@@ -36,3 +36,4 @@ temp/
 *.flow
 *.flow.log
 captures/*.txt
+/.omo/run-continuation
