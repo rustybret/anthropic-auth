@@ -26,6 +26,7 @@ export type SpawnedOpencode = {
 
 export type SpawnOptions = {
   anthropicBaseURL: string
+  hybridCache?: boolean
   relay?: {
     url: string
     token: string
@@ -84,6 +85,9 @@ function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
         accounts: [],
         quota: { enabled: false },
         refresh: { enabled: false },
+        ...(options.hybridCache
+          ? { claudeCache: { enabled: true, mode: 'hybrid' } }
+          : {}),
         ...(options.relay
           ? {
               relay: {

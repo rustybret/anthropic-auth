@@ -20,6 +20,10 @@ export type MockResponse =
       usage?: MockUsage
     }
   | {
+      type: 'refusal'
+      usage?: MockUsage
+    }
+  | {
       type: 'error'
       status: number
       errorType: string
@@ -105,6 +109,30 @@ export class MockAnthropicServer {
       )
     }
 
+    // CacheKeep and Fable recovery prewarms must not consume the scripted
+    // generation sequence. They are zero-output maintenance requests that run
+    // asynchronously between normal model turns.
+    if (body.max_tokens === 0) {
+      return new Response(
+        createSseStream(
+          {
+            type: 'text',
+            text: '',
+            usage: { ...DEFAULT_USAGE, output_tokens: 0 },
+          },
+          body,
+        ),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            connection: 'keep-alive',
+          },
+        },
+      )
+    }
+
     const response = this.queue.shift() ?? {
       type: 'text' as const,
       text: 'ok',
@@ -171,7 +199,13 @@ function createSseStream(
         },
       })
 
-      if (response.type === 'tool_use') {
+      if (response.type === 'refusal') {
+        send('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'refusal', stop_sequence: null },
+          usage: { output_tokens: usage.output_tokens },
+        })
+      } else if (response.type === 'tool_use') {
         const startFrame = `event: content_block_start\ndata: ${JSON.stringify({
           type: 'content_block_start',
           index: 0,

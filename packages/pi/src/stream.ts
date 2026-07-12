@@ -19,6 +19,7 @@ import {
   loadAccounts,
   mergeAnthropicBetas,
   QuotaManager,
+  quotaSnapshotModelScopeIsExhausted,
   resolveClaudeCodeIdentity,
   sendViaRelay,
   setDumpEnabled,
@@ -320,8 +321,8 @@ async function sendAnthropicRequest(options: {
 function quotaSnapshotIsExhausted(
   quota: Awaited<ReturnType<QuotaManager['refreshMain']>> | undefined,
 ) {
-  return Object.values(quota ?? {}).some(
-    (window) => window && window.remainingPercent <= 0,
+  return (['five_hour', 'seven_day'] as const).some(
+    (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
   )
 }
 
@@ -381,10 +382,43 @@ async function executeWithFallback(options: {
     }
   }
 
+  async function primaryQuotaRefreshConfirmsModelScopeExhausted() {
+    try {
+      const quota = await quotaManager.refreshMain(options.primaryAccessToken)
+      const entry = quotaManager.getMain(options.primaryAccessToken)
+      return Boolean(
+        entry &&
+          entry.refreshAfter > Date.now() &&
+          quotaSnapshotModelScopeIsExhausted(quota, options.model.id),
+      )
+    } catch {
+      return false
+    }
+  }
+
+  function primaryCachedModelScopeExhausted() {
+    const entry = quotaManager.getMain(options.primaryAccessToken)
+    return Boolean(
+      entry &&
+        quotaSnapshotModelScopeIsExhausted(entry.quota, options.model.id),
+    )
+  }
+
+  function primaryFreshModelScopeExhausted() {
+    const entry = quotaManager.getMain(options.primaryAccessToken)
+    return Boolean(
+      entry &&
+        entry.refreshAfter > Date.now() &&
+        quotaSnapshotModelScopeIsExhausted(entry.quota, options.model.id),
+    )
+  }
+
   async function tryFallbackAccounts(
     routeOptions: { includeApiRoutes?: boolean } = {},
   ) {
-    const usableOAuth = await manager.getUsableFallbackAccounts(storage)
+    const usableOAuth = await manager.getUsableFallbackAccounts(storage, {
+      modelId: options.model.id,
+    })
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
@@ -435,6 +469,13 @@ async function executeWithFallback(options: {
   if (fallbackFirst) {
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
+  } else if (
+    primaryFreshModelScopeExhausted() ||
+    (primaryCachedModelScopeExhausted() &&
+      (await primaryQuotaRefreshConfirmsModelScopeExhausted()))
+  ) {
+    const fallback = await tryFallbackAccounts()
+    if (fallback) return fallback
   }
 
   const primary = await sendAnthropicRequest({
@@ -447,11 +488,15 @@ async function executeWithFallback(options: {
       return primaryPreflight
   }
 
+  const primaryAllowsQuotaFallback =
+    primaryResponseAllowsApiFallback(primaryPreflight)
   const allowApiFallback =
-    primaryResponseAllowsApiFallback(primaryPreflight) &&
-    (await primaryQuotaRefreshConfirmsExhausted())
+    primaryAllowsQuotaFallback && (await primaryQuotaRefreshConfirmsExhausted())
+  const allowModelScopedOAuthFallback =
+    primaryAllowsQuotaFallback &&
+    (await primaryQuotaRefreshConfirmsModelScopeExhausted())
 
-  if (!fallbackFirst || allowApiFallback) {
+  if (!fallbackFirst || allowApiFallback || allowModelScopedOAuthFallback) {
     const fallback = await tryFallbackAccounts({
       includeApiRoutes: allowApiFallback,
     })

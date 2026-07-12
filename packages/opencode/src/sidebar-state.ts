@@ -4,9 +4,17 @@ export interface QuotaWindow {
   resetsAt?: string
 }
 
+export interface ScopedQuotaWindow extends QuotaWindow {
+  id: string
+  title: string
+  modelId?: string
+  modelName: string
+}
+
 export interface AccountQuota {
   five_hour?: QuotaWindow
   seven_day?: QuotaWindow
+  scoped?: ScopedQuotaWindow[]
 }
 
 export interface SidebarAccountState {
@@ -14,6 +22,16 @@ export interface SidebarAccountState {
   label: string | undefined
   quota: AccountQuota | null
   enabled: boolean
+  // True when the account's refresh token is permanently dead (400
+  // invalid_grant) and it needs a re-login — distinct from a transient backoff.
+  needsReauth: boolean
+}
+
+export interface FableRecoverySidebarState {
+  sessionId: string
+  mode: 'opus' | 'fable'
+  remaining: number
+  changedAt: number
 }
 
 export interface SidebarState {
@@ -34,6 +52,7 @@ export interface SidebarState {
     window?: string
     trackedSessions?: number
   }
+  fableRecoveries?: FableRecoverySidebarState[]
   lastUpdated: number
 }
 
@@ -62,13 +81,71 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
+function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
+  if (!isRecord(value)) return undefined
+  const usedPercent = Number(value.usedPercent)
+  const remainingPercent = Number(value.remainingPercent)
+  if (!Number.isFinite(usedPercent) || !Number.isFinite(remainingPercent)) {
+    return undefined
+  }
+  return {
+    usedPercent,
+    remainingPercent,
+    resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+  }
+}
+
+function normalizeAccountQuota(value: unknown): AccountQuota | null {
+  if (!isRecord(value)) return null
+  const quota: AccountQuota = {}
+  const fiveHour = normalizeQuotaWindow(value.five_hour)
+  const sevenDay = normalizeQuotaWindow(value.seven_day)
+  if (fiveHour) quota.five_hour = fiveHour
+  if (sevenDay) quota.seven_day = sevenDay
+
+  if (Array.isArray(value.scoped)) {
+    const scoped = value.scoped
+      .map((entry): ScopedQuotaWindow | undefined => {
+        if (!isRecord(entry)) return undefined
+        const window = normalizeQuotaWindow(entry)
+        if (!window) return undefined
+        if (typeof entry.id !== 'string' || !entry.id.trim()) return undefined
+        if (typeof entry.title !== 'string' || !entry.title.trim()) {
+          return undefined
+        }
+        if (typeof entry.modelName !== 'string' || !entry.modelName.trim()) {
+          return undefined
+        }
+        const modelId =
+          typeof entry.modelId === 'string' && entry.modelId.trim()
+            ? entry.modelId.trim()
+            : undefined
+        return {
+          ...window,
+          id: entry.id.trim(),
+          title: entry.title.trim(),
+          ...(modelId && { modelId }),
+          modelName: entry.modelName.trim(),
+        }
+      })
+      .filter((entry): entry is ScopedQuotaWindow => entry != null)
+    // Preserve empty `[]` so a sidebar reader can distinguish "scoped owned
+    // by anthropic-auth, none visible" from "no quota data at all". The OUTER
+    // Array.isArray guard means pre-feature inputs without a `scoped` key are
+    // not affected — only inputs that already carried an array reach this line.
+    quota.scoped = scoped
+  }
+
+  return Object.keys(quota).length ? quota : null
+}
+
 export function normalizeSidebarState(raw: unknown): SidebarState {
   if (!isRecord(raw)) return { ...DEFAULT_SIDEBAR_STATE }
 
   const main: SidebarState['main'] = { quota: null }
   if (isRecord(raw.main)) {
     const m = raw.main
-    main.quota = isRecord(m.quota) ? (m.quota as AccountQuota) : null
+    main.quota = normalizeAccountQuota(m.quota)
     if (typeof m.quotaBackedOff === 'boolean')
       main.quotaBackedOff = m.quotaBackedOff
     if (typeof m.quotaBackoffUntil === 'number')
@@ -86,8 +163,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         .map((entry) => ({
           id: entry.id as string,
           label: typeof entry.label === 'string' ? entry.label : undefined,
-          quota: isRecord(entry.quota) ? (entry.quota as AccountQuota) : null,
+          quota: normalizeAccountQuota(entry.quota),
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
+          needsReauth:
+            typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
         }))
     : []
 
@@ -114,6 +193,32 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     }
   }
 
+  const fableRecoveries: FableRecoverySidebarState[] = Array.isArray(
+    raw.fableRecoveries,
+  )
+    ? raw.fableRecoveries
+        .filter(isRecord)
+        .flatMap((recovery): FableRecoverySidebarState[] => {
+          if (
+            typeof recovery.sessionId !== 'string' ||
+            (recovery.mode !== 'opus' && recovery.mode !== 'fable') ||
+            typeof recovery.remaining !== 'number' ||
+            !Number.isFinite(recovery.remaining) ||
+            typeof recovery.changedAt !== 'number' ||
+            !Number.isFinite(recovery.changedAt)
+          )
+            return []
+          return [
+            {
+              sessionId: recovery.sessionId,
+              mode: recovery.mode,
+              remaining: Math.max(0, Math.floor(recovery.remaining)),
+              changedAt: recovery.changedAt,
+            },
+          ]
+        })
+    : []
+
   return {
     main,
     fallbacks,
@@ -126,6 +231,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
     cacheKeep,
+    fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
     lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
   }
 }
@@ -189,21 +295,63 @@ export function resolveActiveAccount(state: SidebarState): {
   return { id: 'main', name: 'main', quota: state.main?.quota ?? null }
 }
 
+export function formatScopedQuotaLabel(title: string) {
+  const label = title.replace(/\s+only$/i, '').trim()
+  return /^fable$/i.test(label) ? 'Fa' : label
+}
+
+export function getFableRecoverySummary(
+  state: SidebarState,
+  sessionId: string,
+): string | undefined {
+  const recovery = state.fableRecoveries?.find(
+    (candidate) => candidate.sessionId === sessionId,
+  )
+  if (!recovery) return undefined
+  if (recovery.mode === 'fable') return 'Fable 5 · restored'
+  return `Opus 4.8 · ${recovery.remaining} left`
+}
+
 export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
   fiveHourUsedPercent: number | null
   sevenDayUsedPercent: number | null
+  scopedUsedPercents: number[]
   text: string | null
 } {
   const fiveHourUsedPercent = quota?.five_hour?.usedPercent ?? null
   const sevenDayUsedPercent = quota?.seven_day?.usedPercent ?? null
-  if (fiveHourUsedPercent == null && sevenDayUsedPercent == null) {
-    return { fiveHourUsedPercent, sevenDayUsedPercent, text: null }
+  const scoped = quota?.scoped ?? []
+  const scopedUsedPercents = scoped.map((window) => window.usedPercent)
+  if (
+    fiveHourUsedPercent == null &&
+    sevenDayUsedPercent == null &&
+    scoped.length === 0
+  ) {
+    return {
+      fiveHourUsedPercent,
+      sevenDayUsedPercent,
+      scopedUsedPercents,
+      text: null,
+    }
   }
+
+  const scopedSegments = scoped.map(
+    (window) =>
+      `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
+  )
+  const primarySegments =
+    fiveHourUsedPercent == null && sevenDayUsedPercent == null
+      ? []
+      : [
+          `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
+          `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+        ]
 
   return {
     fiveHourUsedPercent,
     sevenDayUsedPercent,
-    text: `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`} 7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+    scopedUsedPercents,
+    text: [...primarySegments, ...scopedSegments].join(' '),
   }
 }
 

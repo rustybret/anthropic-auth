@@ -2,6 +2,81 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.15.0
+
+### Minor Changes
+
+- Add automatic Fable content-filter recovery: transparently route the session through Opus 4.8 for a 10-response recovery window, prewarm Fable after each successful Opus response, and return to Fable without changing the selected session model.
+- Preserve both model caches during recovery by warming Fable with the OAuth account that served the refused request and retaining an Opus standby cache bridge when healthy Fable turns move the previous Opus boundary outside Anthropic's 20-block lookback.
+- Show session-specific recovery status in the TUI sidebar and send safe transition notices in OpenCode Desktop without spending quota or creating an extra provider response.
+
+## 1.14.0
+
+### Minor Changes
+
+- Expose Claude Sonnet 5 in the Pi Anthropic provider catalog, completing its existing adaptive-thinking request support.
+
+### Patch Changes
+
+- Preserve empty model-scoped quota arrays through account-state loading, runtime-state merges, and sidebar normalization so a fresh quota response can clear a previously stored scoped window.
+- Omit unavailable 5h/7d placeholders from collapsed quota summaries when only a scoped model window is present.
+- Update OpenTUI Solid, OpenCode SDK, Biome, and generated project documentation.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the scoped-quota persistence fixes and [@nodnarbnitram](https://github.com/nodnarbnitram) for the Pi Sonnet 5 catalog contribution.
+
+## 1.13.0
+
+### Minor Changes
+
+- Add model-scoped OAuth quota support for Anthropic weekly scoped limits such as Fable, including sidebar/quota-summary display and model-aware OAuth fallback routing. Fable scoped exhaustion can route Fable requests to an OAuth fallback while other models continue using the main account.
+- Add per-model scoped killswitch thresholds so matching scoped quota windows can hard-block an account without poisoning routing for other models.
+
+### Patch Changes
+
+- Fix same-label fallback OAuth re-login state merging so fresh credentials clear stale reauth/quota errors and invalidate old quota cache entries.
+- Keep CacheKeep tracking on OAuth fallback routes and prewarm with the same OAuth account that served the cached request.
+- Shorten the Fable scoped quota sidebar label to `Fa` and preserve scoped killswitch thresholds in the TUI edit modal.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the scoped killswitch contribution.
+
+## 1.12.2
+
+### Patch Changes
+
+- Update OpenCode SDK/plugin dependencies.
+
+## 1.12.1
+
+### Patch Changes
+
+- Request visible summarized adaptive thinking for Claude Sonnet 5, while preserving explicit disabled-thinking requests and canonicalizing them to the accepted bare disabled shape.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the Sonnet 5 adaptive-thinking fix.
+
+## 1.12.0
+
+### Minor Changes
+
+- Handle Anthropic auth slash commands with an Effect-compatible `204 No Content` response shape, avoiding logged plugin errors in current OpenCode while keeping the legacy sentinel fallback for older hosts.
+
+## 1.11.0
+
+### Minor Changes
+
+- Add `/claude-account` interactive TUI dialogs for fallback account management, including list, enable, disable, reorder, remove, API-key route setup, and OAuth fallback login helpers.
+- Add `/claude-logging` command/dialog support for persisted log levels.
+- Add CacheKeep per-warm cost logging and an opt-in CacheKeep subagent toggle.
+
+### Patch Changes
+
+- Harden account storage, refresh locks, sidebar state, and RPC discovery against lost updates, stale-lock races, malformed state files, and multi-session port collisions.
+- Load runtime auth state even when the editable config file is absent, so credentials and fallback state remain visible after config cleanup.
+- Improve account cleanup and re-login UX by clearing removed fallback runtime state, showing dead fallback accounts that need re-login, and preserving clearer OAuth account labels.
+- Treat Claude quota endpoint `403` responses as account/org-policy auth failures without arming quota backoff or OAuth refresh backoff.
+- Update OpenCode, OpenTUI, Miniflare, Biome, GitHub Actions, and related development dependencies.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the account/logging parity work and account-management fixes, [@jonmast](https://github.com/jonmast) for the runtime-state load fix, and [@eddieparc](https://github.com/eddieparc) for reporting and proposing the quota `403` backoff boundary fix.
+
 ## 1.10.3
 
 ### Patch Changes

@@ -31,6 +31,16 @@ describe('quota summaries', () => {
               remainingPercent: 50,
               checkedAt: now - 60_000,
             },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 5,
+                remainingPercent: 95,
+                checkedAt: now,
+              },
+            ],
           },
         },
       ],
@@ -43,6 +53,9 @@ describe('quota summaries', () => {
       '5h: 75% remaining (25% used, resets in 1h 15m, checked just now)',
     )
     expect(summary).toContain('1w: 50% remaining (50% used, checked 1m ago)')
+    expect(summary).toContain(
+      'Fable only: 95% remaining (5% used, checked just now)',
+    )
   })
 
   test('formats reset timestamps as relative durations', () => {

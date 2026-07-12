@@ -16,11 +16,15 @@ type SdkClient = {
         parts: Array<{ type: 'text'; text: string }>
       }
     }) => Promise<{ data?: unknown }>
+    messages: (options: {
+      path: { id: string }
+    }) => Promise<{ data?: unknown[] }>
   }
 }
 
 export type E2EHarnessOptions = {
   relay?: 'websocket'
+  hybridCache?: boolean
 }
 
 export class E2EHarness {
@@ -61,6 +65,7 @@ export class E2EHarness {
     const opencode = await spawnOpencode({
       anthropicBaseURL: baseURL,
       relay: relayConfig,
+      hybridCache: options.hybridCache,
     })
     const sdk = await import('@opencode-ai/sdk')
     const client = sdk.createOpencodeClient({
@@ -94,12 +99,17 @@ export class E2EHarness {
     return response.data.id
   }
 
-  async sendPrompt(sessionId: string, text: string, timeoutMs = 45_000) {
+  async sendPrompt(
+    sessionId: string,
+    text: string,
+    timeoutMs = 45_000,
+    modelID = 'claude-sonnet-4-5',
+  ) {
     const result = await this.withTimeout(
       this.client.session.prompt({
         path: { id: sessionId },
         body: {
-          model: { providerID: 'anthropic', modelID: 'claude-sonnet-4-5' },
+          model: { providerID: 'anthropic', modelID },
           parts: [{ type: 'text', text }],
         },
       }),
@@ -107,6 +117,25 @@ export class E2EHarness {
       'session.prompt',
     )
     return result
+  }
+
+  async waitForSessionText(
+    sessionId: string,
+    text: string,
+    timeoutMs = 30_000,
+  ) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const response = await this.client.session.messages({
+        path: { id: sessionId },
+      })
+      if (JSON.stringify(response.data ?? []).includes(text))
+        return response.data
+      await Bun.sleep(100)
+    }
+    throw new Error(
+      `session notification not found: ${text}\n--- stdout ---\n${this.opencode.stdout()}\n--- stderr ---\n${this.opencode.stderr()}`,
+    )
   }
 
   private async withTimeout<T>(

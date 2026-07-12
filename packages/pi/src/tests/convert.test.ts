@@ -364,6 +364,42 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
   })
 })
 
+describe('buildAnthropicRequest — Sonnet 5 thinking', () => {
+  test('requests summarized adaptive thinking for Sonnet 5 without reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('replaces manual reasoning budget with adaptive summarized for Sonnet 5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-5-20260630',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'high' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('sets display summarized (not omitted) so Sonnet 5 thinking is visible', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect((body.thinking as { display?: string }).display).toBe('summarized')
+  })
+})
+
 describe('convertMessages — empty error tool_result guard', () => {
   test('injects Error placeholder when is_error=true and content is empty', async () => {
     const messages = await buildMessages([

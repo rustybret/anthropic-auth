@@ -329,6 +329,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     enabled: true,
     addedAt: now,
     lastUsed: now,
+    lastRefreshedAt: now,
   })
   await saveAccounts(storage)
 

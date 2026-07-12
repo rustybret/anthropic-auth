@@ -23,7 +23,9 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
+  formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
+  getFableRecoverySummary,
   getSidebarState,
   type QuotaPacing,
   resolveActiveAccount,
@@ -304,10 +306,13 @@ function AccountBlock(props: {
   quota: AccountQuota | null
   active: boolean
   pacingEnabled: boolean
+  needsReauth?: boolean
   marginTop?: number
 }) {
-  const statusWord = () => (props.active ? 'active' : 'idle')
-  const statusTone = (): Tone => (props.active ? 'ok' : 'muted')
+  const statusWord = () =>
+    props.needsReauth ? 're-login' : props.active ? 'active' : 'idle'
+  const statusTone = (): Tone =>
+    props.needsReauth ? 'err' : props.active ? 'ok' : 'muted'
   const pacingFor = (
     window:
       | { usedPercent: number; remainingPercent: number; resetsAt?: string }
@@ -345,6 +350,17 @@ function AccountBlock(props: {
           window={props.quota?.seven_day}
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
         />
+        <For each={props.quota?.scoped ?? []}>
+          {(window) => (
+            <QuotaRow
+              theme={props.theme}
+              appearance={props.appearance}
+              label={formatScopedQuotaLabel(window.title)}
+              window={window}
+              pacing={pacingFor(window, SEVEN_DAY_MS)}
+            />
+          )}
+        </For>
       </Show>
     </box>
   )
@@ -402,6 +418,7 @@ function QuotaDialogContent(props: {
                 quota={fb.quota}
                 active={state().activeId === fb.id}
                 pacingEnabled={prefs().sections.pacing}
+                needsReauth={fb.needsReauth}
                 marginTop={1}
               />
             )}
@@ -485,6 +502,7 @@ function createSidebarController(
 function QuotaSidebar(props: {
   api: TuiPluginApi
   controller: SidebarController
+  sessionId: string
 }) {
   const prefs = props.controller.prefs
   const collapsed = props.controller.collapsed
@@ -544,9 +562,21 @@ function QuotaSidebar(props: {
     const quota = activeAccount().quota
     if (!quota) return false
     const now = Date.now()
-    const windows: Array<[typeof quota.five_hour, number]> = [
+    const windows: Array<
+      [
+        (
+          | { usedPercent: number; remainingPercent: number; resetsAt?: string }
+          | undefined
+        ),
+        number,
+      ]
+    > = [
       [quota.five_hour, FIVE_HOUR_MS],
       [quota.seven_day, SEVEN_DAY_MS],
+      ...(quota.scoped ?? []).map((window): [typeof window, number] => [
+        window,
+        SEVEN_DAY_MS,
+      ]),
     ]
     return windows.some(
       ([w, ms]) =>
@@ -558,6 +588,7 @@ function QuotaSidebar(props: {
     const values = [
       summary.fiveHourUsedPercent,
       summary.sevenDayUsedPercent,
+      ...summary.scopedUsedPercents,
     ].filter((value): value is number => value != null)
     // Pacing deficit is an advisory projection, not actual quota exhaustion,
     // so it can only BUMP the usage tone up to warn at most — never soften a
@@ -572,8 +603,17 @@ function QuotaSidebar(props: {
 
   const quotaBackedOff = () => state().main?.quotaBackedOff === true
   const refreshBackedOff = () => state().main?.refreshBackedOff === true
-  const degraded = () => quotaBackedOff() || refreshBackedOff()
+  const needsReauth = () => enabledFallbacks().some((f) => f.needsReauth)
+  const degraded = () => quotaBackedOff() || refreshBackedOff() || needsReauth()
 
+  const fableRecoverySummary = () =>
+    getFableRecoverySummary(state(), props.sessionId)
+  const fableRecoveryTone = (): Tone =>
+    state().fableRecoveries?.find(
+      (recovery) => recovery.sessionId === props.sessionId,
+    )?.mode === 'opus'
+      ? 'warn'
+      : 'ok'
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
     prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null
@@ -649,6 +689,15 @@ function QuotaSidebar(props: {
             </text>
           </CollapsedRow>
         </Show>
+        <Show when={fableRecoverySummary()}>
+          {(summary: () => string) => (
+            <CollapsedRow theme={theme()} label='Recovery'>
+              <text fg={toneColor(theme(), fableRecoveryTone())}>
+                <b>{summary()}</b>
+              </text>
+            </CollapsedRow>
+          )}
+        </Show>
       </Show>
 
       {/* Expanded: full sections. Also render when there's no data so the
@@ -683,6 +732,7 @@ function QuotaSidebar(props: {
                     quota={fb.quota}
                     active={state().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
+                    needsReauth={fb.needsReauth}
                     marginTop={1}
                   />
                 )}
@@ -712,6 +762,17 @@ function QuotaSidebar(props: {
             value={relayValue()}
             tone={state().relay?.enabled ? 'ok' : 'muted'}
           />
+        </Show>
+
+        <Show when={fableRecoverySummary()}>
+          {(summary: () => string) => (
+            <StatRow
+              theme={theme()}
+              label='Recovery'
+              value={summary()}
+              tone={fableRecoveryTone()}
+            />
+          )}
         </Show>
 
         {/* Cache */}
@@ -764,8 +825,14 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: computeEffectiveOrder(root, PLUGIN_KEY, DEFAULT_SLOT_ORDER),
     slots: {
-      sidebar_content(_ctx: unknown, _props: { session_id: string }) {
-        return <QuotaSidebar api={api} controller={controller} />
+      sidebar_content(_ctx: unknown, props: { session_id: string }) {
+        return (
+          <QuotaSidebar
+            api={api}
+            controller={controller}
+            sessionId={props.session_id}
+          />
+        )
       },
     },
   })

@@ -50,6 +50,25 @@ export function isClaudeFableOrMythos5Model(model: unknown) {
   )
 }
 
+export const CLAUDE_SONNET_5_MODEL_ID = 'claude-sonnet-5'
+
+/**
+ * Sonnet 5 enables adaptive thinking by default but ships `display: "omitted"`,
+ * so the `thinking` field returns empty and the user sees nothing. Injecting
+ * this makes the adaptive thinking summary visible. Reuses the Fable/Mythos
+ * shape because the API contract is identical.
+ */
+export const CLAUDE_SONNET_5_ADAPTIVE_THINKING =
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
+
+export function isClaudeSonnet5Model(model: unknown) {
+  return (
+    typeof model === 'string' &&
+    (model === CLAUDE_SONNET_5_MODEL_ID ||
+      model.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`))
+  )
+}
+
 export function isOpenAIReasoningSignature(value: unknown): boolean {
   if (typeof value !== 'string') return false
   if (value.startsWith('gAAAA')) return true

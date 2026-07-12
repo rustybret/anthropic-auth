@@ -32,6 +32,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Cache keepalive**: use `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Fable/Mythos reasoning visibility**: request summarized adaptive thinking for Claude Fable 5 and Mythos 5 so agents can display reasoning summaries instead of blank signed-thinking blocks.
+- **Fable content-filter recovery**: when Fable ends a session response with Anthropic's `refusal` content-filter reason, transparently retry with Opus 4.8 for 10 successful model responses. After each Opus response, a zero-output Fable prewarm advances the same prompt cache using the OAuth account that served the filtered Fable request. The latest Opus cache boundary is retained so a later refusal can bridge back to Opus even after more than 20 Fable content blocks; the selected OpenCode model remains Fable. The TUI sidebar shows the per-session recovery countdown and return to Fable, while OpenCode Desktop receives ignored `promptAsync` notices for both transitions.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
@@ -179,7 +180,7 @@ Example:
   },
   "killswitch": {
     "enabled": false,
-    "main": { "five_hour": 5, "seven_day": 10 },
+    "main": { "five_hour": 5, "seven_day": 10, "scoped": 0 },
     "accounts": {}
   },
   "claudeCache": {
@@ -294,18 +295,20 @@ Add a `killswitch` block to the sidecar config:
   "enabled": true,
   "main": {
     "five_hour": 5,
-    "seven_day": 10
+    "seven_day": 10,
+    "scoped": 0
   },
   "accounts": {
     "work-alt": {
       "five_hour": 10,
-      "seven_day": 20
+      "seven_day": 20,
+      "scoped": 0
     }
   }
 }
 ```
 
-Thresholds are remaining-percent values. With `five_hour: 5`, the account is killed when less than 5% of the 5-hour quota window remains. Accounts without an entry in `accounts` fall back to the `main` thresholds. The aliases `5h` and `1w` are also accepted.
+Thresholds are remaining-percent values. With `five_hour: 5`, the account is killed when less than 5% of the 5-hour quota window remains. The optional `scoped` threshold applies to matching model-scoped quota windows (for example Fable weekly quota) and blocks when the scoped remaining percent is at or below the threshold. Accounts without an entry in `accounts` fall back to the `main` thresholds. The aliases `5h` and `1w` are also accepted.
 
 Behavior:
 
@@ -321,7 +324,8 @@ Manage the killswitch from inside OpenCode:
 /claude-killswitch on           — enable with current or default thresholds
 /claude-killswitch off          — disable
 /claude-killswitch set all:5,10 — set all accounts to 5h≥5%, 1w≥10%
-/claude-killswitch set main:3,8 work-alt:5,10 — per-account thresholds
+/claude-killswitch set main:3,8,0 — set main to 5h≥3%, 1w≥8%, scoped≤0%
+/claude-killswitch set main:3,8,0 work-alt:5,10,0 — per-account thresholds
 ```
 
 Changes made with `/claude-killswitch` are persisted to the sidecar config.

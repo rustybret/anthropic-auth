@@ -280,7 +280,103 @@ describe('CLI login', () => {
       refresh: 'new-refresh',
     })
     expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
-    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeUndefined()
+    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeNumber()
+    expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
+    expect(
+      runtimeState.accounts['cli-label'].lastQuotaRefreshError,
+    ).toBeUndefined()
+  })
+
+  test('re-login with same label replaces split runtime state and clears stale reauth', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const statePath = getAccountStatePath(accountPath)
+    const oldRefreshedAt = Date.now() - 60_000
+
+    await writeFile(
+      accountPath,
+      JSON.stringify(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'anthropic' },
+          accounts: [
+            {
+              id: 'cli-label',
+              label: 'cli-label',
+              type: 'oauth',
+              enabled: true,
+              addedAt: 123,
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    await writeFile(
+      statePath,
+      JSON.stringify(
+        {
+          version: 1,
+          accounts: {
+            'cli-label': {
+              access: 'old-access',
+              refresh: 'old-refresh',
+              expires: 1,
+              lastRefreshedAt: oldRefreshedAt,
+              quota: {
+                five_hour: {
+                  usedPercent: 99,
+                  remainingPercent: 1,
+                  checkedAt: Date.now(),
+                },
+              },
+              lastRefreshError: {
+                message: 'old invalid_grant',
+                checkedAt: oldRefreshedAt,
+                nextRetryAt: Date.now() + 3_600_000,
+                permanent: true,
+              },
+              lastQuotaRefreshError: {
+                message: 'old quota error',
+                checkedAt: oldRefreshedAt,
+              },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+
+    const prompt = async () =>
+      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
+    const exchange = async (): Promise<{
+      type: 'success'
+      access: string
+      refresh: string
+      expires: number
+    }> => ({
+      type: 'success',
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: Date.now() + 3600 * 1000,
+    })
+
+    await withAccountEnv(accountPath, {}, () =>
+      login('cli-label', { prompt, exchange }),
+    )
+
+    const runtimeState = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(runtimeState.accounts['cli-label']).toMatchObject({
+      access: 'new-access',
+      refresh: 'new-refresh',
+    })
+    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeGreaterThan(
+      oldRefreshedAt,
+    )
+    expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
     expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
     expect(
       runtimeState.accounts['cli-label'].lastQuotaRefreshError,

@@ -37,7 +37,7 @@ export type OAuthAccount = AccountBase & {
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
-  quota?: Partial<Record<QuotaWindowName, AccountQuotaWindow>>
+  quota?: OAuthQuotaSnapshot
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -82,6 +82,22 @@ export type AccountOperationError = {
   nextRetryAt?: number
   retryCount?: number
   tokenHash?: string
+  /**
+   * HTTP status of the underlying refresh/quota failure, when known. Lets
+   * consumers distinguish a permanently-dead token (400 invalid_grant →
+   * re-login) from a transient failure (429/5xx → recovers) without a delay
+   * heuristic. Absent on errors persisted before this field existed.
+   */
+  status?: number
+  /**
+   * Explicit dead-token discriminator, set at construction. True ONLY when the
+   * refresh endpoint returned 400 invalid_grant (token is genuinely dead →
+   * re-login). False for transient failures AND for retry-exhausted/network
+   * errors that get a long backoff but are NOT dead — so they are not nagged
+   * for re-login. Absent on errors persisted before this field existed (those
+   * fall back to status / the 24h-delay heuristic).
+   */
+  permanent?: boolean
 }
 
 export type AccountQuotaWindow = {
@@ -91,10 +107,29 @@ export type AccountQuotaWindow = {
   checkedAt: number
 }
 
+export type AccountScopedQuotaWindow = AccountQuotaWindow & {
+  id: string
+  title: string
+  modelId?: string
+  modelName: string
+}
+
+export type OAuthQuotaSnapshot = Partial<
+  Record<QuotaWindowName, AccountQuotaWindow>
+> & {
+  scoped?: AccountScopedQuotaWindow[]
+  // Top-level freshness stamp for the whole snapshot. mergeAccountRuntimeState
+  // uses this when the snapshot has no per-window checkedAt (e.g. a windowless
+  // empty-scoped snapshot) — without it, a windowless refresh gets read as
+  // checkedAt=0 and treated as stale, so an old per-window quota resurrects
+  // instead of being overwritten.
+  checkedAt?: number
+}
+
 export type RoutingMode = 'main-first' | 'fallback-first'
 
 export type KillswitchThresholds = Partial<
-  Record<QuotaWindowName | '5h' | '1w', number>
+  Record<QuotaWindowName | '5h' | '1w' | 'scoped', number>
 >
 
 export type KillswitchConfig = {
@@ -229,14 +264,25 @@ type OAuthUsageWindow = {
   resets_at?: string
 }
 
+type OAuthUsageLimit = {
+  kind?: string
+  group?: string
+  percent?: number
+  resets_at?: string
+  scope?: {
+    model?: {
+      id?: string | null
+      display_name?: string | null
+    } | null
+    surface?: unknown
+  } | null
+}
+
 type OAuthUsageResponse = {
   five_hour?: OAuthUsageWindow
   seven_day?: OAuthUsageWindow
+  limits?: OAuthUsageLimit[]
 }
-
-export type OAuthQuotaSnapshot = Partial<
-  Record<QuotaWindowName, AccountQuotaWindow>
->
 
 export type AccountManagerOptions = {
   now?: () => number
@@ -365,6 +411,7 @@ function normalizeOperationError(
   if (!Number.isFinite(checkedAt)) return undefined
   const nextRetryAt = Number(value.nextRetryAt)
   const retryCount = Number(value.retryCount)
+  const status = Number(value.status)
   return {
     message: value.message,
     checkedAt,
@@ -372,6 +419,33 @@ function normalizeOperationError(
     retryCount: Number.isFinite(retryCount) ? retryCount : undefined,
     tokenHash:
       typeof value.tokenHash === 'string' ? value.tokenHash : undefined,
+    // Preserve the dead-token discriminators across save/load. Without these,
+    // a retry-exhausted transient (permanent=false, 24h backoff) would lose its
+    // flag on reload and the 24h-delay heuristic would wrongly re-classify it
+    // permanent → false "needs re-login" nag.
+    status: Number.isFinite(status) ? status : undefined,
+    permanent:
+      typeof value.permanent === 'boolean' ? value.permanent : undefined,
+  }
+}
+
+function normalizeQuotaWindow(value: unknown): AccountQuotaWindow | undefined {
+  if (!isRecord(value)) return undefined
+  const usedPercent = Number(value.usedPercent)
+  const remainingPercent = Number(value.remainingPercent)
+  const checkedAt = Number(value.checkedAt)
+  if (
+    !Number.isFinite(usedPercent) ||
+    !Number.isFinite(remainingPercent) ||
+    !Number.isFinite(checkedAt)
+  ) {
+    return undefined
+  }
+  return {
+    usedPercent,
+    remainingPercent,
+    checkedAt,
+    resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
   }
 }
 
@@ -379,27 +453,63 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   if (!isRecord(value)) return undefined
   const quota: OAuthAccount['quota'] = {}
   for (const key of ['five_hour', 'seven_day'] as const) {
-    const window = value[key]
-    if (!isRecord(window)) continue
-    const usedPercent = Number(window.usedPercent)
-    const remainingPercent = Number(window.remainingPercent)
-    const checkedAt = Number(window.checkedAt)
-    if (
-      !Number.isFinite(usedPercent) ||
-      !Number.isFinite(remainingPercent) ||
-      !Number.isFinite(checkedAt)
-    ) {
-      continue
-    }
-    quota[key] = {
-      usedPercent,
-      remainingPercent,
-      checkedAt,
-      resetsAt:
-        typeof window.resetsAt === 'string' ? window.resetsAt : undefined,
-    }
+    const normalized = normalizeQuotaWindow(value[key])
+    if (normalized) quota[key] = normalized
   }
+
+  // Persist a top-level snapshot checkedAt through normalize so the
+  // mergeAccountRuntimeState freshness comparison stays meaningful when the
+  // snapshot has no per-window checkedAt (e.g. {scoped:[]}). Pre-feature
+  // inputs without this key are unaffected — only on-disk snapshots that
+  // already carry it reach this branch.
+  if (typeof value.checkedAt === 'number' && Number.isFinite(value.checkedAt)) {
+    quota.checkedAt = value.checkedAt
+  }
+
+  if (Array.isArray(value.scoped)) {
+    const scoped = value.scoped
+      .map((entry): AccountScopedQuotaWindow | undefined => {
+        if (!isRecord(entry)) return undefined
+        const window = normalizeQuotaWindow(entry)
+        if (!window) return undefined
+        if (typeof entry.id !== 'string' || !entry.id.trim()) return undefined
+        if (typeof entry.title !== 'string' || !entry.title.trim()) {
+          return undefined
+        }
+        if (typeof entry.modelName !== 'string' || !entry.modelName.trim()) {
+          return undefined
+        }
+        const modelId =
+          typeof entry.modelId === 'string' && entry.modelId.trim()
+            ? entry.modelId.trim()
+            : undefined
+        return {
+          ...window,
+          id: entry.id.trim(),
+          title: entry.title.trim(),
+          ...(modelId && { modelId }),
+          modelName: entry.modelName.trim(),
+        }
+      })
+      .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
+    // Preserve empty `[]` so a downstream reader can distinguish "scoped
+    // owned by anthropic-auth, none visible" from "no scoped data on this
+    // snapshot". Pre-feature inputs without a `scoped` key are not affected
+    // — only inputs that already carried an array reach this line.
+    quota.scoped = scoped
+  }
+
   return Object.keys(quota).length ? quota : undefined
+}
+
+// Fresh empty storage shell — main OpenCode OAuth account, no fallback
+// accounts. Returns a new object each call so mutating callers don't alias.
+export function createEmptyStorage(): AccountStorage {
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: 'anthropic' },
+    accounts: [],
+  }
 }
 
 function normalizeStorage(value: unknown): AccountStorage | null {
@@ -450,6 +560,59 @@ function objectWithDefinedEntries(value: Record<string, unknown>) {
   )
 }
 
+function numericField(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function accountCredentialTimestamp(value: Record<string, unknown>): number {
+  return Math.max(
+    numericField(value.lastRefreshedAt),
+    numericField(value.lastUsed),
+    numericField(value.addedAt),
+  )
+}
+
+function legacyConfigCredentialsAreNewer(
+  account: Record<string, unknown>,
+  stateAccount: Record<string, unknown>,
+): boolean {
+  if (account.type !== 'oauth') return false
+  if (typeof account.refresh !== 'string' || !account.refresh.trim()) {
+    return false
+  }
+  const tokenChanged = Boolean(
+    (typeof account.access === 'string' &&
+      typeof stateAccount.access === 'string' &&
+      account.access !== stateAccount.access) ||
+      (typeof account.refresh === 'string' &&
+        typeof stateAccount.refresh === 'string' &&
+        account.refresh !== stateAccount.refresh),
+  )
+  if (!tokenChanged) return false
+  return (
+    accountCredentialTimestamp(account) >
+    accountCredentialTimestamp(stateAccount)
+  )
+}
+
+function mergeConfigAccountAndState(
+  account: Record<string, unknown>,
+  stateAccount: Record<string, unknown>,
+): Record<string, unknown> {
+  if (legacyConfigCredentialsAreNewer(account, stateAccount)) {
+    const merged = { ...stateAccount, ...account }
+    const configTimestamp = accountCredentialTimestamp(account)
+    if (configTimestamp > numericField(merged.lastRefreshedAt)) {
+      merged.lastRefreshedAt = configTimestamp
+    }
+    delete merged.quota
+    delete merged.lastRefreshError
+    delete merged.lastQuotaRefreshError
+    return merged
+  }
+  return { ...account, ...stateAccount }
+}
+
 function mergeConfigAndState(
   configValue: unknown,
   stateValue: unknown,
@@ -471,7 +634,7 @@ function mergeConfigAndState(
           typeof account.id === 'string' && isRecord(stateAccounts[account.id])
             ? (stateAccounts[account.id] as Record<string, unknown>)
             : {}
-        return { ...account, ...stateAccount }
+        return mergeConfigAccountAndState(account, stateAccount)
       })
     : []
 
@@ -497,9 +660,13 @@ function mergeConfigAndState(
 
 export async function loadAccounts(path = getAccountStoragePath()) {
   const config = await readJsonIfPresent(path)
-  if (!config.exists) return null
   const state = await readJsonIfPresent(getAccountStatePath(path))
-  return normalizeStorage(mergeConfigAndState(config.value, state.value))
+  // Runtime-only flows (main-OAuth refresh with no fallback accounts) write the
+  // state file but never the config file, so the store is absent only when
+  // neither exists. Synthesize an empty config to merge state into otherwise.
+  if (!config.exists && !state.exists) return null
+  const configValue = config.exists ? config.value : createEmptyStorage()
+  return normalizeStorage(mergeConfigAndState(configValue, state.value))
 }
 
 async function loadExistingTopLevelFields(path: string) {
@@ -548,6 +715,8 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   return Math.max(
     quota?.five_hour?.checkedAt ?? 0,
     quota?.seven_day?.checkedAt ?? 0,
+    ...(quota?.scoped?.map((window) => window.checkedAt) ?? []),
+    quota?.checkedAt ?? 0,
   )
 }
 
@@ -559,12 +728,16 @@ function mergeAccountRuntimeState(
   const existingEntry = existing as AccountRuntimeEntry
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
+  const tokenChanged = Boolean(
+    (existingEntry.access &&
+      incoming.access &&
+      existingEntry.access !== incoming.access) ||
+      (existingEntry.refresh &&
+        incoming.refresh &&
+        existingEntry.refresh !== incoming.refresh),
+  )
+
   if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
-    const tokenChanged = Boolean(
-      existingEntry.access &&
-        incoming.access &&
-        existingEntry.access !== incoming.access,
-    )
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
     const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
     if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
@@ -578,9 +751,26 @@ function mergeAccountRuntimeState(
       }
       return merged
     }
+
+    const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
+    if (tokenChanged) {
+      if ('quota' in incoming) {
+        merged.quota = existingEntry.quota
+        if ('lastQuotaRefreshError' in existingEntry) {
+          merged.lastQuotaRefreshError = existingEntry.lastQuotaRefreshError
+        } else {
+          delete merged.lastQuotaRefreshError
+        }
+      } else {
+        delete merged.quota
+        delete merged.lastQuotaRefreshError
+      }
+      if (!('lastRefreshError' in incoming)) delete merged.lastRefreshError
+      return merged
+    }
+
     return {
-      ...existingEntry,
-      ...incoming,
+      ...merged,
       quota: existingEntry.quota,
       lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
     }
@@ -769,6 +959,17 @@ async function saveAccountStateUnlocked(
         if (!storage.accounts.some((account) => account.id === id)) {
           delete next.accounts[id]
         }
+      }
+    } else {
+      // Full save: drop any per-account state whose id is no longer present in
+      // storage.accounts. The scoped path above only prunes ids it was asked to
+      // save; on a removal the storage is saved with scope.accounts === true
+      // (ids === null), so without this branch the removed account's runtime
+      // state (quota/lastRefreshError/access/refresh/expires) would be orphaned
+      // in the state file and later merged onto a re-added same-id account.
+      const present = new Set(storage.accounts.map((account) => account.id))
+      for (const id of Object.keys(next.accounts)) {
+        if (!present.has(id)) delete next.accounts[id]
       }
     }
   }
@@ -1027,11 +1228,7 @@ export async function setCache1hPersistentEnabled(
   mode?: Cache1hMode,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeCache = {
     ...(storage.claudeCache ?? {}),
     enabled,
@@ -1045,11 +1242,7 @@ export async function setCache1hPersistentMode(
   mode: Cache1hMode,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeCache = {
     ...(storage.claudeCache ?? {}),
     enabled: storage.claudeCache?.enabled === true,
@@ -1067,11 +1260,7 @@ export async function setDumpPersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.dump = {
     ...(storage.dump ?? {}),
     enabled,
@@ -1088,11 +1277,7 @@ export async function setFastModePersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeFast = {
     ...(storage.claudeFast ?? {}),
     enabled,
@@ -1106,11 +1291,7 @@ export async function setCacheKeepPersistentWindow(
   endHour: number,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
     enabled: true,
     startHour,
@@ -1124,11 +1305,7 @@ export async function setCacheKeepPersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
     ...(storage.cacheKeep ?? {}),
     enabled,
@@ -1145,11 +1322,7 @@ export async function setCacheKeepSubagentsEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
     ...(storage.cacheKeep ?? {}),
     subagents: enabled,
@@ -1253,13 +1426,63 @@ export function buildRefreshOperationError(input: {
   } else {
     delay = NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
   }
+  const statusFromError = (input.error as { status?: unknown }).status
+  const status =
+    typeof statusFromError === 'number' && Number.isFinite(statusFromError)
+      ? statusFromError
+      : undefined
+  const message = formatErrorMessage(input.error)
+  // A token is permanently dead ONLY on 400 invalid_grant. The OAuth spec allows
+  // other 400s (invalid_client / invalid_request / unsupported_grant_type) that
+  // re-login does NOT fix — those, like a retry-exhausted / network / 429 / 5xx
+  // error, get a long backoff but must stay permanent=false so they are not
+  // falsely flagged "needs re-login". ClaudeOAuthRefreshError carries the raw
+  // OAuth body, and its message embeds it (`...: 400 — <body>`), so check both.
+  const body =
+    typeof (input.error as { body?: unknown }).body === 'string'
+      ? (input.error as { body: string }).body
+      : ''
+  const isInvalidGrant =
+    body.includes('invalid_grant') || message.includes('invalid_grant')
   return {
-    message: formatErrorMessage(input.error),
+    message,
     checkedAt: input.now,
     nextRetryAt: input.now + delay,
     retryCount,
     tokenHash,
+    status,
+    permanent: status === 400 && isInvalidGrant,
   }
+}
+
+/**
+ * True when a refresh error means the token is permanently dead and the account
+ * needs a re-login (vs a transient failure that recovers).
+ *
+ * Precedence:
+ *  1. the explicit `permanent` flag (set at construction from 400 invalid_grant)
+ *     — the authoritative signal; correctly classifies a retry-exhausted/network
+ *     error (long backoff, but NOT dead) as non-permanent;
+ *  2. else the captured HTTP `status` — 400 (for errors built before `permanent`
+ *     existed but after `status`);
+ *  3. else the legacy 24h-delay heuristic — back-compat ONLY for errors persisted
+ *     before either field existed (e.g. an operator's already-dead token: no
+ *     status, ~24h backoff). It still flags those until the next refresh restamps
+ *     the error with the explicit field.
+ */
+export function isPermanentRefreshError(
+  error: AccountOperationError | undefined,
+): boolean {
+  if (!error) return false
+  if (typeof error.permanent === 'boolean') return error.permanent
+  if (typeof error.status === 'number') return error.status === 400
+  if (typeof error.nextRetryAt === 'number') {
+    return (
+      error.nextRetryAt - error.checkedAt >=
+      NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
+    )
+  }
+  return false
 }
 
 export function refreshBackoffActive(
@@ -1281,6 +1504,12 @@ export function formatRefreshBackoffMessage(
     Math.ceil(((error.nextRetryAt ?? now) - now) / 1000),
   )
   return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
+}
+
+export function isQuotaPolicyAuthError(error: unknown) {
+  const status = (error as { status?: unknown }).status
+  if (status === 403) return true
+  return /Claude quota check failed: 403\b/.test(formatErrorMessage(error))
 }
 
 export function buildQuotaOperationError(input: {
@@ -1340,11 +1569,7 @@ export async function setLogLevelPersistent(
   path = getAccountStoragePath(),
 ) {
   const { setLogLevel } = await import('./logger.ts')
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.logging = {
     ...(storage.logging ?? {}),
     level,
@@ -1387,6 +1612,48 @@ function failClosedOnUnknownQuota(storage: AccountStorage | null) {
   )
 }
 
+function scopedQuotaModelKey(model: unknown): string | null {
+  if (typeof model !== 'string') return null
+  const normalized = model.toLowerCase()
+  if (normalized.includes('fable')) return 'fable'
+  if (normalized.includes('mythos')) return 'mythos'
+  return null
+}
+
+export function getScopedQuotaWindowForModel(
+  quota: OAuthQuotaSnapshot | undefined,
+  model: unknown,
+): AccountScopedQuotaWindow | undefined {
+  const key = scopedQuotaModelKey(model)
+  if (!key) return undefined
+  return quota?.scoped?.find((window) => {
+    const haystack = [window.modelId, window.modelName, window.title]
+      .filter((value): value is string => typeof value === 'string')
+      .join(' ')
+      .toLowerCase()
+    return haystack.includes(key)
+  })
+}
+
+export function quotaSnapshotModelScopeIsExhausted(
+  quota: OAuthQuotaSnapshot | undefined,
+  model: unknown,
+) {
+  const window = getScopedQuotaWindowForModel(quota, model)
+  return Boolean(
+    window &&
+      Number.isFinite(window.remainingPercent) &&
+      window.remainingPercent <= 0,
+  )
+}
+
+export function quotaSnapshotPassesModelScope(
+  quota: OAuthQuotaSnapshot | undefined,
+  model: unknown,
+) {
+  return !quotaSnapshotModelScopeIsExhausted(quota, model)
+}
+
 export function quotaSnapshotPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
@@ -1409,16 +1676,21 @@ export function quotaSnapshotPassesPolicy(
 // thresholds, even if the API would still accept them.
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<QuotaWindowName, number> = {
+export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<
+  QuotaWindowName | 'scoped',
+  number
+> = {
   five_hour: 5,
   seven_day: 10,
+  scoped: 0,
 }
 
-function normalizeKillswitchThresholds(
+export function normalizeKillswitchThresholds(
   thresholds: KillswitchThresholds | undefined,
-): Record<QuotaWindowName, number> {
+): Record<QuotaWindowName | 'scoped', number> {
   const fiveHour = thresholds?.five_hour ?? thresholds?.['5h']
   const sevenDay = thresholds?.seven_day ?? thresholds?.['1w']
+  const scoped = thresholds?.scoped
   return {
     five_hour:
       typeof fiveHour === 'number' && Number.isFinite(fiveHour)
@@ -1428,6 +1700,10 @@ function normalizeKillswitchThresholds(
       typeof sevenDay === 'number' && Number.isFinite(sevenDay)
         ? sevenDay
         : DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
+    scoped:
+      typeof scoped === 'number' && Number.isFinite(scoped)
+        ? scoped
+        : DEFAULT_KILLSWITCH_THRESHOLDS.scoped,
   }
 }
 
@@ -1435,10 +1711,10 @@ export function isKillswitchEnabled(storage: AccountStorage | null) {
   return storage?.killswitch?.enabled === true
 }
 
-function getKillswitchThresholdsForAccount(
+export function getKillswitchThresholdsForAccount(
   storage: AccountStorage | null,
   accountId?: string,
-): Record<QuotaWindowName, number> {
+): Record<QuotaWindowName | 'scoped', number> {
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
   if (accountId && storage.killswitch.accounts?.[accountId]) {
     return normalizeKillswitchThresholds(storage.killswitch.accounts[accountId])
@@ -1449,11 +1725,16 @@ function getKillswitchThresholdsForAccount(
 /**
  * Returns true if the account's quota is above its killswitch threshold.
  * When killswitch is disabled, always returns true.
+ *
+ * When `modelId` is provided, the per-account `scoped` threshold is also
+ * evaluated against the quota window matching that model — additive to the
+ * 5h/7d check. A model with no matching scoped window is unaffected.
  */
 export function killswitchPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
   accountId?: string,
+  modelId?: string,
 ) {
   if (!isKillswitchEnabled(storage)) return true
   const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
@@ -1473,6 +1754,24 @@ export function killswitchPassesPolicy(
     }
     if (window.remainingPercent < thresholds[key]) return false
   }
+  // Scoped check is additive to the 5h/7d evaluation above and is an
+  // INDEPENDENT block reason — it must run before the unknown-window
+  // fail-closed decision, so an exhausted scoped window blocks even when
+  // 5h/7d is missing/non-finite (the latter only changes the fall-through
+  // for accounts that did not already block on scoped). A missing scoped
+  // window (no carve-out for this model) is not "unknown quota" — only a
+  // PRESENT window at/below threshold blocks. The comparison is inclusive
+  // (`<=`) so the default 0 fires at exhaustion.
+  if (modelId) {
+    const scopedWindow = getScopedQuotaWindowForModel(quota, modelId)
+    if (
+      scopedWindow &&
+      Number.isFinite(scopedWindow.remainingPercent) &&
+      scopedWindow.remainingPercent <= thresholds.scoped
+    ) {
+      return false
+    }
+  }
   if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)
   return true
 }
@@ -1480,21 +1779,38 @@ export function killswitchPassesPolicy(
 /**
  * Find the earliest reset time across all accounts' quota windows.
  * Returns seconds from `now` until that reset, or 300 as a fallback.
+ *
+ * When `scopedModelId` is provided, ONLY the matched scoped window's
+ * `resetsAt` is considered — the 5h/7d resets are intentionally ignored
+ * so the retry hint reflects the weekly reset, not the sooner 5h reset
+ * (which would cause a retry-storm against a block that won't clear for
+ * days). With `scopedModelId` undefined, the 5h/7d behavior is unchanged.
  */
 export function killswitchRetryAfterSeconds(
   mainQuota: OAuthQuotaSnapshot | undefined,
   fallbackAccounts: Array<{ quota?: OAuthQuotaSnapshot }>,
   now: number,
+  scopedModelId?: string,
 ): number {
   const resetTimes: number[] = []
   const allQuotas = [mainQuota, ...fallbackAccounts.map((a) => a.quota)]
   for (const quota of allQuotas) {
-    for (const key of ['five_hour', 'seven_day'] as const) {
-      const resetStr = quota?.[key]?.resetsAt
+    if (scopedModelId) {
+      const scopedWindow = getScopedQuotaWindowForModel(quota, scopedModelId)
+      const resetStr = scopedWindow?.resetsAt
       if (!resetStr) continue
       const resetTime = Date.parse(resetStr)
       if (Number.isFinite(resetTime) && resetTime > now) {
         resetTimes.push(resetTime)
+      }
+    } else {
+      for (const key of ['five_hour', 'seven_day'] as const) {
+        const resetStr = quota?.[key]?.resetsAt
+        if (!resetStr) continue
+        const resetTime = Date.parse(resetStr)
+        if (Number.isFinite(resetTime) && resetTime > now) {
+          resetTimes.push(resetTime)
+        }
       }
     }
   }
@@ -1512,11 +1828,7 @@ export async function setKillswitchPersistent(
   config: KillswitchConfig,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.killswitch = config
   await saveAccounts(storage, path)
   return storage
@@ -1559,11 +1871,7 @@ export async function addAccountPersistent(
   account: FallbackAccount,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   upsertAccount(storage, account)
   await saveAccounts(storage, path)
 }
@@ -1690,6 +1998,54 @@ function clampPercent(value: number) {
   return value
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function slugForQuotaIdentity(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function mapScopedWeeklyLimits(
+  limits: OAuthUsageLimit[] | undefined,
+  checkedAt: number,
+): AccountScopedQuotaWindow[] {
+  if (!Array.isArray(limits)) return []
+  const seen = new Set<string>()
+  const scoped: AccountScopedQuotaWindow[] = []
+  for (const limit of limits) {
+    if (limit?.kind !== 'weekly_scoped' || limit.group !== 'weekly') continue
+    if (typeof limit.percent !== 'number' || !Number.isFinite(limit.percent)) {
+      continue
+    }
+    const modelName = nonEmptyString(limit.scope?.model?.display_name)
+    if (!modelName) continue
+    const identity = nonEmptyString(limit.scope?.model?.id) ?? modelName
+    const slug = slugForQuotaIdentity(identity)
+    if (!slug) continue
+    const id = `claude-weekly-scoped-${slug}`
+    if (seen.has(id)) continue
+    seen.add(id)
+
+    const usedPercent = clampPercent(limit.percent)
+    const modelId = nonEmptyString(limit.scope?.model?.id)
+    scoped.push({
+      id,
+      title: `${modelName} only`,
+      ...(modelId && { modelId }),
+      modelName,
+      usedPercent,
+      remainingPercent: clampPercent(100 - usedPercent),
+      resetsAt: limit.resets_at,
+      checkedAt,
+    })
+  }
+  return scoped
+}
+
 function mapUsageWindow(
   window: OAuthUsageWindow | undefined,
   checkedAt: number,
@@ -1709,7 +2065,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   accessToken: string
   fetchImpl?: typeof fetch
   now?: () => number
-}) {
+}): Promise<OAuthQuotaSnapshot> {
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
     method: 'GET',
@@ -1739,6 +2095,8 @@ export async function fetchOAuthQuotaSnapshot(input: {
   return {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),
     seven_day: mapUsageWindow(usage.seven_day, checkedAt),
+    scoped: mapScopedWeeklyLimits(usage.limits, checkedAt),
+    checkedAt,
   } satisfies OAuthQuotaSnapshot
 }
 
@@ -1826,6 +2184,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (isQuotaPolicyAuthError(error)) return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
@@ -1921,7 +2280,10 @@ export class FallbackAccountManager {
     this.quotaTimer = null
   }
 
-  async getUsableFallbackAccounts(existingStorage?: AccountStorage | null) {
+  async getUsableFallbackAccounts(
+    existingStorage?: AccountStorage | null,
+    options: { modelId?: string } = {},
+  ) {
     const storage =
       existingStorage !== undefined ? existingStorage : await this.load()
     if (!storage) return []
@@ -1964,7 +2326,13 @@ export class FallbackAccountManager {
         // QuotaManager cache (the same source as the staleness check above) so
         // an active-route refresh that updated only the cache is not ignored.
         if (
-          this.accountPassesQuotaPolicy(this.quotaPolicyAccount(next), storage)
+          this.accountPassesQuotaPolicy(
+            this.quotaPolicyAccount(next),
+            storage,
+            {
+              modelId: options.modelId,
+            },
+          )
         )
           usable.push(next)
       } catch (error) {
@@ -1983,8 +2351,21 @@ export class FallbackAccountManager {
               error: formatErrorMessage(error),
             },
           )
-          usable.push(account)
-        } else if (!failClosedOnUnknownQuota(storage)) {
+          if (
+            this.accountPassesQuotaPolicy(
+              this.quotaPolicyAccount(account),
+              storage,
+              {
+                modelId: options.modelId,
+              },
+            )
+          ) {
+            usable.push(account)
+          }
+        } else if (
+          !failClosedOnUnknownQuota(storage) &&
+          quotaSnapshotPassesModelScope(account.quota, options.modelId)
+        ) {
           usable.push(account)
         }
       }
@@ -2008,8 +2389,12 @@ export class FallbackAccountManager {
   accountPassesQuotaPolicy(
     account: OAuthAccount,
     storage: AccountStorage | null,
+    options: { modelId?: string } = {},
   ) {
-    return quotaSnapshotPassesPolicy(account.quota, storage)
+    return (
+      quotaSnapshotPassesPolicy(account.quota, storage) &&
+      quotaSnapshotPassesModelScope(account.quota, options.modelId)
+    )
   }
 
   /**

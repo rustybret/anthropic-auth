@@ -156,6 +156,137 @@ describe('CacheKeepManager', () => {
     manager.stop()
   })
 
+  test('prewarms immediately without requiring cachekeep enablement or its window', async () => {
+    let sentBody = ''
+    let seenAccountId: string | undefined
+    const fetchImpl = mock(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        sentBody = String(init?.body)
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { cache_read_input_tokens: 123 } }),
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(null),
+      fetchImpl,
+      prepareHeaders: (headers, target) => {
+        seenAccountId = target.oauthAccountId
+        headers.set('authorization', 'Bearer fresh')
+        return headers
+      },
+    })
+
+    const result = await manager.prewarmNow({
+      sessionId: 'ses_fable',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers({ authorization: 'Bearer stale' }),
+      bodyText: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      oauthAccountId: 'fallback-account',
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      usage: { cache_read_input_tokens: 123 },
+    })
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(seenAccountId).toBe('fallback-account')
+    expect(JSON.parse(sentBody).model).toBe('claude-fable-5')
+    expect(JSON.parse(sentBody).max_tokens).toBe(0)
+  })
+
+  test('bounds immediate prewarm requests so final Fable recovery cannot hang', async () => {
+    const fetchImpl = mock(
+      (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(init.signal?.reason),
+            { once: true },
+          )
+        }),
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(null),
+      fetchImpl,
+      prewarmTimeoutMs: 5,
+    })
+
+    const result = manager.prewarmNow({
+      sessionId: 'ses_timeout',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    await expect(result).rejects.toMatchObject({ name: 'TimeoutError' })
+  })
+
+  test('passes OAuth account identity to prewarm header refresh', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    let seenAccountId: string | undefined
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+      prepareHeaders: (headers, target) => {
+        seenAccountId = target.oauthAccountId
+        return headers
+      },
+    })
+
+    await manager.track({
+      sessionId: 'ses_1',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers({ authorization: 'Bearer fallback' }),
+      bodyText: JSON.stringify({
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+      oauthAccountId: 'fallback-account',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(seenAccountId).toBe('fallback-account')
+    manager.stop()
+  })
+
   test('lets callers refresh headers before prewarm fetch', async () => {
     let now = new Date('2026-05-18T10:00:00').getTime()
     let seenAuthorization = ''

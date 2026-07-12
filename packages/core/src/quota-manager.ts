@@ -22,6 +22,7 @@ import {
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getQuotaRefreshEveryNRequests,
+  isQuotaPolicyAuthError,
   quotaBackoffActive,
 } from './accounts.ts'
 
@@ -555,10 +556,12 @@ export class QuotaManager {
     })
   }
 
-  // A 401 is an auth/token problem, not a rate limit. The caller refreshes the
-  // token and retries; backing off the quota API here would block that retry,
-  // so surface 401s without recording backoff state.
+  // A 401 is an auth/token problem and a 403 is an account/org policy problem,
+  // not quota endpoint saturation. Surface both without recording quota backoff
+  // so callers can refresh, re-auth, or try another account immediately.
   private static isAuthError(error: unknown): boolean {
+    const status = (error as { status?: unknown }).status
+    if (status === 401 || isQuotaPolicyAuthError(error)) return true
     const message = error instanceof Error ? error.message : String(error)
     return /quota check failed: 401\b/.test(message)
   }

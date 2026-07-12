@@ -7,6 +7,31 @@ type ApplyFn = (
   args: string,
 ) => Promise<{ text: string; knobs: Record<string, unknown> }>
 
+type KillswitchDialogConfig = {
+  enabled?: boolean
+  main?: Record<string, number>
+  accounts?: Record<string, Record<string, number>>
+}
+
+export function buildKillswitchThresholdSeed(
+  config: KillswitchDialogConfig,
+  accountIds: string[],
+) {
+  const readT = (t: Record<string, number> | undefined) => {
+    const fh = t?.five_hour ?? t?.['5h'] ?? 5
+    const sd = t?.seven_day ?? t?.['1w'] ?? 10
+    const scoped = t?.scoped ?? 0
+    return { fh, sd, scoped }
+  }
+  const mainT = readT(config.main)
+  const seedParts = [`main:${mainT.fh},${mainT.sd},${mainT.scoped}`]
+  for (const id of accountIds) {
+    const t = readT(config.accounts?.[id] ?? config.main)
+    seedParts.push(`${id}:${t.fh},${t.sd},${t.scoped}`)
+  }
+  return seedParts.join(' ')
+}
+
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
@@ -150,25 +175,10 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'claude-killswitch') {
-    const config = (payload.knobs.config ?? {}) as {
-      enabled?: boolean
-      main?: Record<string, number>
-      accounts?: Record<string, Record<string, number>>
-    }
+    const config = (payload.knobs.config ?? {}) as KillswitchDialogConfig
     const accountIds = (payload.knobs.accountIds as string[]) ?? []
     const enabled = config.enabled === true
-    const readT = (t: Record<string, number> | undefined) => {
-      const fh = t?.five_hour ?? t?.['5h'] ?? 5
-      const sd = t?.seven_day ?? t?.['1w'] ?? 10
-      return { fh, sd }
-    }
-    const mainT = readT(config.main)
-    const seedParts = [`main:${mainT.fh},${mainT.sd}`]
-    for (const id of accountIds) {
-      const t = readT(config.accounts?.[id] ?? config.main)
-      seedParts.push(`${id}:${t.fh},${t.sd}`)
-    }
-    const seed = seedParts.join(' ')
+    const seed = buildKillswitchThresholdSeed(config, accountIds)
 
     const openEdit = () => {
       const DialogPrompt = api.ui.DialogPrompt
@@ -177,7 +187,7 @@ export function openCommandDialog(
         <DialogPrompt
           title='Killswitch thresholds'
           description={() => <text>{payload.text}</text>}
-          placeholder='main:5,10 work-alt:5,10'
+          placeholder='main:5,10,0 work-alt:5,10,0'
           value={seed}
           onConfirm={(value: string) => {
             void apply('claude-killswitch', `set ${value.trim()}`).then((r) => {
@@ -206,7 +216,7 @@ export function openCommandDialog(
           {
             title: 'Edit thresholds…',
             value: 'edit',
-            description: 'Set per-account 5h,1w cutoffs',
+            description: 'Set per-account 5h,1w,scoped cutoffs',
           },
         ]}
         onSelect={(option) => {
@@ -517,13 +527,13 @@ export function openCommandDialog(
               openOAuthUrlScreen(oauthUrl)
               return
             }
-            openOAuthCodePrompt()
+            openOAuthCodePrompt(oauthUrl)
           }}
         />
       ))
     }
 
-    const openOAuthCodePrompt = () => {
+    const openOAuthCodePrompt = (oauthUrl: string) => {
       const DialogPrompt = api.ui.DialogPrompt
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
@@ -543,15 +553,44 @@ export function openCommandDialog(
               buildL1()
               return
             }
-            void apply('claude-account', `add-oauth-finish ${trimmed}`).then(
-              (r) => {
-                api.ui.toast({ message: r.text })
-                updateAccounts(r)
-                buildL1()
-              },
-            )
+            openOAuthLabelPrompt(trimmed, oauthUrl)
           }}
-          onCancel={() => buildL1()}
+          // Step BACK to the sign-in URL screen, not L1: the OAuth session
+          // (PKCE verifier/state) is already minted. Returning to L1 would let a
+          // retry re-run add-oauth-start and re-mint it, invalidating the URL the
+          // user is mid-sign-in with. Same session → same URL is preserved.
+          onCancel={() => openOAuthUrlScreen(oauthUrl)}
+        />
+      ))
+    }
+
+    const openOAuthLabelPrompt = (code: string, oauthUrl: string) => {
+      const DialogPrompt = api.ui.DialogPrompt
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='OAuth sign-in \u2014 label'
+          description={() => (
+            <text>A short name for this account (optional).</text>
+          )}
+          placeholder='e.g. work'
+          value=''
+          onConfirm={(value: string) => {
+            const label = value.trim()
+            const args = label
+              ? `add-oauth-finish ${code} --label ${label}`
+              : `add-oauth-finish ${code}`
+            void apply('claude-account', args).then((r) => {
+              api.ui.toast({ message: r.text })
+              updateAccounts(r)
+              buildL1()
+            })
+          }}
+          // Step BACK to the code prompt, not L1: the user already obtained an
+          // auth code to reach this step. Returning to L1 would let a retry
+          // re-run add-oauth-start, minting a new PKCE verifier/state that
+          // invalidates the code they already have and forces a full re-auth.
+          onCancel={() => openOAuthCodePrompt(oauthUrl)}
         />
       ))
     }

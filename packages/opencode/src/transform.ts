@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
@@ -5,10 +6,13 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
+  isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   mergeAnthropicBetas,
@@ -452,6 +456,12 @@ type CacheControl = { type: string; ttl?: string; [k: string]: unknown }
 const CACHE_1H_CONTROL = { type: 'ephemeral', ttl: '1h' } as const
 const ANTHROPIC_CACHE_LOOKBACK_BLOCKS = 20
 
+export type HybridMessageCacheAnchor = {
+  fingerprint: string
+  messageIndex: number
+  messageCount: number
+}
+
 function getCacheControl(value: Record<string, unknown>) {
   if (isRecord(value.cache_control)) return value.cache_control
   if (isRecord(value.cacheControl)) return value.cacheControl
@@ -477,6 +487,72 @@ function normalizeContentToArray(content: unknown) {
   if (Array.isArray(content)) return content
   if (typeof content === 'string') return [{ type: 'text', text: content }]
   return null
+}
+
+function normalizeCacheFingerprintValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(normalizeCacheFingerprintValue)
+  }
+  if (!isRecord(value)) return value
+
+  const normalized: Record<string, unknown> = {}
+  for (const key of Object.keys(value).sort()) {
+    if (key === 'cache_control' || key === 'cacheControl') continue
+    normalized[key] = normalizeCacheFingerprintValue(value[key])
+  }
+  return normalized
+}
+
+function cacheAnchorMessageFingerprint(message: unknown) {
+  if (!isRecord(message)) return undefined
+  const content = normalizeContentToArray(message.content)
+  if (!content?.length) return undefined
+  const normalized = normalizeCacheFingerprintValue({
+    ...message,
+    content,
+  })
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
+}
+
+function messageHasWireCacheAnchor(message: unknown) {
+  if (!isRecord(message)) return false
+  const content = normalizeContentToArray(message.content)
+  return Boolean(
+    content?.some(
+      (block) =>
+        isRecord(block) && getCacheControl(block)?.type === 'ephemeral',
+    ),
+  )
+}
+
+export function extractLatestHybridMessageCacheAnchor(
+  bodyText: string,
+): HybridMessageCacheAnchor | undefined {
+  try {
+    const parsed = JSON.parse(bodyText) as Record<string, unknown>
+    if (!Array.isArray(parsed.messages)) return undefined
+
+    for (let index = parsed.messages.length - 1; index > 1; index--) {
+      const message = parsed.messages[index]
+      if (
+        !isRecord(message) ||
+        message.role !== 'user' ||
+        !messageHasWireCacheAnchor(message)
+      ) {
+        continue
+      }
+      const fingerprint = cacheAnchorMessageFingerprint(message)
+      if (!fingerprint) return undefined
+      return {
+        fingerprint,
+        messageIndex: index,
+        messageCount: parsed.messages.length,
+      }
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 function updateCacheControlTtl(value: unknown, cache1hEnabled: boolean) {
@@ -632,10 +708,74 @@ function findUserCacheAnchors(messages: unknown[]) {
   return anchors
 }
 
-function selectHybridMessageAnchors(messages: unknown[]) {
+function findStandbyHybridAnchor(
+  messages: unknown[],
+  userAnchors: Array<{ index: number; blockPosition: number }>,
+  latest: { index: number; blockPosition: number },
+  standbyAnchor: HybridMessageCacheAnchor | undefined,
+) {
+  if (!standbyAnchor) return undefined
+
+  const candidates: Array<{ index: number; blockPosition: number }> = []
+  const hinted = userAnchors.find(
+    (anchor) =>
+      anchor.index === standbyAnchor.messageIndex &&
+      anchor.index > 1 &&
+      anchor.index < latest.index,
+  )
+  if (hinted) candidates.push(hinted)
+  for (const anchor of [...userAnchors].reverse()) {
+    if (
+      anchor.index <= 1 ||
+      anchor.index >= latest.index ||
+      anchor.index === hinted?.index
+    ) {
+      continue
+    }
+    candidates.push(anchor)
+  }
+
+  for (const anchor of candidates) {
+    if (
+      cacheAnchorMessageFingerprint(messages[anchor.index]) ===
+      standbyAnchor.fingerprint
+    ) {
+      return anchor
+    }
+  }
+  return undefined
+}
+
+function selectHybridMessageAnchors(
+  messages: unknown[],
+  standbyAnchor?: HybridMessageCacheAnchor,
+) {
   const userAnchors = findUserCacheAnchors(messages)
   const latest = [...userAnchors].reverse().find((anchor) => anchor.index > 1)
-  if (!latest) return { latest: undefined, bridge: undefined }
+  if (!latest) {
+    return {
+      latest: undefined,
+      bridge: undefined,
+      standbyAnchorMatched: false,
+      standbyBridgeApplied: false,
+    }
+  }
+
+  const standby = findStandbyHybridAnchor(
+    messages,
+    userAnchors,
+    latest,
+    standbyAnchor,
+  )
+  const standbyDistanceBlocks = standby
+    ? latest.blockPosition - standby.blockPosition + 1
+    : undefined
+  const standbyBridge =
+    standby &&
+    standbyDistanceBlocks != null &&
+    standbyDistanceBlocks > ANTHROPIC_CACHE_LOOKBACK_BLOCKS
+      ? standby
+      : undefined
 
   const previous = [...userAnchors]
     .reverse()
@@ -643,14 +783,20 @@ function selectHybridMessageAnchors(messages: unknown[]) {
   const distanceFromPrevious = previous
     ? latest.blockPosition - previous.blockPosition + 1
     : 0
-  const bridge =
+  const lookbackBridge =
     previous &&
     previous.index > 1 &&
     distanceFromPrevious > ANTHROPIC_CACHE_LOOKBACK_BLOCKS
       ? previous
       : undefined
 
-  return { latest, bridge }
+  return {
+    latest,
+    bridge: standbyBridge ?? lookbackBridge,
+    standbyAnchorMatched: Boolean(standby),
+    standbyDistanceBlocks,
+    standbyBridgeApplied: Boolean(standbyBridge),
+  }
 }
 
 function systemBlockText(block: unknown) {
@@ -709,21 +855,34 @@ function setHybridSystemAnchor(parsed: Record<string, unknown>) {
   }
 }
 
-function applyHybridCache1h(parsed: Record<string, unknown>) {
+function applyHybridCache1h(
+  parsed: Record<string, unknown>,
+  standbyAnchor?: HybridMessageCacheAnchor,
+) {
   removeAllCacheControls(parsed)
   coalesceHybridSystemTail(parsed)
 
   if (!Array.isArray(parsed.messages)) {
     setHybridSystemAnchor(parsed)
-    return
+    return {
+      standbyAnchorMatched: false,
+      standbyBridgeApplied: false,
+    }
   }
 
-  const { latest, bridge } = selectHybridMessageAnchors(parsed.messages)
+  const {
+    latest,
+    bridge,
+    standbyAnchorMatched,
+    standbyDistanceBlocks,
+    standbyBridgeApplied,
+  } = selectHybridMessageAnchors(parsed.messages, standbyAnchor)
 
   // Hybrid has only four Anthropic cache slots. Keep the system fallback in
-  // normal turns, but spend that slot on the previous user/tool-result boundary
-  // when a tool-heavy step pushes the latest user boundary outside Anthropic's
-  // 20-block lookback window.
+  // normal turns, but spend that slot on a previous user/tool-result boundary
+  // when a tool-heavy step exceeds Anthropic's 20-block lookback or when a
+  // model-specific standby cache (Opus during healthy Fable turns) must bridge
+  // from its last known tail to the current request.
   if (!bridge) setHybridSystemAnchor(parsed)
 
   const firstMessageHasSplitPrefix = hasMultipleCacheableContentBlocks(
@@ -742,6 +901,15 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   }
   if (bridge) setMessageCacheAnchor(parsed.messages[bridge.index])
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
+
+  return {
+    standbyAnchorMatched,
+    standbyDistanceBlocks,
+    standbyBridgeApplied,
+    ...(standbyBridgeApplied && bridge
+      ? { standbyBridgeMessageIndex: bridge.index }
+      : {}),
+  }
 }
 
 function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {
@@ -776,29 +944,73 @@ function normalizeFableMythosRequest(
   return { replacedExisting: hadThinking }
 }
 
+/**
+ * Sonnet 5 has adaptive thinking on by default but defaults `display` to
+ * "omitted", so the thinking field returns empty. Inject
+ * `{type:"adaptive",display:"summarized"}` to make it visible — UNLESS the
+ * caller explicitly disabled thinking. Unlike Fable/Mythos (which reject a
+ * disable), Sonnet 5 accepts `{type:"disabled"}`, so an intentional opt-out is
+ * preserved rather than force-enabled. A manual `{type:"enabled",budget_tokens}`
+ * would 400 on Sonnet 5, so it is overwritten with the adaptive form.
+ */
+function normalizeSonnet5Request(
+  parsed: Record<string, unknown>,
+): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+  if (!isClaudeSonnet5Model(parsed.model)) return null
+  const hadThinking = Object.hasOwn(parsed, 'thinking')
+  const thinking = parsed.thinking
+  if (isRecord(thinking) && thinking.type === 'disabled') {
+    // `display` is invalid alongside `type:"disabled"` (nothing to display) and
+    // can 400; canonicalize to a bare disabled object while keeping thinking off.
+    parsed.thinking = { type: 'disabled' }
+    return { replacedExisting: hadThinking, display: 'disabled' }
+  }
+  parsed.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
+  return { replacedExisting: hadThinking, display: 'summarized' }
+}
+
+export function prepareFableCacheWarmSource(
+  bodyText: string,
+  fableModel = CLAUDE_FABLE_5_MODEL_ID,
+): { ok: true; bodyText: string } | { ok: false; reason: string } {
+  try {
+    const body = JSON.parse(bodyText) as Record<string, unknown>
+    body.model = fableModel
+    delete body.speed
+    normalizeFableMythosRequest(body)
+    return { ok: true, bodyText: JSON.stringify(body) }
+  } catch {
+    return { ok: false, reason: 'body is not valid JSON' }
+  }
+}
+
 function applyCache1hStrategy(
   parsed: Record<string, unknown>,
-  options: { enabled: boolean; mode: Cache1hMode },
+  options: {
+    enabled: boolean
+    mode: Cache1hMode
+    hybridStandbyAnchor?: HybridMessageCacheAnchor
+  },
 ) {
   if (!options.enabled) {
     applyCache1hTtl(parsed, false)
     delete parsed.cache_control
     delete parsed.cacheControl
-    return
+    return {}
   }
 
   if (options.mode === 'automatic') {
     applyAutomaticCache1h(parsed)
-    return
+    return {}
   }
 
   if (options.mode === 'hybrid') {
-    applyHybridCache1h(parsed)
-    return
+    return applyHybridCache1h(parsed, options.hybridStandbyAnchor)
   }
 
   applyCache1hTtl(parsed, true)
   delete parsed.cacheControl
+  return {}
 }
 
 /**
@@ -871,6 +1083,7 @@ export async function rewriteRequestBody(
     fastModeEnabled?: boolean
     identity?: ClaudeCodeIdentity
     perf?: RewritePerfCallback
+    hybridStandbyAnchor?: HybridMessageCacheAnchor
   } = {},
 ): Promise<string> {
   try {
@@ -902,6 +1115,7 @@ export async function rewriteRequestBody(
     const modelNormalizeStart = rewriteNowMs()
     const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
+    const sonnet5Thinking = normalizeSonnet5Request(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
@@ -910,6 +1124,8 @@ export async function rewriteRequestBody(
         : undefined,
       replacedFableMythosThinking:
         fableMythosThinking?.replacedExisting ?? false,
+      sonnet5ThinkingDisplay: sonnet5Thinking?.display,
+      replacedSonnet5Thinking: sonnet5Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
@@ -946,14 +1162,16 @@ export async function rewriteRequestBody(
     }
 
     const cacheStart = rewriteNowMs()
-    applyCache1hStrategy(parsed, {
+    const cachePlacement = applyCache1hStrategy(parsed, {
       enabled: options.cache1hEnabled ?? false,
       mode: options.cache1hMode ?? 'explicit',
+      hybridStandbyAnchor: options.hybridStandbyAnchor,
     })
     options.perf?.('cache_strategy', {
       ms: rewriteRoundMs(rewriteNowMs() - cacheStart),
       enabled: options.cache1hEnabled ?? false,
       mode: options.cache1hMode ?? 'explicit',
+      ...cachePlacement,
     })
 
     if (options.fastModeEnabled && isFastModeSupportedModel(parsed.model)) {
@@ -1119,7 +1337,8 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
   summary.index = numberField(data, 'index')
   summary.contentBlockType = stringField(contentBlock, 'type')
   summary.deltaType = stringField(delta, 'type')
-  summary.stopReason = stringField(data, 'stop_reason')
+  summary.stopReason =
+    stringField(delta, 'stop_reason') ?? stringField(data, 'stop_reason')
 
   if (summary.deltaType === 'text_delta') {
     summary.textDeltaBytes = stringBytes(stringField(delta, 'text') ?? '')
@@ -1193,6 +1412,40 @@ type SseErrorState = {
   pending: string
 }
 
+type SseFinishState = {
+  pending: string
+  completed: boolean
+}
+
+type SseFinishUpdate =
+  | { type: 'content-filter' }
+  | { type: 'complete'; finishReason: string }
+
+function createSseFinishState(): SseFinishState {
+  return { pending: '', completed: false }
+}
+
+function updateSseFinishState(
+  state: SseFinishState,
+  text: string,
+): SseFinishUpdate | null {
+  if (!text || state.completed) return null
+  state.pending += text
+
+  while (true) {
+    const boundary = findSseBoundary(state.pending)
+    if (!boundary) return null
+    const rawEvent = state.pending.slice(0, boundary.index)
+    state.pending = state.pending.slice(boundary.index + boundary.length)
+    const summary = summarizeSseEvent(rawEvent)
+    if (summary?.type !== 'message_delta' || !summary.stopReason) continue
+    state.completed = true
+    return summary.stopReason === 'refusal'
+      ? { type: 'content-filter' }
+      : { type: 'complete', finishReason: summary.stopReason }
+  }
+}
+
 type RetryableAnthropicStreamError = Error & {
   code: 'ECONNRESET'
   syscall: 'anthropic-sse'
@@ -1230,6 +1483,16 @@ function retryableAnthropicStreamError(
   error.code = 'ECONNRESET'
   error.syscall = 'anthropic-sse'
   if (errorType) error.providerErrorType = errorType
+  return error
+}
+
+function retryableFableContentFilterError(): RetryableAnthropicStreamError {
+  const error = new Error(
+    'Fable response was blocked by the provider content filter; retrying with Opus 4.8',
+  ) as RetryableAnthropicStreamError
+  error.code = 'ECONNRESET'
+  error.syscall = 'anthropic-sse'
+  error.providerErrorType = 'refusal'
   return error
 }
 
@@ -1322,7 +1585,11 @@ function sseDiagnosticStats(state: SseDiagnosticState) {
  */
 export function createStrippedStream(
   response: Response,
-  options: { perf?: RewritePerfCallback } = {},
+  options: {
+    perf?: RewritePerfCallback
+    onContentFilter?: () => boolean | undefined
+    onComplete?: (finishReason: string) => void
+  } = {},
 ): Response {
   if (!response.body) return response
 
@@ -1341,11 +1608,35 @@ export function createStrippedStream(
   const streamStart = rewriteNowMs()
   const sseDiagnostics = options.perf ? createSseDiagnosticState() : undefined
   const sseErrors = createSseErrorState()
+  const sseFinish =
+    options.onContentFilter || options.onComplete
+      ? createSseFinishState()
+      : undefined
+
+  const updateFinish = (text: string) => {
+    if (!sseFinish) return null
+    const update = updateSseFinishState(sseFinish, text)
+    if (update?.type === 'content-filter' && options.onContentFilter) {
+      const handled = options.onContentFilter()
+      return handled === false ? null : retryableFableContentFilterError()
+    }
+    if (update?.type === 'complete') options.onComplete?.(update.finishReason)
+    return null
+  }
 
   const releaseReader = () => {
     if (readerReleased) return
     readerReleased = true
     reader.releaseLock()
+  }
+  const cancelReader = async (reason: unknown) => {
+    try {
+      await reader.cancel(reason)
+    } catch {
+      // The stream may already be closed by the provider.
+    } finally {
+      releaseReader()
+    }
   }
   const streamStats = (extra: Record<string, unknown> = {}) => ({
     chunks: chunkCount,
@@ -1382,16 +1673,15 @@ export function createStrippedStream(
         if (done) {
           const finalDecoded = decoder.decode()
           if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, finalDecoded)
-          const retryableStreamError = updateSseErrorState(
-            sseErrors,
-            finalDecoded,
-          )
+          const retryableStreamError =
+            updateSseErrorState(sseErrors, finalDecoded) ??
+            updateFinish(finalDecoded)
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
               providerErrorType: retryableStreamError.providerErrorType,
             })
-            releaseReader()
+            await cancelReader(retryableStreamError)
             throw retryableStreamError
           }
           const rewriteStart = rewriteNowMs()
@@ -1415,7 +1705,8 @@ export function createStrippedStream(
         inputBytes += value.byteLength
         const decoded = decoder.decode(value, { stream: true })
         if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
-        const retryableStreamError = updateSseErrorState(sseErrors, decoded)
+        const retryableStreamError =
+          updateSseErrorState(sseErrors, decoded) ?? updateFinish(decoded)
         if (retryableStreamError) {
           logProgress('stream_tool_prefix_retryable_error', {
             error: retryableStreamError.message,

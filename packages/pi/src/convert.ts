@@ -5,8 +5,10 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
+  isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   orderClaudeCodeBody,
@@ -406,12 +408,19 @@ export async function buildAnthropicRequest(
   }
 
   const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
+  const isSonnet5 = isClaudeSonnet5Model(modelId)
+  // Sonnet 5 shares Fable/Mythos's adaptive-summarized contract: make adaptive
+  // thinking visible (display defaults to "omitted") and map reasoning to
+  // output_config effort. Pi's typed options cannot express thinking-disabled,
+  // so there is no disable case here (see transform.ts for the raw-body path).
   if (isFableOrMythos5) {
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  } else if (isSonnet5) {
+    body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
   }
 
   if (options?.reasoning) {
-    if (isFableOrMythos5) {
+    if (isFableOrMythos5 || isSonnet5) {
       body.output_config = { effort: options.reasoning }
     } else {
       const budgets: Record<string, number> = {

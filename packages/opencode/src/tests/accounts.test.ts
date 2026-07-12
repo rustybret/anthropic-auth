@@ -24,15 +24,19 @@ import {
   getCache1hPersistentMode,
   getLogLevel,
   getPersistedLogLevel,
+  getScopedQuotaWindowForModel,
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  isPermanentRefreshError,
   type KillswitchThresholds,
   killswitchPassesPolicy,
   loadAccounts,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   QuotaManager,
+  quotaSnapshotModelScopeIsExhausted,
+  quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   removeAccount,
   removeAccountPersistent,
@@ -221,6 +225,127 @@ describe('account storage', () => {
     expect(rawState.accounts['kie-opus'].apiKey).toBe('kie-key')
 
     await expect(loadAccounts()).resolves.toEqual(storage)
+  })
+
+  test('prefers newer legacy config OAuth credentials over stale runtime state', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          {
+            id: 'umut',
+            label: 'umut',
+            type: 'oauth',
+            enabled: true,
+            addedAt: 1,
+            lastUsed: 2_000,
+            access: 'new-access',
+            refresh: 'new-refresh',
+            expires: 3_000,
+          },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      getAccountStatePath(),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          umut: {
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires: 1_000,
+            lastRefreshedAt: 1_000,
+            lastRefreshError: {
+              message: 'Claude OAuth refresh failed: 400 invalid_grant',
+              checkedAt: 1_500,
+              nextRetryAt: 99_999,
+              status: 400,
+              permanent: true,
+            },
+            lastQuotaRefreshError: {
+              message: 'refresh backed off',
+              checkedAt: 1_500,
+            },
+            quota: {
+              five_hour: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: 1_500,
+              },
+            },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts[0]
+    expect(account?.type).toBe('oauth')
+    if (account?.type !== 'oauth') throw new Error('expected oauth account')
+    expect(account).toMatchObject({
+      id: 'umut',
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: 3_000,
+      lastUsed: 2_000,
+      lastRefreshedAt: 2_000,
+    })
+    expect(account.lastRefreshError).toBeUndefined()
+    expect(account.lastQuotaRefreshError).toBeUndefined()
+    expect(account.quota).toBeUndefined()
+  })
+
+  test('keeps newer runtime OAuth credentials over older legacy config credentials', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          {
+            id: 'umut',
+            label: 'umut',
+            type: 'oauth',
+            enabled: true,
+            addedAt: 1,
+            lastUsed: 500,
+            access: 'old-config-access',
+            refresh: 'old-config-refresh',
+            expires: 500,
+          },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      getAccountStatePath(),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          umut: {
+            access: 'new-state-access',
+            refresh: 'new-state-refresh',
+            expires: 2_000,
+            lastRefreshedAt: 2_000,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts[0]).toMatchObject({
+      id: 'umut',
+      access: 'new-state-access',
+      refresh: 'new-state-refresh',
+      expires: 2_000,
+      lastRefreshedAt: 2_000,
+    })
   })
 
   test('drops API fallback routes with invalid base URLs on load', async () => {
@@ -800,6 +925,70 @@ describe('account storage', () => {
     expect(saved?.claudeFast).toEqual({ enabled: false })
     expect(isFastModePersistentlyEnabled(saved)).toBe(false)
   })
+
+  test('returns null when neither config nor state file exists', async () => {
+    await expect(loadAccounts()).resolves.toBeNull()
+  })
+
+  test('reads runtime state when config file is absent (no fallback accounts)', async () => {
+    const statePath = getAccountStatePath(accountPath)
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        main: {
+          refreshLeaseId: 'lease-abc',
+          refreshLeaseUntil: 9_999_999_999_999,
+          refreshLeaseTokenHash: 'hash-xyz',
+          quota: {
+            five_hour: {
+              usedPercent: 33,
+              remainingPercent: 67,
+              checkedAt: 777,
+            },
+          },
+          quotaCheckedAt: 777,
+          quotaToken: 'token-state-only',
+        },
+      }),
+      'utf8',
+    )
+
+    // Config file must NOT exist for this scenario.
+    await expect(stat(accountPath)).rejects.toThrow()
+
+    const loaded = await loadAccounts()
+    expect(loaded).not.toBeNull()
+    expect(loaded?.accounts).toEqual([])
+    expect(loaded?.refresh?.mainRefreshLeaseId).toBe('lease-abc')
+    expect(loaded?.refresh?.mainRefreshLeaseUntil).toBe(9_999_999_999_999)
+    expect(loaded?.refresh?.mainRefreshLeaseTokenHash).toBe('hash-xyz')
+    expect(loaded?.quota?.mainQuotaToken).toBe('token-state-only')
+    expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(33)
+  })
+
+  test('lease written via saveAccountState is visible to loadAccounts without a config file', async () => {
+    const storage: AccountStorage = {
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      accounts: [],
+      refresh: {
+        mainRefreshLeaseId: 'lease-from-save',
+        mainRefreshLeaseUntil: 9_999_999_999_999,
+        mainRefreshLeaseTokenHash: 'token-hash-from-save',
+      },
+    }
+    await saveAccountState(storage, accountPath, { mainRefresh: true })
+
+    // saveAccountState must not have created the config file.
+    await expect(stat(accountPath)).rejects.toThrow()
+
+    const loaded = await loadAccounts()
+    expect(loaded?.refresh?.mainRefreshLeaseId).toBe('lease-from-save')
+    expect(loaded?.refresh?.mainRefreshLeaseTokenHash).toBe(
+      'token-hash-from-save',
+    )
+  })
 })
 
 describe('FallbackAccountManager', () => {
@@ -850,6 +1039,311 @@ describe('FallbackAccountManager', () => {
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
     expect(expectOAuthAccount(saved?.accounts[0]).expires).toBe(3_601_000)
     expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
+  })
+
+  test('filters fallback accounts with exhausted matching scoped model quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push(
+      {
+        id: 'fable-empty',
+        type: 'oauth',
+        access: 'empty-access',
+        refresh: 'empty-refresh',
+        expires: Date.now() + 5 * 60 * 60 * 1000,
+        quota: {
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          seven_day: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 100,
+              remainingPercent: 0,
+              checkedAt: 1_000,
+            },
+          ],
+        },
+      },
+      {
+        id: 'fable-ok',
+        type: 'oauth',
+        access: 'ok-access',
+        refresh: 'ok-refresh',
+        expires: Date.now() + 5 * 60 * 60 * 1000,
+        quota: {
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          seven_day: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: 1_000,
+            },
+          ],
+        },
+      },
+    )
+    await saveAccounts(storage)
+
+    const manager = new FallbackAccountManager({ now: () => 1_000 })
+
+    expect(
+      (
+        await manager.getUsableFallbackAccounts(undefined, {
+          modelId: 'claude-fable-5',
+        })
+      ).map((account) => account.id),
+    ).toEqual(['fable-ok'])
+    expect(
+      (
+        await manager.getUsableFallbackAccounts(undefined, {
+          modelId: 'claude-opus-4-8',
+        })
+      ).map((account) => account.id),
+    ).toEqual(['fable-empty', 'fable-ok'])
+  })
+
+  test('preserves an empty scoped quota array through save/load when scoped is the only quota key', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'empty-scoped-only',
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: { scoped: [] },
+    })
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota).toBeDefined()
+    expect(account.quota?.scoped).toBeDefined()
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('preserves an empty scoped quota array alongside five_hour', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'empty-scoped-with-five-hour',
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: 1_000,
+        },
+        scoped: [],
+      },
+    })
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota?.five_hour?.usedPercent).toBe(10)
+    expect(account.quota?.scoped).toBeDefined()
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('routing predicate treats empty scoped array as not exhausted (invariant lock)', () => {
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: 1_000,
+      },
+      seven_day: {
+        usedPercent: 5,
+        remainingPercent: 95,
+        checkedAt: 1_000,
+      },
+      scoped: [],
+    }
+    expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5')).toBe(
+      false,
+    )
+    expect(quotaSnapshotPassesModelScope(quota, 'claude-fable-5')).toBe(true)
+    expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)
+  })
+
+  test('mergeAccountRuntimeState: windowless {scoped:[]} replaces stale exhausted-Fable quota', async () => {
+    // Persist an exhausted-Fable scoped window at T1, then save a windowless
+    // empty-scoped snapshot stamped T2 > T1. mergeAccountRuntimeState must NOT
+    // treat the empty snapshot as stale and resurrect the old Fable window —
+    // loadAccounts must return scoped: [].
+    const accountId = 'merge-empty-scoped'
+    const T1 = 1_000
+    const T2 = 2_000
+
+    const first = baseStorage()
+    first.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: T1,
+        },
+        seven_day: {
+          usedPercent: 15,
+          remainingPercent: 85,
+          checkedAt: T1,
+        },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: T1,
+          },
+        ],
+      },
+    })
+    await saveAccounts(first)
+
+    const second = baseStorage()
+    second.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: { scoped: [], checkedAt: T2 },
+    })
+    await saveAccounts(second)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(
+      loaded?.accounts.find((entry) => entry.id === accountId),
+    )
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('mergeAccountRuntimeState: real promo-end path lands empty scoped', async () => {
+    // Reachable-path lock: persist an account with five_hour/seven_day + a
+    // Fable scoped window at T1, then save the post-promo snapshot (5h/7d at
+    // T2, scoped: [], top-level checkedAt: T2). Loaded quota.scoped must be [].
+    const accountId = 'merge-promo-end'
+    const T1 = 1_000
+    const T2 = 2_000
+
+    const first = baseStorage()
+    first.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: T1,
+        },
+        seven_day: {
+          usedPercent: 15,
+          remainingPercent: 85,
+          checkedAt: T1,
+        },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 42,
+            remainingPercent: 58,
+            checkedAt: T1,
+          },
+        ],
+      },
+    })
+    await saveAccounts(first)
+
+    const second = baseStorage()
+    second.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: T2,
+        },
+        seven_day: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: T2,
+        },
+        scoped: [],
+        checkedAt: T2,
+      },
+    })
+    await saveAccounts(second)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(
+      loaded?.accounts.find((entry) => entry.id === accountId),
+    )
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('top-level checkedAt round-trips through save/load', async () => {
+    const storage = baseStorage()
+    const stampedAt = 1_234_567
+    storage.accounts.push({
+      id: 'with-checked-at',
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: stampedAt,
+        },
+        checkedAt: stampedAt,
+      },
+    })
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(
+      loaded?.accounts.find((entry) => entry.id === 'with-checked-at'),
+    )
+    expect(account.quota?.checkedAt).toBe(stampedAt)
   })
 
   test('refreshes fallback tokens within the four-hour minimum window', async () => {
@@ -1841,6 +2335,235 @@ describe('buildRefreshOperationError', () => {
     })
     expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
   })
+
+  test('captures the error status on the operation error', () => {
+    const error = new ClaudeOAuthRefreshError(400, 'invalid_grant')
+    const result = buildRefreshOperationError({
+      error,
+      now: 1000000,
+      refreshToken: 'test-token',
+    })
+    expect(result.status).toBe(400)
+  })
+
+  test('captures duck-typed status when no ClaudeOAuthRefreshError', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 429 },
+      now: 1000000,
+      refreshToken: 'test-token',
+    })
+    expect(result.status).toBe(429)
+  })
+
+  test('sets permanent true only for 400 invalid_grant', () => {
+    const dead = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(dead.permanent).toBe(true)
+  })
+
+  test('sets permanent false for retry-exhausted transient (no status)', () => {
+    const exhausted = buildRefreshOperationError({
+      error: new Error('Token refresh exhausted all retries'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(exhausted.permanent).toBe(false)
+  })
+
+  test('sets permanent false for a 429', () => {
+    const rateLimited = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(rateLimited.permanent).toBe(false)
+  })
+
+  test('sets permanent false for a 400 that is NOT invalid_grant', () => {
+    // The OAuth spec allows 400 invalid_client / invalid_request /
+    // unsupported_grant_type — none of which re-login fixes. Only invalid_grant
+    // means the refresh token itself is dead.
+    const invalidClient = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(invalidClient.status).toBe(400)
+    expect(invalidClient.permanent).toBe(false)
+    // Explicit false must short-circuit isPermanentRefreshError before the
+    // legacy status===400 fallback can wrongly flag it.
+    expect(isPermanentRefreshError(invalidClient)).toBe(false)
+  })
+
+  test('sets permanent true for a 400 invalid_grant from the body JSON', () => {
+    const dead = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(
+        400,
+        '{"error":"invalid_grant","error_description":"Refresh token expired"}',
+      ),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(dead.permanent).toBe(true)
+    expect(isPermanentRefreshError(dead)).toBe(true)
+  })
+})
+
+describe('isPermanentRefreshError', () => {
+  test('400 (invalid_grant) → permanent (dead token, needs re-login)', () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(isPermanentRefreshError(error)).toBe(true)
+  })
+
+  test('429 (rate limited) → NOT permanent (transient, recovers)', () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+
+  test('500 (server error) → NOT permanent (transient)', () => {
+    const error = buildRefreshOperationError({
+      error: { status: 500 },
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+
+  test('legacy error without status but 24h delay → permanent (heuristic)', () => {
+    // Mirrors a dead token persisted before the status field existed: a
+    // non-transient error gets NON_TRANSIENT_REFRESH_RETRY_DELAY_MS (24h).
+    const checkedAt = 1000000
+    const error = {
+      message: 'invalid_grant',
+      checkedAt,
+      nextRetryAt: checkedAt + 24 * 60 * 60_000,
+    }
+    expect(isPermanentRefreshError(error)).toBe(true)
+  })
+
+  test('legacy error without status, short delay → NOT permanent', () => {
+    const checkedAt = 1000000
+    const error = {
+      message: 'rate limited',
+      checkedAt,
+      nextRetryAt: checkedAt + 5 * 60_000,
+    }
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+
+  test('retry-exhausted transient error → NOT permanent (no false re-login nag)', () => {
+    // A network glitch that exhausts all retries throws a plain Error with NO
+    // status. isTransientRefreshError classifies it non-transient (no status,
+    // message is not "fetch failed"), so it gets the 24h backoff delay — but it
+    // is NOT a dead token. Built through buildRefreshOperationError, the explicit
+    // `permanent` flag must be false so it is not nagged for re-login.
+    const error = buildRefreshOperationError({
+      error: new Error('Token refresh exhausted all retries'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    // Sanity: it really did get the 24h non-transient delay (so the legacy
+    // heuristic alone would have wrongly flagged it permanent).
+    expect(error.nextRetryAt).toBe(1000000 + 24 * 60 * 60_000)
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+})
+
+describe('isPermanentRefreshError across save/load round-trip', () => {
+  test('retry-exhausted transient survives round-trip as NON-permanent', async () => {
+    // The classification only matters once persisted. A retry-exhausted error
+    // is permanent=false in memory but gets a 24h NON_TRANSIENT backoff — if the
+    // status/permanent fields are dropped on load, the 24h-delay heuristic wrongly
+    // re-classifies it permanent and the sidebar falsely nags re-login.
+    const error = buildRefreshOperationError({
+      error: new Error('Token refresh exhausted all retries'),
+      now: Date.now(),
+      refreshToken: 'rt-exhausted',
+    })
+    expect(error.permanent).toBe(false)
+    expect(isPermanentRefreshError(error)).toBe(false)
+
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'exhausted',
+      type: 'oauth',
+      refresh: 'rt-exhausted',
+      lastRefreshError: error,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const reloaded = expectOAuthAccount(
+      loaded!.accounts.find((a) => a.id === 'exhausted'),
+    )
+    expect(reloaded.lastRefreshError?.permanent).toBe(false)
+    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(false)
+  })
+
+  test('400 invalid_grant survives round-trip as permanent', async () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
+      now: Date.now(),
+      refreshToken: 'rt-dead',
+    })
+    expect(error.permanent).toBe(true)
+
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'dead',
+      type: 'oauth',
+      refresh: 'rt-dead',
+      lastRefreshError: error,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const reloaded = expectOAuthAccount(
+      loaded!.accounts.find((a) => a.id === 'dead'),
+    )
+    expect(reloaded.lastRefreshError?.status).toBe(400)
+    expect(reloaded.lastRefreshError?.permanent).toBe(true)
+    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(true)
+  })
+
+  test('400 non-invalid_grant survives round-trip as NON-permanent', async () => {
+    // A 400 invalid_client (misconfig) must NOT nag re-login — and the explicit
+    // permanent=false must survive load so the status===400 fallback never fires.
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
+      now: Date.now(),
+      refreshToken: 'rt-misconfig',
+    })
+    expect(error.permanent).toBe(false)
+
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'misconfig',
+      type: 'oauth',
+      refresh: 'rt-misconfig',
+      lastRefreshError: error,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const reloaded = expectOAuthAccount(
+      loaded!.accounts.find((a) => a.id === 'misconfig'),
+    )
+    expect(reloaded.lastRefreshError?.status).toBe(400)
+    expect(reloaded.lastRefreshError?.permanent).toBe(false)
+    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2006,6 +2729,102 @@ describe('isTransientQuotaError via duck-typed error classification', () => {
 // fetchOAuthQuotaSnapshot attaches .status + .retryAfter (producer)
 // ---------------------------------------------------------------------------
 describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
+  test('parses weekly scoped model quota limits from OAuth usage payload', async () => {
+    const fetchImpl = (async () => {
+      return new Response(
+        JSON.stringify({
+          five_hour: {
+            utilization: 12,
+            resets_at: '2026-07-04T12:00:00Z',
+          },
+          seven_day: {
+            utilization: 34,
+            resets_at: '2026-07-08T09:00:00Z',
+          },
+          limits: [
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 5,
+              resets_at: '2026-07-08T09:00:00Z',
+              scope: {
+                model: { id: null, display_name: 'Fable' },
+                surface: null,
+              },
+              is_active: false,
+            },
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 7,
+              resets_at: '2026-07-08T09:00:00Z',
+              scope: {
+                model: { id: 'claude/fable.5:promo', display_name: 'Fable' },
+              },
+            },
+            { kind: 'daily', group: 'daily', percent: 10 },
+          ],
+        }),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+
+    const quota = await fetchOAuthQuotaSnapshot({
+      accessToken: 't',
+      fetchImpl,
+      now: () => 1_000_000,
+    })
+
+    expect(quota.five_hour?.usedPercent).toBe(12)
+    expect(quota.seven_day?.remainingPercent).toBe(66)
+    expect(quota.scoped).toEqual([
+      {
+        id: 'claude-weekly-scoped-fable',
+        title: 'Fable only',
+        modelName: 'Fable',
+        usedPercent: 5,
+        remainingPercent: 95,
+        resetsAt: '2026-07-08T09:00:00Z',
+        checkedAt: 1_000_000,
+      },
+      {
+        id: 'claude-weekly-scoped-claude-fable-5-promo',
+        title: 'Fable only',
+        modelId: 'claude/fable.5:promo',
+        modelName: 'Fable',
+        usedPercent: 7,
+        remainingPercent: 93,
+        resetsAt: '2026-07-08T09:00:00Z',
+        checkedAt: 1_000_000,
+      },
+    ])
+  })
+
+  test('matches scoped model quota only for the matching model family', () => {
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: 1 },
+      seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: 1 },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: 1,
+        },
+      ],
+    }
+
+    expect(getScopedQuotaWindowForModel(quota, 'claude-fable-5')?.title).toBe(
+      'Fable only',
+    )
+    expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5')).toBe(
+      true,
+    )
+    expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)
+  })
+
   test('429 response → thrown error carries .status=429 + .retryAfter', async () => {
     let thrown: unknown = null
     const fetchImpl = (async () => {
@@ -2193,6 +3012,69 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
     // Quota-401 DOES arm the quota backoff.
     expect(account?.lastQuotaRefreshError).toBeDefined()
     expect(account?.lastQuotaRefreshError?.checkedAt).toBe(now)
+  })
+
+  test('quota-endpoint 403 does NOT arm quota or refresh backoff', async () => {
+    const now = 1_000_000
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-quota-403',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      // Token is fresh → tokenNeedsRefresh returns false, so the only failure
+      // in this test comes from the quota endpoint, not token refresh.
+      expires: now + 24 * 60 * 60_000,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'permission_error',
+              message:
+                'OAuth authentication is currently not allowed for this organization.',
+            },
+          }),
+          { status: 403 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-quota-403') as
+      | OAuthAccount
+      | undefined
+    expect(account?.lastRefreshError).toBeUndefined()
+    expect(account?.lastQuotaRefreshError).toBeUndefined()
   })
 })
 
@@ -2659,6 +3541,59 @@ describe('removeAccountPersistent', () => {
     expect(await removeAccountPersistent('nonexistent', accountPath)).toBe(
       false,
     )
+  })
+
+  test('prunes the orphaned per-account state on removal (full-save path)', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'doomed',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: Date.now() + 3600_000,
+      lastRefreshError: {
+        message: 'boom',
+        checkedAt: Date.now(),
+      },
+    })
+    await saveAccounts(storage, accountPath)
+
+    // Sanity: the state file holds the per-account block before removal.
+    const statePath = getAccountStatePath(accountPath)
+    const before = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(before.accounts?.doomed).toBeDefined()
+
+    expect(await removeAccountPersistent('doomed', accountPath)).toBe(true)
+
+    const after = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(after.accounts?.doomed).toBeUndefined()
+  })
+
+  test('removing one fallback leaves the other fallback state intact', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'keep',
+      type: 'oauth',
+      access: 'keep-access',
+      refresh: 'keep-refresh',
+      expires: Date.now() + 3600_000,
+    })
+    storage.accounts.push({
+      id: 'drop',
+      type: 'oauth',
+      access: 'drop-access',
+      refresh: 'drop-refresh',
+      expires: Date.now() + 3600_000,
+    })
+    await saveAccounts(storage, accountPath)
+
+    expect(await removeAccountPersistent('drop', accountPath)).toBe(true)
+
+    const statePath = getAccountStatePath(accountPath)
+    const after = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(after.accounts?.drop).toBeUndefined()
+    expect(after.accounts?.keep).toBeDefined()
+    expect(after.accounts?.keep?.refresh).toBe('keep-refresh')
   })
 })
 

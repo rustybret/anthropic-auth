@@ -8,6 +8,7 @@ import {
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
+  getFableRecoverySummary,
   getSidebarState,
   normalizeSidebarState,
   resolveActiveAccount,
@@ -37,7 +38,13 @@ describe('resolveActiveAccount', () => {
     const state = make({
       activeId: 'fb1',
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: true },
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: quota(40),
+          enabled: true,
+          needsReauth: false,
+        },
       ],
     })
     const active = resolveActiveAccount(state)
@@ -50,7 +57,13 @@ describe('resolveActiveAccount', () => {
     const state = make({
       activeId: 'fb1',
       fallbacks: [
-        { id: 'fb1', label: undefined, quota: quota(5), enabled: true },
+        {
+          id: 'fb1',
+          label: undefined,
+          quota: quota(5),
+          enabled: true,
+          needsReauth: false,
+        },
       ],
     })
     expect(resolveActiveAccount(state).name).toBe('fb1')
@@ -61,7 +74,13 @@ describe('resolveActiveAccount', () => {
       activeId: 'fb1',
       main: { quota: quota(12) },
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: false },
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: quota(40),
+          enabled: false,
+          needsReauth: false,
+        },
       ],
     })
     const active = resolveActiveAccount(state)
@@ -79,7 +98,13 @@ describe('resolveActiveAccount', () => {
       activeId: 'ghost',
       main: { quota: null },
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: true },
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: quota(40),
+          enabled: true,
+          needsReauth: false,
+        },
       ],
     })
     const active = resolveActiveAccount(state)
@@ -123,6 +148,52 @@ describe('resolveActiveAccount', () => {
   })
 })
 
+describe('getFableRecoverySummary', () => {
+  test('shows the Opus recovery countdown only for the matching session', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'opus',
+          remaining: 7,
+          changedAt: 123,
+        },
+        {
+          sessionId: 'ses_other',
+          mode: 'fable',
+          remaining: 0,
+          changedAt: 124,
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_fable')).toBe(
+      'Opus 4.8 · 7 left',
+    )
+    expect(getFableRecoverySummary(state, 'ses_other')).toBe(
+      'Fable 5 · restored',
+    )
+    expect(getFableRecoverySummary(state, 'ses_unknown')).toBeUndefined()
+  })
+
+  test('shows the transition back to Fable', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'fable',
+          remaining: 0,
+          changedAt: 456,
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_fable')).toBe(
+      'Fable 5 · restored',
+    )
+  })
+})
+
 describe('getCollapsedQuotaSummary', () => {
   test('formats both active-account quota windows', () => {
     expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
@@ -145,9 +216,144 @@ describe('getCollapsedQuotaSummary', () => {
     ).toBe('5h: 13% 7d: —')
   })
 
+  test('formats scoped model quota windows in collapsed quota text', () => {
+    expect(
+      getCollapsedQuotaSummary({
+        five_hour: { usedPercent: 13, remainingPercent: 87 },
+        seven_day: { usedPercent: 7, remainingPercent: 93 },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 42,
+            remainingPercent: 58,
+          },
+        ],
+      }).text,
+    ).toBe('5h: 13% 7d: 7% Fa: 42%')
+  })
+
   test('returns no collapsed quota text when no windows are available', () => {
     expect(getCollapsedQuotaSummary(null).text).toBeNull()
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
+  })
+
+  test('omits 5h/7d placeholders when only scoped windows are visible', () => {
+    const summary = getCollapsedQuotaSummary({
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+        },
+      ],
+    })
+    expect(summary.text).toBe('Fa: 100%')
+    expect(summary.text).not.toContain('5h:')
+    expect(summary.text).not.toContain('7d:')
+    expect(summary.text).not.toContain('—')
+  })
+
+  test('preserves partial-dash primary segment alongside scoped windows', () => {
+    const summary = getCollapsedQuotaSummary({
+      five_hour: { usedPercent: 23, remainingPercent: 77 },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 42,
+          remainingPercent: 58,
+        },
+      ],
+    })
+    expect(summary.text).toBe('5h: 23% 7d: — Fa: 42%')
+  })
+})
+
+describe('normalizeSidebarState', () => {
+  test('preserves valid scoped quota windows and drops malformed ones', () => {
+    const normalized = normalizeSidebarState({
+      main: {
+        quota: {
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelId: 'claude-fable-5',
+              modelName: 'Fable',
+              usedPercent: 5,
+              remainingPercent: 95,
+              resetsAt: '2026-07-08T09:00:00Z',
+            },
+            { id: 'broken', title: 'Broken only', usedPercent: Number.NaN },
+          ],
+        },
+      },
+      fallbacks: [],
+      route: 'main',
+      lastUpdated: 0,
+    })
+
+    expect(normalized.main.quota?.scoped).toEqual([
+      {
+        id: 'claude-weekly-scoped-fable',
+        title: 'Fable only',
+        modelId: 'claude-fable-5',
+        modelName: 'Fable',
+        usedPercent: 5,
+        remainingPercent: 95,
+        resetsAt: '2026-07-08T09:00:00Z',
+      },
+    ])
+  })
+
+  test('normalizes valid Fable recovery state and rejects malformed state', () => {
+    const valid = normalizeSidebarState({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'opus',
+          remaining: 7.8,
+          changedAt: 123,
+        },
+      ],
+    })
+    expect(valid.fableRecoveries).toEqual([
+      {
+        sessionId: 'ses_fable',
+        mode: 'opus',
+        remaining: 7,
+        changedAt: 123,
+      },
+    ])
+
+    const invalid = normalizeSidebarState({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'other',
+          remaining: 7,
+          changedAt: 123,
+        },
+      ],
+    })
+    expect(invalid.fableRecoveries).toBeUndefined()
+  })
+
+  test('preserves empty scoped quota array when scoped is the only quota key', () => {
+    const normalized = normalizeSidebarState({
+      main: { quota: { scoped: [] } },
+      fallbacks: [],
+      route: 'main',
+      lastUpdated: 0,
+    })
+
+    expect(normalized.main.quota).not.toBeNull()
+    expect(normalized.main.quota?.scoped).toEqual([])
   })
 })
 
@@ -382,6 +588,27 @@ describe('normalizeSidebarState', () => {
     expect(out.fallbacks[0]!.enabled).toBe(false)
   })
 
+  test('fallbacks: needsReauth defaults to false when missing', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true }],
+    })
+    expect(out.fallbacks[0]!.needsReauth).toBe(false)
+  })
+
+  test('fallbacks: needsReauth is parsed when present', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true, needsReauth: true }],
+    })
+    expect(out.fallbacks[0]!.needsReauth).toBe(true)
+  })
+
+  test('fallbacks: needsReauth defaults to false when non-boolean', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true, needsReauth: 'yes' }],
+    })
+    expect(out.fallbacks[0]!.needsReauth).toBe(false)
+  })
+
   test('relay defaults to null when missing transport', () => {
     const out = normalizeSidebarState({ relay: { enabled: true } })
     expect(out.relay).toBeNull()
@@ -461,6 +688,7 @@ describe('normalizeSidebarState', () => {
             five_hour: { usedPercent: 40, remainingPercent: 60 },
           },
           enabled: true,
+          needsReauth: false,
         },
       ],
       activeId: 'fb1',
@@ -530,7 +758,15 @@ describe('getSidebarState malformed file round-trip', () => {
         quotaBackedOff: false,
         refreshBackedOff: true,
       },
-      fallbacks: [{ id: 'fb1', label: 'work', quota: null, enabled: true }],
+      fallbacks: [
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: null,
+          enabled: true,
+          needsReauth: false,
+        },
+      ],
       activeId: 'fb1',
       route: 'fallback',
       relay: { enabled: false, transport: 'sse' },

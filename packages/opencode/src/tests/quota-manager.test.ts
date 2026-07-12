@@ -185,6 +185,33 @@ describe('QuotaManager', () => {
       expect(qm.getLastApiError()).toBeUndefined()
     })
 
+    test('403 does not arm backoff (account/org policy error)', async () => {
+      // A 403 from the quota endpoint means this OAuth account is not allowed to
+      // use OAuth quota, not that the quota API is saturated.
+      let apiErrorCount = 0
+      const fetchMock = mock(() =>
+        Promise.resolve(new Response('org policy', { status: 403 })),
+      ) as unknown as typeof fetch
+      const qm = new QuotaManager({
+        storage: null,
+        fetchImpl: fetchMock,
+        now: () => now,
+        onApiError: () => {
+          apiErrorCount++
+        },
+      })
+
+      await expect(qm.refreshMain('token')).rejects.toThrow('403')
+      expect(qm.isBackedOff()).toBe(false)
+      expect(qm.getLastApiError()).toBeUndefined()
+      expect(apiErrorCount).toBe(0)
+
+      await expect(
+        qm.refreshFallback('fallback-1', 'fallback-token'),
+      ).rejects.toThrow('403')
+      expect(qm.isFallbackBackedOff('fallback-1', 'fallback-token')).toBe(false)
+    })
+
     test('repeated 429s escalate backoff exponentially', async () => {
       const fetchMock = mock(() =>
         Promise.resolve(new Response('rate limited', { status: 429 })),

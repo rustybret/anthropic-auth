@@ -9,11 +9,13 @@ import dedent from 'dedent'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
+  extractLatestHybridMessageCacheAnchor,
   getSanitizeMemoStats,
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
   prefixToolNames,
+  prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
   rewriteRequestBody,
   rewriteUrl,
@@ -636,6 +638,79 @@ describe('createStrippedStream', () => {
     ).toBe(true)
   })
 
+  test('turns Fable refusal finishes into retryable errors and signals once', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
+      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+    ]
+    let filtered = 0
+    let completed = 0
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+    const response = createStrippedStream(new Response(stream), {
+      onContentFilter: () => {
+        filtered++
+      },
+      onComplete: () => {
+        completed++
+      },
+    })
+    const reader = response.body!.getReader()
+    expect((await reader.read()).done).toBe(false)
+
+    let caught: unknown
+    try {
+      while (!(await reader.read()).done) {}
+    } catch (error) {
+      caught = error
+    }
+
+    expect((caught as { code?: string }).code).toBe('ECONNRESET')
+    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
+      'refusal',
+    )
+    expect(filtered).toBe(1)
+    expect(completed).toBe(0)
+  })
+
+  test('signals successful Anthropic finishes exactly once', async () => {
+    const finishes: string[] = []
+    const response = createStrippedStream(
+      new Response(
+        [
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ].join(''),
+      ),
+      { onComplete: (reason) => finishes.push(reason) },
+    )
+
+    await response.text()
+    expect(finishes).toEqual(['tool_use'])
+  })
+
+  test('does not intercept refusals when no Fable callback is installed', async () => {
+    const payload =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
+    const response = createStrippedStream(new Response(payload))
+    await expect(response.text()).resolves.toContain('refusal')
+  })
+
+  test('preserves a refusal when Fable recovery declines a non-OAuth route', async () => {
+    const payload =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
+    const response = createStrippedStream(new Response(payload), {
+      onContentFilter: () => false,
+    })
+    await expect(response.text()).resolves.toContain('refusal')
+  })
+
   test('does not mark non-transient Anthropic stream errors retryable', async () => {
     const encoder = new TextEncoder()
     const chunks = [
@@ -674,6 +749,36 @@ describe('createStrippedStream', () => {
     const original = new Response(null, { status: 204 })
     const result = createStrippedStream(original)
     expect(result).toBe(original)
+  })
+})
+
+describe('prepareFableCacheWarmSource', () => {
+  test('restores the Fable model shape from an Opus request without changing its input', () => {
+    const source = prepareFableCacheWarmSource(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        speed: 'fast',
+        thinking: { type: 'enabled', budget_tokens: 4096 },
+        output_config: { effort: 'xhigh' },
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'same input' }],
+      }),
+    )
+
+    expect(source.ok).toBe(true)
+    if (!source.ok) throw new Error(source.reason)
+    const body = JSON.parse(source.bodyText)
+    expect(body.model).toBe('claude-fable-5')
+    expect(body.speed).toBeUndefined()
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'xhigh' })
+    expect(body.messages).toEqual([{ role: 'user', content: 'same input' }])
   })
 })
 
@@ -936,6 +1041,66 @@ describe('rewriteRequestBody', () => {
 
     expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(result.output_config).toEqual({ effort: 'xhigh' })
+  })
+
+  test('requests summarized adaptive thinking for Sonnet 5 without thinking', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('replaces manual enabled thinking with adaptive summarized for Sonnet 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5-20260630',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 10_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(result.thinking.budget_tokens).toBeUndefined()
+  })
+
+  test('preserves explicitly disabled thinking for Sonnet 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('strips display from disabled thinking for Sonnet 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled', display: 'summarized' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('does not touch thinking for non-Sonnet5 models', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 5_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 5_000 })
   })
 
   test('strips OpenAI encrypted reasoning blocks before sending to Anthropic', async () => {
@@ -1684,6 +1849,129 @@ describe('rewriteRequestBody', () => {
         cache_control: { type: 'ephemeral', ttl: '1h' },
       },
     ])
+  })
+
+  test('hybrid mode restores a model-specific standby anchor beyond lookback', async () => {
+    const baseMessages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'permanent Magic Context history' },
+          { type: 'text', text: 'volatile Magic Context history' },
+        ],
+      },
+      { role: 'assistant', content: 'first assistant turn' },
+      { role: 'user', content: 'last Opus user boundary' },
+    ]
+    const cachedOpusBody = await rewriteRequestBody(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: 'Stable system block',
+        messages: baseMessages,
+      }),
+      { cache1hEnabled: true, cache1hMode: 'hybrid' },
+    )
+    const standbyAnchor = extractLatestHybridMessageCacheAnchor(cachedOpusBody)
+    expect(standbyAnchor).toMatchObject({ messageIndex: 2, messageCount: 3 })
+
+    const messages = [...baseMessages]
+    for (let index = 0; index < 11; index++) {
+      messages.push(
+        { role: 'assistant', content: `Fable response ${index}` },
+        { role: 'user', content: `Fable follow-up ${index}` },
+      )
+    }
+    const cacheEvents: Array<Record<string, unknown> | undefined> = []
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-opus-4-8',
+          system: 'Stable system block',
+          messages,
+        }),
+        {
+          cache1hEnabled: true,
+          cache1hMode: 'hybrid',
+          hybridStandbyAnchor: standbyAnchor,
+          perf: (stage, data) => {
+            if (stage === 'cache_strategy') cacheEvents.push(data)
+          },
+        },
+      ),
+    )
+
+    expect(cacheEvents).toEqual([
+      expect.objectContaining({
+        standbyAnchorMatched: true,
+        standbyBridgeApplied: true,
+        standbyBridgeMessageIndex: 2,
+        standbyDistanceBlocks: 23,
+      }),
+    ])
+    expect(result.system[2].cache_control).toBeUndefined()
+    expect(result.messages[0].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[0].content[1].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[2].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages.at(-3).content[0].cache_control).toBeUndefined()
+    expect(result.messages.at(-1).content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
+  test('hybrid standby anchors rely on normal lookback while still nearby', async () => {
+    const messages = [
+      { role: 'user', content: 'message 0' },
+      { role: 'user', content: 'message 1' },
+      { role: 'user', content: 'last Opus user boundary' },
+    ]
+    const cachedOpusBody = await rewriteRequestBody(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: 'Stable system block',
+        messages,
+      }),
+      { cache1hEnabled: true, cache1hMode: 'hybrid' },
+    )
+    const standbyAnchor = extractLatestHybridMessageCacheAnchor(cachedOpusBody)
+    messages.push(
+      { role: 'assistant', content: 'one Fable response' },
+      { role: 'user', content: 'one Fable follow-up' },
+    )
+
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-opus-4-8',
+          system: 'Stable system block',
+          messages,
+        }),
+        {
+          cache1hEnabled: true,
+          cache1hMode: 'hybrid',
+          hybridStandbyAnchor: standbyAnchor,
+        },
+      ),
+    )
+
+    expect(result.system[2].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[2].content).toBe('last Opus user boundary')
+    expect(result.messages[4].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
   })
 
   test('hybrid mode preserves only the last original system cache anchor after billing and identity blocks', async () => {

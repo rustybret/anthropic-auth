@@ -1,5 +1,6 @@
 import type {
   AccountQuotaWindow,
+  AccountScopedQuotaWindow,
   AccountStorage,
   OAuthAccount,
   OAuthQuotaSnapshot,
@@ -73,6 +74,14 @@ function formatWindow(
   ].join('')
 }
 
+function formatScopedWindow(window: AccountScopedQuotaWindow, now: number) {
+  return [
+    `  - ${window.title}: ${formatPercent(window.remainingPercent)} remaining`,
+    ` (${formatPercent(window.usedPercent)} used`,
+    `${formatReset(window.resetsAt, now)}, checked ${formatAge(window.checkedAt, now)})`,
+  ].join('')
+}
+
 function accountName(account: OAuthAccount) {
   return account.label?.trim() || account.id
 }
@@ -132,6 +141,9 @@ export function buildClaudeQuotaSummary(input: {
     }
     lines.push(formatWindow('five_hour', account.quota?.five_hour, now))
     lines.push(formatWindow('seven_day', account.quota?.seven_day, now))
+    for (const window of account.quota?.scoped ?? []) {
+      lines.push(formatScopedWindow(window, now))
+    }
     lines.push('')
   }
 

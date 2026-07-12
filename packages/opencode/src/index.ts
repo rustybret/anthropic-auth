@@ -24,6 +24,7 @@ import {
   CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  createEmptyStorage,
   dumpDirectRequest,
   exchange,
   executeAccountCommand,
@@ -42,11 +43,13 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getKillswitchConfig,
+  getKillswitchThresholdsForAccount,
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
   getRelayConfig,
   getRoutingMode,
+  getScopedQuotaWindowForModel,
   hashRefreshToken,
   isApiKeyAccount,
   isCache1hEnabled,
@@ -61,6 +64,7 @@ import {
   isFastModeSupportedModel,
   isKillswitchEnabled,
   isOAuthAccount,
+  isPermanentRefreshError,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -81,6 +85,8 @@ import {
   parseRoutingCommandAction,
   type QuotaAccountSummary,
   QuotaManager,
+  quotaSnapshotModelScopeIsExhausted,
+  quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
@@ -107,6 +113,11 @@ import {
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
+import {
+  FableFallbackManager,
+  type FableFallbackPlan,
+  type FableStandbyCacheAnchor,
+} from './fable-fallback.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   drainNotifications,
@@ -129,14 +140,20 @@ import {
 import {
   addFastModeBetaHeader,
   createStrippedStream,
+  extractLatestHybridMessageCacheAnchor,
   isInsecure,
   mergeHeaders,
+  prepareFableCacheWarmSource,
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
 } from './transform.ts'
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
+const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
+const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
+const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
+const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
@@ -145,10 +162,74 @@ const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 
+/**
+ * Format the user-facing 429 message for a killswitch block. When the block
+ * is scoped-driven (the request's model matches a scoped window that is at
+ * or below the killswitch threshold), the message names the model so the
+ * operator can distinguish a per-model weekly block from a whole-account
+ * kill. Otherwise the generic account-level message is used.
+ */
+export function formatKillswitchBlockMessage(input: {
+  retryAfterSeconds: number
+  modelName?: string
+}): string {
+  const minutes = Math.floor(input.retryAfterSeconds / 60)
+  const seconds = input.retryAfterSeconds % 60
+  const retryHint = `Retry in ${minutes}m ${seconds}s.`
+  return input.modelName
+    ? `${input.modelName} weekly limit reached, no routable accounts. ${retryHint}`
+    : `Killswitch: no routable accounts. ${retryHint}`
+}
+
+/**
+ * Decide whether a killswitch block is scoped-driven (a per-model weekly
+ * block) versus a whole-account 5h/7d-driven block. A block is scoped-driven
+ * only when the request's model matches a scoped window AND that window is
+ * actually at or below the per-account scoped threshold. A Fable request
+ * with a healthy Fable window is therefore correctly classified as
+ * account-level (the 5h/7d breach killed the account, not the Fable quota).
+ *
+ * Priority: account-level 5h/7d always wins. `killswitchPassesPolicy` called
+ * WITHOUT a modelId evaluates only 5h/7d; if it returns false, 5h/7d drove
+ * the block, so this is account-level regardless of the scoped window's
+ * state. Only when 5h/7d pass AND the matched scoped window is at/below the
+ * scoped threshold do we call it scoped-driven.
+ */
+export function resolveScopedDrivenBlock(input: {
+  mainQuota: OAuthQuotaSnapshot | undefined
+  requestModelId: string | undefined
+  storage: AccountStorage | null
+}):
+  | { isScopedDriven: true; modelName: string; modelId: string }
+  | { isScopedDriven: false } {
+  if (!input.requestModelId) return { isScopedDriven: false }
+  if (!killswitchPassesPolicy(input.mainQuota, input.storage)) {
+    // 5h/7d already killed the account — account-level, not scoped-driven.
+    return { isScopedDriven: false }
+  }
+  const matchedWindow = getScopedQuotaWindowForModel(
+    input.mainQuota,
+    input.requestModelId,
+  )
+  if (!matchedWindow) return { isScopedDriven: false }
+  if (!Number.isFinite(matchedWindow.remainingPercent)) {
+    return { isScopedDriven: false }
+  }
+  const thresholds = getKillswitchThresholdsForAccount(input.storage)
+  if (matchedWindow.remainingPercent <= thresholds.scoped) {
+    return {
+      isScopedDriven: true,
+      modelName: matchedWindow.modelName,
+      modelId: input.requestModelId,
+    }
+  }
+  return { isScopedDriven: false }
+}
+
 type NotificationRequest = {
   path: { id: string }
   body: {
-    noReply: true
+    noReply: boolean
     parts: Array<{ type: 'text'; text: string; ignored: true }>
     agent?: string
     model?: { providerID: string; modelID: string }
@@ -281,13 +362,14 @@ async function sendIgnoredMessage(
   ctx: Parameters<Plugin>[0],
   sessionId: string,
   text: string,
+  noReply = true,
 ) {
   const session = ctx.client.session as PluginSessionClient | undefined
   const promptContext = await resolvePromptContext(ctx.client, sessionId)
   const request: NotificationRequest = {
     path: { id: sessionId },
     body: {
-      noReply: true,
+      noReply,
       parts: [{ type: 'text', text, ignored: true }],
     },
   }
@@ -310,12 +392,53 @@ async function sendIgnoredMessage(
   )
 }
 
-function _throwHandledSentinel(): never {
-  throw new Error(HANDLED_SENTINEL)
+function createDesktopNotificationClosureResponse() {
+  const messageId = `msg_${randomUUID().replaceAll('-', '')}`
+  const events = [
+    `event: message_start\ndata: ${JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-fable-5',
+        stop_reason: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    })}\n\n`,
+    `event: message_delta\ndata: ${JSON.stringify({
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 0 },
+    })}\n\n`,
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ]
+  return new Response(events.join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  })
 }
 
 function cleanAbort(): never {
-  throw new Error(HANDLED_SENTINEL)
+  // OpenCode currently has no handled/cancel return contract for
+  // command.execute.before. Throw an Error for legacy hosts, but duck-type an
+  // Effect HttpServerResponse.empty({ status: 204 }) so OpenCode 1.17+ treats
+  // handled slash commands as a clean no-content response instead of logging a
+  // plugin error.
+  const sentinel = new Error(HANDLED_SENTINEL) as Error &
+    Record<string, unknown>
+  sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID
+  sentinel[ERROR_REPORTER_IGNORE] = true
+  sentinel.status = 204
+  sentinel.statusText = undefined
+  sentinel.headers = {}
+  sentinel.cookies = {
+    [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID,
+    cookies: {},
+  }
+  sentinel.body = { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: 'Empty' }
+  throw sentinel
 }
 
 function shouldInjectParallelToolPrompt(input: {
@@ -344,6 +467,25 @@ const ZERO_MODEL_COST = {
   output: 0,
   cache: { read: 0, write: 0 },
 }
+
+type FableWarmTarget = {
+  url: string
+  headers: Headers
+  bodyText: string
+  oauthAccountId: string
+}
+
+type FableRequestContext = {
+  plan: FableFallbackPlan
+  warmTarget?: FableWarmTarget
+  opusCacheAnchor?: FableStandbyCacheAnchor
+  standbyBridgeLogged?: boolean
+}
+
+const FABLE_SWITCHED_TO_OPUS_NOTICE =
+  'Fable content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Fable cache warm.'
+const FABLE_RESTORED_NOTICE =
+  'Fable recovery window complete. Returning to Fable 5.'
 
 type AnthropicProviderModel = {
   id?: string
@@ -476,6 +618,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       cause: error instanceof Error ? error : undefined,
     })
   }
+  const fableFallbackManager = new FableFallbackManager()
   const quotaManager = new QuotaManager({
     storage: initialStorage,
     onMainQuotaFetched: async (
@@ -485,10 +628,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       fetchStartedAt,
     ) => {
       try {
-        const storage = (await loadAccounts(accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        const storage =
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
         const persisted = getPersistedMainQuota(storage)
         if (
           persisted &&
@@ -513,10 +654,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     },
     onApiError: async (error) => {
       try {
-        const storage = (await loadAccounts(accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        const storage =
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
         storage.quota = storage.quota ?? {}
         storage.quota.mainLastQuotaApiError = error
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
@@ -538,25 +677,58 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     prepareHeaders: async (headers, target) => {
-      if (!latestGetAuth) return headers
-      const auth = await latestGetAuth()
-      if (auth.type !== 'oauth') return headers
-      if (!auth.access || (auth.expires && auth.expires < Date.now())) {
-        if (!latestRefreshMainAccessToken) return headers
-        auth.access = await latestRefreshMainAccessToken()
+      let accessToken: string | undefined
+      const accountId = target.oauthAccountId
+      if (accountId && accountId !== 'main') {
+        const storage = await loadAccounts(accountStoragePath)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId &&
+            candidate.enabled !== false &&
+            isOAuthAccount(candidate),
+        )
+        if (!account || !storage) {
+          throw new Error(
+            `OAuth account ${accountId} is unavailable for cache prewarm`,
+          )
+        }
+        let current = account
+        try {
+          current = await fallbackManager.refreshAccount(account, storage)
+        } catch (error) {
+          logger.warn('cachekeep', 'fallback token refresh failed', {
+            accountId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+        accessToken = current.access
+        if (!accessToken) {
+          throw new Error(
+            `OAuth account ${accountId} has no access token for cache prewarm`,
+          )
+        }
+      } else {
+        if (!latestGetAuth) return headers
+        const auth = await latestGetAuth()
+        if (auth.type !== 'oauth') return headers
+        if (!auth.access || (auth.expires && auth.expires < Date.now())) {
+          if (!latestRefreshMainAccessToken) return headers
+          auth.access = await latestRefreshMainAccessToken()
+        }
+        accessToken = auth.access
       }
-      if (!auth.access) return headers
+      if (!accessToken) return headers
       try {
         const parsedBody = JSON.parse(target.bodyText) as Record<
           string,
           unknown
         >
         const identity = await resolveClaudeCodeIdentity(
-          auth.access,
+          accessToken,
           typeof parsedBody.model === 'string' ? parsedBody.model : undefined,
         )
         headers.delete('anthropic-beta')
-        setOAuthHeaders(headers, auth.access, {
+        setOAuthHeaders(headers, accessToken, {
           body: parsedBody,
           identity,
         })
@@ -568,11 +740,77 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         )
         if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
       } catch {
-        setOAuthHeaders(headers, auth.access)
+        setOAuthHeaders(headers, accessToken)
       }
       return headers
     },
   })
+
+  const fableWarmChains = new Map<string, Promise<void>>()
+
+  function warmFableAfterOpus(context: FableRequestContext) {
+    const sessionId = context.plan.sessionId
+    const run = async () => {
+      const target = context.warmTarget
+      if (!target) {
+        logger.debug('fable-fallback', 'cache warm skipped', {
+          session: sessionId,
+          reason: 'Opus response was not served by an OAuth route',
+        })
+        return
+      }
+      const source = prepareFableCacheWarmSource(
+        target.bodyText,
+        context.plan.requestedModel,
+      )
+      if (!source.ok) {
+        logger.warn('fable-fallback', 'cache warm skipped', {
+          session: sessionId,
+          reason: source.reason,
+        })
+        return
+      }
+
+      try {
+        const result = await cacheKeepManager.prewarmNow({
+          sessionId,
+          url: target.url,
+          headers: target.headers,
+          bodyText: source.bodyText,
+          oauthAccountId: context.plan.cacheAccountId ?? target.oauthAccountId,
+        })
+        if (result.ok) {
+          logger.debug('fable-fallback', 'Fable cache warmed', {
+            session: sessionId,
+            remaining: fableFallbackManager.remaining(sessionId),
+            ...(result.usage && { usage: result.usage }),
+          })
+          return
+        }
+        logger.warn('fable-fallback', 'Fable cache warm skipped', {
+          session: sessionId,
+          status: result.status,
+          reason: result.reason,
+        })
+      } catch (error) {
+        logger.warn('fable-fallback', 'Fable cache warm failed', {
+          session: sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    const previous = fableWarmChains.get(sessionId) ?? Promise.resolve()
+    const current = previous.then(run, run)
+    fableWarmChains.set(sessionId, current)
+    void current.finally(() => {
+      if (fableWarmChains.get(sessionId) === current) {
+        fableWarmChains.delete(sessionId)
+      }
+    })
+    return current
+  }
+
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
     mode: getCache1hPersistentMode(initialStorage),
@@ -613,6 +851,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     route: 'main',
   }
   const sidebarStateFile = getSidebarStateFile()
+  const fableRecoveryNotices = new Map<
+    string,
+    NonNullable<SidebarState['fableRecoveries']>[number]
+  >()
+  const pendingDesktopRecoveryNotices = new Map<string, string[]>()
+  const pendingDesktopNotificationClosures = new Map<string, number>()
+  const idleSessions = new Set<string>()
 
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -661,6 +906,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             ? (quotaManager.getFallback(account.id, account.access)?.quota ??
               null)
             : null,
+          // A fallback with a permanently-dead refresh token (400 invalid_grant)
+          // is dropped by getUsableFallbackAccounts and silently degrades to
+          // main — surface it as "needs re-login". Only flag truly-dead tokens
+          // whose backoff is still active, not transient (429/5xx) backoff.
+          needsReauth:
+            account.lastRefreshError != null &&
+            refreshBackoffActive(
+              account.lastRefreshError,
+              account.refresh,
+              Date.now(),
+            ) &&
+            isPermanentRefreshError(account.lastRefreshError),
           enabled: account.enabled !== false,
         })),
       activeId: options.activeId,
@@ -684,6 +941,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             : undefined,
         trackedSessions: cacheKeepManager.trackedCount(),
       },
+      fableRecoveries:
+        fableRecoveryNotices.size > 0
+          ? [...fableRecoveryNotices.values()]
+          : undefined,
       lastUpdated: Date.now(),
     }
     return setSidebarState(state, sidebarStateFile).catch((error) =>
@@ -870,6 +1131,82 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
   }
 
+  function publishFableRecoveryNotice(
+    notice: Omit<
+      NonNullable<SidebarState['fableRecoveries']>[number],
+      'changedAt'
+    >,
+    storage: AccountStorage | null,
+    auth: { access?: string; refresh?: string },
+    desktopText?: string,
+  ) {
+    fableRecoveryNotices.delete(notice.sessionId)
+    fableRecoveryNotices.set(notice.sessionId, {
+      ...notice,
+      changedAt: Date.now(),
+    })
+    if (fableRecoveryNotices.size > 128) {
+      const oldest = fableRecoveryNotices.keys().next().value
+      if (oldest) fableRecoveryNotices.delete(oldest)
+    }
+    void writeSidebarState(storage, {
+      activeId: lastSidebarRouting.activeId,
+      route: lastSidebarRouting.route,
+      mainAccessToken: auth.access,
+      mainRefreshToken: auth.refresh,
+    })
+
+    if (!desktopText || isTuiConnected(notice.sessionId)) return
+    const pending = pendingDesktopRecoveryNotices.get(notice.sessionId) ?? []
+    pending.push(desktopText)
+    pendingDesktopRecoveryNotices.set(notice.sessionId, pending.slice(-2))
+    if (idleSessions.has(notice.sessionId)) {
+      void flushDesktopRecoveryNotices(notice.sessionId)
+    }
+  }
+
+  async function flushDesktopRecoveryNotices(sessionId: string) {
+    const pending = pendingDesktopRecoveryNotices.get(sessionId)
+    if (!pending?.length) return
+    pendingDesktopRecoveryNotices.delete(sessionId)
+    if (isTuiConnected(sessionId)) return
+
+    for (const text of pending) {
+      pendingDesktopNotificationClosures.set(
+        sessionId,
+        (pendingDesktopNotificationClosures.get(sessionId) ?? 0) + 1,
+      )
+      try {
+        // PromptAsync is the only server-plugin path that renders arbitrary text
+        // in OpenCode Desktop. Let it open a turn, then satisfy that turn locally
+        // in the fetch wrapper so no provider request or recovery count is spent.
+        await sendIgnoredMessage(ctx, sessionId, text, false)
+      } catch (error) {
+        const closures = pendingDesktopNotificationClosures.get(sessionId) ?? 0
+        if (closures <= 1) pendingDesktopNotificationClosures.delete(sessionId)
+        else pendingDesktopNotificationClosures.set(sessionId, closures - 1)
+        logger.warn('fable-fallback', 'Desktop notification failed', {
+          session: sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+  }
+
+  function clearFableRecoveryNotice(
+    sessionId: string | null | undefined,
+    storage: AccountStorage | null,
+    auth: { access?: string; refresh?: string },
+  ) {
+    if (!sessionId || !fableRecoveryNotices.delete(sessionId)) return
+    void writeSidebarState(storage, {
+      activeId: lastSidebarRouting.activeId,
+      route: lastSidebarRouting.route,
+      mainAccessToken: auth.access,
+      mainRefreshToken: auth.refresh,
+    })
+  }
+
   async function executePersistentCache1hCommand(argumentsText: string) {
     const action = parseCache1hCommandAction(argumentsText)
     if (action.type === 'enable' || action.type === 'disable') {
@@ -1001,10 +1338,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (action.type === 'add-apikey') {
       if (!action.apiKey) {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return { text: 'API key is required', accounts }
       }
@@ -1014,10 +1348,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         action.baseURL?.trim() || 'https://api.kie.ai/claude'
       if (!isValidApiBaseURL(resolvedBaseURL)) {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
           text: 'Invalid base URL. Must be an http(s) URL without embedded credentials.',
@@ -1070,10 +1401,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         text: `Open this URL in your browser:\n${authResult.url}`,
         knobs: { oauthUrl: authResult.url },
         accounts: buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         ),
       }
     }
@@ -1084,10 +1412,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const pending = takeOAuthPending(key)
       if (!pending) {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
           text: 'OAuth session expired. Please start again.',
@@ -1105,10 +1430,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
         if (result.type === 'failed') {
           const accounts = buildAccountList(
-            (await loadAccounts(accountStoragePath)) ?? {
-              version: 1,
-              accounts: [],
-            },
+            (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
           )
           return {
             text: 'OAuth authentication failed. Please check the code and try again.',
@@ -1117,15 +1439,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         }
 
         const now = Date.now()
+        // OAuth accounts have no natural key, so the id stays a UUID even when a
+        // label is given (label collisions must not collide ids). The label is
+        // optional — a blank one keeps the UUID-name fallback in the UI.
         const account: OAuthAccount = {
           id: randomUUID(),
           type: 'oauth' as const,
+          label: action.label || undefined,
           access: result.access,
           refresh: result.refresh,
           expires: result.expires,
           enabled: true,
           addedAt: now,
           lastUsed: now,
+          lastRefreshedAt: now,
         }
         await addAccountPersistent(account, accountStoragePath)
         logger.info('commands', 'account added', {
@@ -1137,15 +1464,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const updatedStorage = await loadAccounts(accountStoragePath)
         await refreshSidebarAfterMutation(updatedStorage)
         const accounts = buildAccountList(
-          updatedStorage ?? { version: 1, accounts: [] },
+          updatedStorage ?? createEmptyStorage(),
         )
         return { text: `OAuth account added.`, accounts }
       } catch {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
           text: 'OAuth exchange failed due to a network error. Please try again.',
@@ -1444,6 +1768,43 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   }
 
   return {
+    event: async ({ event }: { event: unknown }) => {
+      const value = event as unknown as {
+        type?: string
+        properties?: {
+          sessionID?: string
+          status?: { type?: string }
+          info?: { id?: string }
+        }
+      }
+      const sessionId =
+        value.properties?.sessionID ?? value.properties?.info?.id
+      if (!sessionId) return
+
+      const becameIdle =
+        value.type === 'session.idle' ||
+        (value.type === 'session.status' &&
+          value.properties?.status?.type === 'idle')
+      if (becameIdle) {
+        idleSessions.delete(sessionId)
+        idleSessions.add(sessionId)
+        if (idleSessions.size > 256) {
+          const oldest = idleSessions.values().next().value
+          if (oldest) idleSessions.delete(oldest)
+        }
+        await flushDesktopRecoveryNotices(sessionId)
+        return
+      }
+
+      if (value.type === 'session.status' || value.type === 'session.deleted') {
+        idleSessions.delete(sessionId)
+      }
+      if (value.type === 'session.deleted') {
+        pendingDesktopRecoveryNotices.delete(sessionId)
+        pendingDesktopNotificationClosures.delete(sessionId)
+        fableRecoveryNotices.delete(sessionId)
+      }
+    },
     config: async (config: { command?: Record<string, unknown> }) => {
       config.command = {
         ...(config.command ?? {}),
@@ -1595,13 +1956,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 async function updateMainRefreshState(
                   update: (storage: AccountStorage) => void,
                 ) {
-                  const storage: AccountStorage = (await loadAccounts(
-                    accountStoragePath,
-                  )) ?? {
-                    version: 1,
-                    main: { type: 'opencode', provider: 'anthropic' },
-                    accounts: [],
-                  }
+                  const storage: AccountStorage =
+                    (await loadAccounts(accountStoragePath)) ??
+                    createEmptyStorage()
                   storage.refresh = storage.refresh ?? {}
                   update(storage)
                   await saveAccountState(storage, accountStoragePath, {
@@ -1990,6 +2347,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return body == null || typeof body === 'string'
           }
 
+          function parseRequestModel(
+            body: RequestInit['body'] | null | undefined,
+          ) {
+            if (typeof body !== 'string') return undefined
+            try {
+              const parsed = JSON.parse(body) as { model?: unknown }
+              return typeof parsed.model === 'string' ? parsed.model : undefined
+            } catch {
+              return undefined
+            }
+          }
+
           function isSubagentRequest(headers: Headers) {
             return headers.has('x-parent-session-id')
           }
@@ -2120,8 +2489,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             trace?: PerfTrace,
             route = 'api_fallback',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            fableRequest?: FableRequestContext,
           ) {
             void currentStorage
+            if (fableRequest?.plan.downgraded) {
+              fableRequest.warmTarget = undefined
+              fableRequest.opusCacheAnchor = undefined
+            }
             const start = nowMs()
             const requestHeaders = mergeHeaders(input, init)
             const directAffinity =
@@ -2227,6 +2601,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             trace?: PerfTrace,
             route = 'unknown',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            oauthAccountId = 'main',
+            fableRequest?: FableRequestContext,
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -2281,14 +2657,50 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   return false
                 }
               })()
+              const cacheEnabled = !subagentRequest && isCache1hEnabled()
+              const cacheMode = getCache1hMode()
+              const standbyCacheAnchor =
+                fableRequest?.plan.downgraded &&
+                fableRequest.plan.standbyCacheAnchor?.oauthAccountId ===
+                  oauthAccountId
+                  ? fableRequest.plan.standbyCacheAnchor
+                  : undefined
               body = await rewriteRequestBody(body, {
-                cache1hEnabled: !subagentRequest && isCache1hEnabled(),
-                cache1hMode: getCache1hMode(),
+                cache1hEnabled: cacheEnabled,
+                cache1hMode: cacheMode,
                 fastModeEnabled: fastModeRequested,
                 identity,
-                perf: (stage, data) =>
-                  trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
+                hybridStandbyAnchor: standbyCacheAnchor,
+                perf: (stage, data) => {
+                  trace?.mark(`rewrite_body_${stage}`, { route, ...data })
+                  if (
+                    stage === 'cache_strategy' &&
+                    data?.standbyBridgeApplied === true &&
+                    fableRequest &&
+                    !fableRequest.standbyBridgeLogged
+                  ) {
+                    fableRequest.standbyBridgeLogged = true
+                    logger.info(
+                      'fable-fallback',
+                      'restored standby Opus cache bridge',
+                      {
+                        session: fableRequest.plan.sessionId,
+                        distanceBlocks: data?.standbyDistanceBlocks,
+                      },
+                    )
+                  }
+                },
               })
+              if (
+                fableRequest?.plan.downgraded &&
+                cacheEnabled &&
+                cacheMode === 'hybrid'
+              ) {
+                const anchor = extractLatestHybridMessageCacheAnchor(body)
+                fableRequest.opusCacheAnchor = anchor
+                  ? { ...anchor, oauthAccountId }
+                  : undefined
+              }
               const headerBodyParseStart = nowMs()
               try {
                 setOAuthHeaders(requestHeaders, accessToken, {
@@ -2324,8 +2736,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             }
 
             const rewritten = rewriteUrl(input)
+            if (fableRequest && typeof body === 'string') {
+              fableRequest.warmTarget = {
+                url: rewritten.url?.toString() ?? rewritten.input.toString(),
+                headers: new Headers(requestHeaders),
+                bodyText: body,
+                oauthAccountId,
+              }
+            }
             if (
-              route === 'main' &&
               typeof body === 'string' &&
               isCache1hEnabled() &&
               getCache1hMode() === 'hybrid'
@@ -2340,6 +2759,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   bodyText: body,
                   storage,
                   cacheMode: 'hybrid',
+                  oauthAccountId,
                 })
                 trace?.mark('cachekeep_track', {
                   session: relayAffinity,
@@ -2436,8 +2856,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           function quotaSnapshotIsExhausted(
             quota: OAuthQuotaSnapshot | null | undefined,
           ) {
-            return Object.values(quota ?? {}).some(
-              (window) => window && window.remainingPercent <= 0,
+            return (['five_hour', 'seven_day'] as const).some(
+              (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
             )
           }
 
@@ -2472,10 +2892,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
-            options: { includeApiRoutes?: boolean } = {},
+            options: { includeApiRoutes?: boolean; modelId?: string } = {},
           ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
-            const usableOAuth =
-              await fallbackManager.getUsableFallbackAccounts(storageArg)
+            const usableOAuth = await fallbackManager.getUsableFallbackAccounts(
+              storageArg,
+              { modelId: options.modelId },
+            )
             const usableOAuthById = new Map(
               usableOAuth.map((account) => [account.id, account]),
             )
@@ -2503,6 +2925,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     getFallbackQuota(account),
                     storageArg,
                     account.id,
+                    options.modelId,
                   )
                 : true,
             )
@@ -2521,6 +2944,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 id: string
                 access?: string
               }) => void | Promise<void>
+              fableRequest?: FableRequestContext
             },
           ) {
             if (!accounts.length) return currentResponse ?? null
@@ -2540,6 +2964,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   trace,
                   `api_fallback_${index}`,
                   storage,
+                  options?.fableRequest,
                 )
               } else {
                 const access = account.access
@@ -2551,6 +2976,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   trace,
                   `fallback_${index}`,
                   storage,
+                  account.id,
+                  options?.fableRequest,
                 )
               }
               lastResponse = response
@@ -2602,6 +3029,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               id: string
               access?: string
             }) => void,
+            modelId?: string,
+            fableRequest?: FableRequestContext,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
@@ -2660,6 +3089,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               const accountsStart = nowMs()
               accounts = await getRoutableFallbackAccounts(storage, {
                 includeApiRoutes,
+                modelId,
               })
               trace?.mark('fallback_get_accounts', {
                 ms: roundMs(nowMs() - accountsStart),
@@ -2673,7 +3103,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   ? // Prefer the fresh QuotaManager cache (updated by the eager
                     // killswitch refresh) over the request-start storage snapshot,
                     // matching the other killswitch fallback filters.
-                    killswitchPassesPolicy(getFallbackQuota(a), storage, a.id)
+                    killswitchPassesPolicy(
+                      getFallbackQuota(a),
+                      storage,
+                      a.id,
+                      modelId,
+                    )
                   : true,
               )
               if (accounts.length < before) {
@@ -2691,7 +3126,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 storage,
                 currentResponse,
                 trace,
-                { onSuccess: onFallbackSuccess },
+                {
+                  onSuccess: onFallbackSuccess,
+                  fableRequest,
+                },
               )) ?? currentResponse
             )
           }
@@ -2699,6 +3137,40 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
+              const incomingHeaders = mergeHeaders(input, init)
+              const sessionId =
+                incomingHeaders.get('x-session-affinity') ||
+                incomingHeaders.get('x-opencode-session')
+              if (sessionId) idleSessions.delete(sessionId)
+              const pendingNotificationClosures = sessionId
+                ? (pendingDesktopNotificationClosures.get(sessionId) ?? 0)
+                : 0
+              if (sessionId && pendingNotificationClosures > 0) {
+                if (pendingNotificationClosures === 1) {
+                  pendingDesktopNotificationClosures.delete(sessionId)
+                } else {
+                  pendingDesktopNotificationClosures.set(
+                    sessionId,
+                    pendingNotificationClosures - 1,
+                  )
+                }
+                return createDesktopNotificationClosureResponse()
+              }
+              let fablePlan = fableFallbackManager.plan(sessionId, init?.body)
+              if (fablePlan && !fablePlan.downgraded) {
+                const finalWarm = fableWarmChains.get(fablePlan.sessionId)
+                if (finalWarm) {
+                  await finalWarm
+                  fablePlan = fableFallbackManager.plan(sessionId, init?.body)
+                }
+              }
+              const fableRequest: FableRequestContext | undefined = fablePlan
+                ? { plan: fablePlan }
+                : undefined
+              if (fablePlan?.downgraded) {
+                init = { ...init, body: fablePlan.bodyText }
+              }
+
               const initialBody = init?.body
               const trace = createPerfTrace({
                 bodyBytes:
@@ -2706,6 +3178,94 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     ? initialBody.length
                     : undefined,
               })
+              const wrapResponse = (response: Response) =>
+                createStrippedStream(response, {
+                  perf: (stage, data) => trace.mark(stage, data),
+                  ...(!fablePlan?.downgraded && fablePlan
+                    ? {
+                        onContentFilter: () => {
+                          if (!fableRequest?.warmTarget) {
+                            logger.debug(
+                              'fable-fallback',
+                              'content filter recovery unavailable for non-OAuth route',
+                              { session: fablePlan.sessionId },
+                            )
+                            return false
+                          }
+                          const remaining = fableFallbackManager.activate(
+                            fablePlan,
+                            fableRequest.warmTarget.oauthAccountId,
+                          )
+                          logger.info(
+                            'fable-fallback',
+                            'content filter detected; switching session to Opus 4.8',
+                            { session: fablePlan.sessionId, remaining },
+                          )
+                          publishFableRecoveryNotice(
+                            {
+                              sessionId: fablePlan.sessionId,
+                              mode: 'opus',
+                              remaining,
+                            },
+                            storage,
+                            auth,
+                            FABLE_SWITCHED_TO_OPUS_NOTICE,
+                          )
+                        },
+                      }
+                    : {}),
+                  ...(fablePlan?.downgraded && fableRequest
+                    ? {
+                        onComplete: (finishReason: string) => {
+                          const completed = fableFallbackManager.complete(
+                            fablePlan,
+                            fableRequest.opusCacheAnchor,
+                          )
+                          if (!completed.counted) return
+                          logger.info(
+                            'fable-fallback',
+                            'Opus 4.8 turn completed',
+                            {
+                              session: fablePlan.sessionId,
+                              finishReason,
+                              remaining: completed.remaining,
+                            },
+                          )
+                          publishFableRecoveryNotice(
+                            {
+                              sessionId: fablePlan.sessionId,
+                              mode: 'opus',
+                              remaining: completed.remaining,
+                            },
+                            storage,
+                            auth,
+                          )
+                          const warm = warmFableAfterOpus(fableRequest)
+                          if (completed.remaining === 0) {
+                            const notifyRestored = () => {
+                              if (
+                                fableFallbackManager.remaining(
+                                  fablePlan.sessionId,
+                                ) !== 0
+                              )
+                                return
+                              publishFableRecoveryNotice(
+                                {
+                                  sessionId: fablePlan.sessionId,
+                                  mode: 'fable',
+                                  remaining: 0,
+                                },
+                                storage,
+                                auth,
+                                FABLE_RESTORED_NOTICE,
+                              )
+                            }
+                            void warm.then(notifyRestored, notifyRestored)
+                          }
+                        },
+                      }
+                    : {}),
+                })
               const authStart = nowMs()
               const auth = await getAuth()
               trace.mark('get_auth', {
@@ -2727,7 +3287,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               quotaManager.seedFallbacksFromAccounts(
                 (storage?.accounts ?? []).filter(isOAuthAccount),
               )
+              if (!fablePlan) {
+                clearFableRecoveryNotice(sessionId, storage, auth)
+              }
               const replayableRequest = isReplayableRequest(input, init?.body)
+              const requestModelId = parseRequestModel(init?.body)
               // Count every replayable request up front — before the
               // fallback-first early return — so the every-N refresh cadence
               // (quota.refreshEveryNRequests) advances for main and the active
@@ -2765,6 +3329,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       includeApiRoutes: mainQuotaEntryIsFreshExhausted(
                         auth.access,
                       ),
+                      modelId: requestModelId,
                     })
                   trace.mark('fallback_first_get_accounts', {
                     ms: roundMs(nowMs() - fallbackStart),
@@ -2781,15 +3346,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       returnLastOnExhausted: false,
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback-first'),
+                      fableRequest,
                     },
                   )
                   if (fallbackResponse) {
                     trace.done('return_fallback_first', {
                       status: fallbackResponse.status,
                     })
-                    return createStrippedStream(fallbackResponse, {
-                      perf: (stage, data) => trace.mark(stage, data),
-                    })
+                    return wrapResponse(fallbackResponse)
                   }
                   preselectedFallbackAccounts = undefined
                 } catch (error) {
@@ -2903,12 +3467,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     routingQuotaEntry = quotaManager.getMain(auth.access)
                     showQuotaToastFromCache()
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {
-                    if (quotaSnapshotIsExhausted(routingQuota)) {
+                    if (
+                      quotaSnapshotIsExhausted(routingQuota) ||
+                      quotaSnapshotModelScopeIsExhausted(
+                        routingQuota,
+                        requestModelId,
+                      )
+                    ) {
                       // A stale exhausted snapshot is not strong enough evidence
-                      // to spend API-key credits. Re-check synchronously; if the
-                      // quota API is backed off and only stale data is returned,
-                      // the API route gate below still refuses it because the
-                      // entry is not fresh.
+                      // to spend API-key credits or skip the main account for a
+                      // model-scoped quota. Re-check synchronously; if the quota API
+                      // is backed off and only stale data is returned, the route gate
+                      // below still refuses API-key routes because the entry is not
+                      // fresh.
                       routingQuota = await quotaManager.refreshMain(auth.access)
                       routingQuotaEntry = quotaManager.getMain(auth.access)
                     } else {
@@ -2932,11 +3503,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     mainAccessToken: auth.access,
                     mainRefreshToken: auth.refresh,
                   })
+                  const routingQuotaPasses =
+                    quotaSnapshotPassesPolicy(routingQuota, storage) &&
+                    quotaSnapshotPassesModelScope(routingQuota, requestModelId)
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
-                    passes: quotaSnapshotPassesPolicy(routingQuota, storage),
+                    passes: routingQuotaPasses,
+                    model: requestModelId,
+                    modelScopedExhausted: quotaSnapshotModelScopeIsExhausted(
+                      routingQuota,
+                      requestModelId,
+                    ),
                   })
-                  if (!quotaSnapshotPassesPolicy(routingQuota, storage)) {
+                  if (!routingQuotaPasses) {
                     const fallbackStart = nowMs()
                     preselectedFallbackAccounts =
                       await getRoutableFallbackAccounts(storage, {
@@ -2945,6 +3524,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             routingQuotaEntry.refreshAfter > Date.now() &&
                             quotaSnapshotIsExhausted(routingQuotaEntry.quota),
                         ),
+                        modelId: requestModelId,
                       })
                     trace.mark('preselect_fallback_accounts', {
                       ms: roundMs(nowMs() - fallbackStart),
@@ -2960,15 +3540,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
+                        fableRequest,
                       },
                     )
                     if (fallbackResponse) {
                       trace.done('return_preselected_fallback', {
                         status: fallbackResponse.status,
                       })
-                      return createStrippedStream(fallbackResponse, {
-                        perf: (stage, data) => trace.mark(stage, data),
-                      })
+                      return wrapResponse(fallbackResponse)
                     }
                   }
                 } catch (error) {
@@ -3057,7 +3636,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 // refresh failed on the first request) killswitchPassesPolicy
                 // returns false under failClosedOnUnknownQuota, so the killswitch
                 // must still block / reroute instead of falling through to main.
-                !killswitchPassesPolicy(mainQuota, storage)
+                // accountId stays undefined for main; the optional trailing
+                // modelId adds the per-model scoped check.
+                !killswitchPassesPolicy(
+                  mainQuota,
+                  storage,
+                  undefined,
+                  requestModelId,
+                )
               ) {
                 // Main is killswitch-killed. Decide where to route from the SAME
                 // set routing will actually use — usable fallbacks that also
@@ -3077,6 +3663,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       includeApiRoutes: mainQuotaEntryIsFreshExhausted(
                         auth.access,
                       ),
+                      modelId: requestModelId,
                     })
                   : []
 
@@ -3106,9 +3693,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     trace.done('return_killswitch_fallback', {
                       status: fallbackResponse.status,
                     })
-                    return createStrippedStream(fallbackResponse, {
-                      perf: (stage, data) => trace.mark(stage, data),
-                    })
+                    return wrapResponse(fallbackResponse)
                   }
                 }
                 // Nowhere to route (no surviving fallback, or none produced a
@@ -3120,17 +3705,31 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       a.enabled !== false && isOAuthAccount(a),
                   )
                   .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
+                // Decide whether the block is scoped-driven (request's
+                // model matches a scoped window that is at/below the scoped
+                // threshold) vs a whole-account 5h/7d-driven block. A
+                // healthy Fable window + 5h/7d breach is NOT scoped-driven.
+                const scoped = resolveScopedDrivenBlock({
+                  mainQuota,
+                  requestModelId,
+                  storage,
+                })
                 const retryAfter = killswitchRetryAfterSeconds(
                   mainQuota,
                   fallbackAccounts,
                   now,
+                  scoped.isScopedDriven ? scoped.modelId : undefined,
                 )
+                const message = formatKillswitchBlockMessage({
+                  retryAfterSeconds: retryAfter,
+                  ...(scoped.isScopedDriven && { modelName: scoped.modelName }),
+                })
                 return new Response(
                   JSON.stringify({
                     type: 'error',
                     error: {
                       type: 'rate_limit_error',
-                      message: `Killswitch: no routable accounts. Retry in ${Math.floor(retryAfter / 60)}m ${retryAfter % 60}s.`,
+                      message,
                     },
                   }),
                   {
@@ -3150,6 +3749,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace,
                 'main',
                 storage,
+                'main',
+                fableRequest,
               )
               let fallbackServed = false
               const response = await tryFallbackAccounts(
@@ -3164,13 +3765,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   fallbackServed = true
                   writeCurrentSidebarState(account.id, 'fallback')
                 },
+                requestModelId,
+                fableRequest,
               )
               if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
               trace.done('return_response', { status: response.status })
-              return createStrippedStream(response, {
-                perf: (stage, data) => trace.mark(stage, data),
-              })
+              return wrapResponse(response)
             },
           }
         }
