@@ -229,6 +229,7 @@ export function resolveScopedDrivenBlock(input: {
 type NotificationRequest = {
   path: { id: string }
   body: {
+    messageID?: string
     noReply: boolean
     parts: Array<{ type: 'text'; text: string; ignored: true }>
     agent?: string
@@ -358,20 +359,51 @@ function createPerfTrace(data?: Record<string, unknown>): PerfTrace {
   return trace
 }
 
+function notificationMessageIdBeforeAssistant(
+  latestAssistantMessageId: string,
+  latestUserMessageId?: string,
+) {
+  const match = /^msg_([0-9a-fA-F]{12})/.exec(latestAssistantMessageId)
+  if (!match) return undefined
+  const encoded = BigInt(`0x${match[1]}`)
+  if (encoded <= 0n) return undefined
+  const previous = (encoded - 1n).toString(16).padStart(12, '0')
+  const candidate = `msg_${previous}${'z'.repeat(14)}`
+  if (latestUserMessageId && candidate <= latestUserMessageId) return undefined
+  return candidate
+}
+
 async function sendIgnoredMessage(
   ctx: Parameters<Plugin>[0],
   sessionId: string,
   text: string,
-  noReply = true,
+  options: {
+    noReply?: boolean
+    beforeActiveAssistant?: boolean
+  } = {},
 ) {
   const session = ctx.client.session as PluginSessionClient | undefined
   const promptContext = await resolvePromptContext(ctx.client, sessionId)
   const request: NotificationRequest = {
     path: { id: sessionId },
     body: {
-      noReply,
+      noReply: options.noReply ?? true,
       parts: [{ type: 'text', text, ignored: true }],
     },
+  }
+  if (options.beforeActiveAssistant) {
+    const messageID = promptContext?.latestAssistantMessageId
+      ? notificationMessageIdBeforeAssistant(
+          promptContext.latestAssistantMessageId,
+          promptContext.latestUserMessageId,
+        )
+      : undefined
+    if (!messageID) {
+      throw new Error(
+        'OpenCode active assistant ordering is unavailable for an immediate notification.',
+      )
+    }
+    request.body.messageID = messageID
   }
   if (promptContext?.agent) request.body.agent = promptContext.agent
   if (promptContext?.model) request.body.model = promptContext.model
@@ -390,34 +422,6 @@ async function sendIgnoredMessage(
   throw new Error(
     'OpenCode session prompt API is unavailable for ignored replies.',
   )
-}
-
-function createDesktopNotificationClosureResponse() {
-  const messageId = `msg_${randomUUID().replaceAll('-', '')}`
-  const events = [
-    `event: message_start\ndata: ${JSON.stringify({
-      type: 'message_start',
-      message: {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        content: [],
-        model: 'claude-fable-5',
-        stop_reason: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    })}\n\n`,
-    `event: message_delta\ndata: ${JSON.stringify({
-      type: 'message_delta',
-      delta: { stop_reason: 'end_turn', stop_sequence: null },
-      usage: { output_tokens: 0 },
-    })}\n\n`,
-    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-  ]
-  return new Response(events.join(''), {
-    status: 200,
-    headers: { 'content-type': 'text/event-stream' },
-  })
 }
 
 function cleanAbort(): never {
@@ -855,9 +859,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     string,
     NonNullable<SidebarState['fableRecoveries']>[number]
   >()
-  const pendingDesktopRecoveryNotices = new Map<string, string[]>()
-  const pendingDesktopNotificationClosures = new Map<string, number>()
-  const idleSessions = new Set<string>()
 
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -1157,40 +1158,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
 
     if (!desktopText || isTuiConnected(notice.sessionId)) return
-    const pending = pendingDesktopRecoveryNotices.get(notice.sessionId) ?? []
-    pending.push(desktopText)
-    pendingDesktopRecoveryNotices.set(notice.sessionId, pending.slice(-2))
-    if (idleSessions.has(notice.sessionId)) {
-      void flushDesktopRecoveryNotices(notice.sessionId)
-    }
-  }
-
-  async function flushDesktopRecoveryNotices(sessionId: string) {
-    const pending = pendingDesktopRecoveryNotices.get(sessionId)
-    if (!pending?.length) return
-    pendingDesktopRecoveryNotices.delete(sessionId)
-    if (isTuiConnected(sessionId)) return
-
-    for (const text of pending) {
-      pendingDesktopNotificationClosures.set(
-        sessionId,
-        (pendingDesktopNotificationClosures.get(sessionId) ?? 0) + 1,
-      )
-      try {
-        // PromptAsync is the only server-plugin path that renders arbitrary text
-        // in OpenCode Desktop. Let it open a turn, then satisfy that turn locally
-        // in the fetch wrapper so no provider request or recovery count is spent.
-        await sendIgnoredMessage(ctx, sessionId, text, false)
-      } catch (error) {
-        const closures = pendingDesktopNotificationClosures.get(sessionId) ?? 0
-        if (closures <= 1) pendingDesktopNotificationClosures.delete(sessionId)
-        else pendingDesktopNotificationClosures.set(sessionId, closures - 1)
-        logger.warn('fable-fallback', 'Desktop notification failed', {
-          session: sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        })
-      }
-    }
+    // OpenCode renders messages by creation time but its active run loop chooses
+    // pending user work by monotonic message ID. Place this no-reply notification
+    // immediately before the already-running assistant ID: Desktop shows it now,
+    // while the model loop cannot mistake it for a new user turn.
+    void sendIgnoredMessage(ctx, notice.sessionId, desktopText, {
+      noReply: true,
+      beforeActiveAssistant: true,
+    }).catch((error) => {
+      logger.warn('fable-fallback', 'Desktop notification failed', {
+        session: notice.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    })
   }
 
   function clearFableRecoveryNotice(
@@ -1773,7 +1753,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         type?: string
         properties?: {
           sessionID?: string
-          status?: { type?: string }
           info?: { id?: string }
         }
       }
@@ -1781,27 +1760,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         value.properties?.sessionID ?? value.properties?.info?.id
       if (!sessionId) return
 
-      const becameIdle =
-        value.type === 'session.idle' ||
-        (value.type === 'session.status' &&
-          value.properties?.status?.type === 'idle')
-      if (becameIdle) {
-        idleSessions.delete(sessionId)
-        idleSessions.add(sessionId)
-        if (idleSessions.size > 256) {
-          const oldest = idleSessions.values().next().value
-          if (oldest) idleSessions.delete(oldest)
-        }
-        await flushDesktopRecoveryNotices(sessionId)
-        return
-      }
-
-      if (value.type === 'session.status' || value.type === 'session.deleted') {
-        idleSessions.delete(sessionId)
-      }
       if (value.type === 'session.deleted') {
-        pendingDesktopRecoveryNotices.delete(sessionId)
-        pendingDesktopNotificationClosures.delete(sessionId)
         fableRecoveryNotices.delete(sessionId)
       }
     },
@@ -3141,21 +3100,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               const sessionId =
                 incomingHeaders.get('x-session-affinity') ||
                 incomingHeaders.get('x-opencode-session')
-              if (sessionId) idleSessions.delete(sessionId)
-              const pendingNotificationClosures = sessionId
-                ? (pendingDesktopNotificationClosures.get(sessionId) ?? 0)
-                : 0
-              if (sessionId && pendingNotificationClosures > 0) {
-                if (pendingNotificationClosures === 1) {
-                  pendingDesktopNotificationClosures.delete(sessionId)
-                } else {
-                  pendingDesktopNotificationClosures.set(
-                    sessionId,
-                    pendingNotificationClosures - 1,
-                  )
-                }
-                return createDesktopNotificationClosureResponse()
-              }
               let fablePlan = fableFallbackManager.plan(sessionId, init?.body)
               if (fablePlan && !fablePlan.downgraded) {
                 const finalWarm = fableWarmChains.get(fablePlan.sessionId)

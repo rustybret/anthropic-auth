@@ -4,13 +4,16 @@
  * OpenCode records even ignored/noReply prompt messages as user messages. If a
  * plugin sends one without the previous model/variant, OpenCode's next prompt
  * can inherit the synthetic message's default model/variant and change usage or
- * cache attribution. Resolve the most recent assistant context and pass it
- * through on hidden command replies.
+ * cache attribution. Resolve the most recent assistant context and message IDs
+ * so hidden replies preserve model state and active-run notifications can be
+ * ordered before the assistant without becoming pending user work.
  */
 export interface ResolvedPromptContext {
   agent?: string
   model?: { providerID: string; modelID: string }
   variant?: string
+  latestAssistantMessageId?: string
+  latestUserMessageId?: string
 }
 
 interface RawInfo {
@@ -32,9 +35,19 @@ function extractMessages(response: unknown): unknown[] {
   return []
 }
 
-function getRole(message: unknown): string | undefined {
+function getMessageInfo(message: unknown) {
   if (!isRecord(message) || !isRecord(message.info)) return undefined
-  return typeof message.info.role === 'string' ? message.info.role : undefined
+  return message.info
+}
+
+function getRole(message: unknown): string | undefined {
+  const info = getMessageInfo(message)
+  return typeof info?.role === 'string' ? info.role : undefined
+}
+
+function getMessageId(message: unknown): string | undefined {
+  const info = getMessageInfo(message)
+  return typeof info?.id === 'string' ? info.id : undefined
 }
 
 function extractFromMessage(message: unknown): ResolvedPromptContext | null {
@@ -78,6 +91,9 @@ function mergeContexts(
     agent: base.agent ?? patch.agent,
     model: base.model ?? patch.model,
     variant: base.variant ?? patch.variant,
+    latestAssistantMessageId:
+      base.latestAssistantMessageId ?? patch.latestAssistantMessageId,
+    latestUserMessageId: base.latestUserMessageId ?? patch.latestUserMessageId,
   }
 }
 
@@ -118,7 +134,27 @@ export async function resolvePromptContext(
   }
   if (messages.length === 0) return null
 
-  let result: ResolvedPromptContext = {}
+  let latestAssistantMessageId: string | undefined
+  let latestUserMessageId: string | undefined
+  for (const message of messages) {
+    const id = getMessageId(message)
+    if (!id) continue
+    const role = getRole(message)
+    if (
+      role === 'assistant' &&
+      (!latestAssistantMessageId || id > latestAssistantMessageId)
+    ) {
+      latestAssistantMessageId = id
+    }
+    if (role === 'user' && (!latestUserMessageId || id > latestUserMessageId)) {
+      latestUserMessageId = id
+    }
+  }
+
+  let result: ResolvedPromptContext = {
+    latestAssistantMessageId,
+    latestUserMessageId,
+  }
   for (let index = messages.length - 1; index >= 0; index--) {
     if (getRole(messages[index]) !== 'assistant') continue
     const context = extractFromMessage(messages[index])
@@ -134,6 +170,14 @@ export async function resolvePromptContext(
     if (isComplete(result)) return result
   }
 
-  if (!result.agent && !result.model && !result.variant) return null
+  if (
+    !result.agent &&
+    !result.model &&
+    !result.variant &&
+    !result.latestAssistantMessageId &&
+    !result.latestUserMessageId
+  ) {
+    return null
+  }
   return result
 }

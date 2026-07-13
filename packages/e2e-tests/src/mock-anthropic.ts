@@ -9,6 +9,7 @@ export type MockResponse =
   | {
       type: 'text'
       text: string
+      delayMs?: number
       usage?: MockUsage
     }
   | {
@@ -172,7 +173,10 @@ function createSseStream(
     typeof requestBody.model === 'string' ? requestBody.model : 'mock-model'
 
   return new ReadableStream<Uint8Array>({
-    start(controller) {
+    async start(controller) {
+      if ('delayMs' in response && response.delayMs) {
+        await Bun.sleep(response.delayMs)
+      }
       const send = (event: string, data: Record<string, unknown>) => {
         controller.enqueue(
           encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),

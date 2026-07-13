@@ -17,7 +17,9 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   `auth` (OAuth loader + token refresh). **[G]** hook shape; **[A]** provider id `'anthropic'`.
 - **CLI** — `packages/opencode/src/cli.ts`, bin `opencode-anthropic-auth`. Subcommands:
   `login [label]`, `api add [label]`, `list`, `relay setup`. **[G+A]** flow generic, OAuth/endpoints [A].
-- **TUI** — `packages/opencode/src/tui.tsx`, mounted via `api.slots.register`. Sidebar + command
+- **TUI** — source in `packages/opencode/src/tui.tsx`, exported through the host-runtime-aware
+  `src/tui/entry.mjs` loader and mounted via `api.slots.register`. Published packages ship a
+  precompiled Solid/OpenTUI tree so node_modules loading preserves reactivity. Sidebar + command
   modals. **[G]** rendering; **[A]** quota window labels + command names.
 - **Pi frontend** — `packages/pi/` — a SECOND frontend reusing `packages/core/`. Proof the core is
   already frontend-agnostic. Out of scope for openai-auth but relevant to the shared-core question.

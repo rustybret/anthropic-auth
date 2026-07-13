@@ -2,6 +2,15 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.15.1
+
+### Patch Changes
+
+- Show Fable recovery transition notices immediately during active multi-step OpenCode Desktop runs while preserving the selected session model and preventing additional provider turns.
+- Restore live TUI sidebar updates on current OpenTUI hosts by shipping a precompiled reactive Solid tree, with packed-package smoke coverage in CI and release gates.
+
+Thanks to [@tomolom](https://github.com/tomolom) for reporting the TUI packaging issue.
+
 ## 1.15.0
 
 ### Minor Changes

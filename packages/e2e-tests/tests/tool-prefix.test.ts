@@ -44,24 +44,40 @@ describe('OpenCode Anthropic auth e2e', () => {
     harness = await E2EHarness.create({ hybridCache: true })
     harness.script([
       { type: 'refusal' },
-      { type: 'text', text: 'recovered through opus' },
+      {
+        type: 'text',
+        text: 'recovered through opus',
+        delayMs: 3_000,
+      },
     ])
 
     const sessionId = await harness.createSession()
-    const result = await harness.sendPrompt(
-      sessionId,
-      'recover from the Fable content filter',
-      60_000,
-      'claude-fable-5',
-    )
+    let promptSettled = false
+    const resultPromise = harness
+      .sendPrompt(
+        sessionId,
+        'recover from the Fable content filter',
+        60_000,
+        'claude-fable-5',
+      )
+      .finally(() => {
+        promptSettled = true
+      })
 
+    await harness.waitFor(
+      () =>
+        harness!.anthropic
+          .requests()
+          .filter((request) => request.body.max_tokens !== 0).length >= 2,
+      { label: 'delayed Opus recovery request captured' },
+    )
+    await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
+    expect(promptSettled).toBe(false)
+
+    const result = await resultPromise
     const serialized = JSON.stringify(result)
     expect(serialized).toContain('recovered through opus')
     expect(serialized).not.toContain('ContentFilterError')
-    await harness.waitForSessionText(
-      sessionId,
-      'Switched to Opus 4.8',
-    )
     await harness.waitFor(
       () =>
         harness!.anthropic
@@ -81,9 +97,10 @@ describe('OpenCode Anthropic auth e2e', () => {
         !serializedBody.includes('Generate a title for this conversation')
       )
     })
-    expect(sessionRequests.slice(0, 2).map((request) => request.body.model)).toEqual(
-      ['claude-fable-5', 'claude-opus-4-8'],
-    )
+    expect(sessionRequests.map((request) => request.body.model)).toEqual([
+      'claude-fable-5',
+      'claude-opus-4-8',
+    ])
   }, 90_000)
 
   it('bridges back to a stale Opus cache after more than 20 Fable blocks', async () => {

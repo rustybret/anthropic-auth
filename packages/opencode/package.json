@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-anthropic-auth",
-  "version": "1.15.0",
+  "version": "1.15.1",
   "type": "module",
   "repository": {
     "type": "git",
@@ -16,7 +16,7 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "import": "./src/tui.tsx"
+      "import": "./src/tui/entry.mjs"
     },
     "./tui-prefs": {
       "types": "./dist/tui-preferences.d.ts",
@@ -36,7 +36,8 @@
   "files": [
     "dist",
     "src/tui.tsx",
-    "src/tui/command-dialogs.tsx",
+    "src/tui",
+    "src/tui-compiled",
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
     "src/rpc",
@@ -44,24 +45,26 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
+    "build:tui": "bun scripts/build-tui.ts",
+    "smoke:tui": "bun scripts/smoke-tui-pack-install.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",
     "extract": "bun ../../scripts/extract-system-prompt.ts",
     "test": "bun test src/tests",
-    "typecheck": "tsc",
-    "types": "tsc",
+    "typecheck": "tsc && tsc -p tsconfig.scripts.json",
+    "types": "tsc && tsc -p tsconfig.scripts.json",
     "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@cortexkit/anthropic-auth-core": "1.15.0",
-    "@opentui/core": ">=0.4.2",
-    "@opentui/solid": ">=0.4.3",
+    "@cortexkit/anthropic-auth-core": "1.15.1",
+    "@opentui/core": "0.4.3",
+    "@opentui/solid": "0.4.3",
     "jsonc-parser": "^3.3.1",
-    "solid-js": "^1.9.10"
+    "solid-js": "1.9.12"
   }
 }

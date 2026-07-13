@@ -38,8 +38,8 @@ anthropic-auth/
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
-- Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `fable-fallback.ts` (session-local Fable content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar widget), `tui/command-dialogs.tsx` (command modal dialog components), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed Fable recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `fable-fallback.ts` (session-local Fable content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed Fable recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -64,7 +64,7 @@ anthropic-auth/
 - `packages/opencode/src/index.ts`: OpenCode plugin factory (exported as `AnthropicAuthPlugin`)
 - `packages/opencode/src/cli.ts`: CLI binary entry (`opencode-anthropic-auth`)
 - `packages/pi/src/index.ts`: Pi extension entry (default export function)
-- `packages/opencode/src/tui.tsx`: TUI sidebar widget entry (SolidJS component)
+- `packages/opencode/src/tui.tsx`: TUI sidebar source (SolidJS component), loaded through `src/tui/entry.mjs` from precompiled output on current OpenTUI hosts
 - `packages/core/src/index.ts`: Shared core library entry (re-exports all modules)
 
 **Configuration:**

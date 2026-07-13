@@ -283,16 +283,22 @@ describe('package metadata', () => {
       files?: string[]
       'oc-plugin'?: string[]
       scripts?: Record<string, string>
+      dependencies?: Record<string, string>
     }
 
     expect(packageJson.exports?.['./tui']).toEqual({
       types: './dist/tui.d.ts',
-      import: './src/tui.tsx',
+      import: './src/tui/entry.mjs',
     })
     expect(packageJson.files).toContain('src/tui.tsx')
+    expect(packageJson.files).toContain('src/tui')
+    expect(packageJson.files).toContain('src/tui-compiled')
     expect(packageJson.files).toContain('src/sidebar-state.ts')
     expect(packageJson['oc-plugin']).toEqual(['server', 'tui'])
-    expect(packageJson.scripts?.build).not.toContain('--outfile dist/tui.js')
+    expect(packageJson.scripts?.build).toContain('bun run build:tui')
+    for (const dependency of ['@opentui/core', '@opentui/solid', 'solid-js']) {
+      expect(packageJson.dependencies?.[dependency]).toMatch(/^\d/)
+    }
   })
 
   test('package TUI entrypoint imports under OpenTUI runtime support', () => {
@@ -4655,7 +4661,32 @@ describe('auth.loader', () => {
       return Promise.resolve(new Response(successfulSse, { status: 200 }))
     }) as unknown as typeof fetch
 
-    const mockClient = createMockClient()
+    const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
+    const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
+    const mockClient = createMockClient([
+      {
+        info: {
+          id: latestUserMessageId,
+          role: 'user',
+          agent: 'Alfonso - CTO',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5',
+            variant: 'xhigh',
+          },
+        },
+      },
+      {
+        info: {
+          id: latestAssistantMessageId,
+          role: 'assistant',
+          agent: 'Alfonso - CTO',
+          providerID: 'anthropic',
+          modelID: 'claude-fable-5',
+          variant: 'xhigh',
+        },
+      },
+    ])
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
       () =>
@@ -4688,7 +4719,8 @@ describe('auth.loader', () => {
       caught = error
     }
     expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+    await waitForMockCall(mockClient.session.promptAsync)
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
     const switchedState = await waitForSidebarState((state) =>
       Boolean(
         state.fableRecoveries?.some(
@@ -4706,22 +4738,19 @@ describe('auth.loader', () => {
 
     const firstOpus = await result.fetch(MESSAGES_URL, request)
     await firstOpus.text()
-    await plugin.event?.({
-      event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_fable_filter',
-          status: { type: 'idle' },
-        },
-      },
-    })
-    await waitForMockCall(mockClient.session.promptAsync)
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
     expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
         path: { id: 'ses_fable_filter' },
         body: expect.objectContaining({
-          noReply: false,
+          messageID: expect.any(String),
+          noReply: true,
+          agent: 'Alfonso - CTO',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5',
+          },
+          variant: 'xhigh',
           parts: [
             expect.objectContaining({
               type: 'text',
@@ -4732,8 +4761,12 @@ describe('auth.loader', () => {
         }),
       }),
     )
-    const switchNotificationClosure = await result.fetch(MESSAGES_URL, request)
-    expect(await switchNotificationClosure.text()).toContain('message_stop')
+    const switchNotificationRequest = mockClient.session.promptAsync.mock
+      .calls[0]?.[0] as { body: { messageID?: string } } | undefined
+    const switchNotificationMessageId =
+      switchNotificationRequest?.body.messageID
+    expect(switchNotificationMessageId! > latestUserMessageId).toBe(true)
+    expect(switchNotificationMessageId! < latestAssistantMessageId).toBe(true)
     expect(normalModels).toHaveLength(2)
 
     for (let turn = 1; turn < 10; turn++) {
@@ -4793,15 +4826,6 @@ describe('auth.loader', () => {
     const restored = await restoredPromise
     await restored.text()
     expect(normalModels.at(-1)).toBe('claude-fable-5')
-    await plugin.event?.({
-      event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_fable_filter',
-          status: { type: 'idle' },
-        },
-      },
-    })
 
     for (
       let attempt = 0;
@@ -4815,7 +4839,8 @@ describe('auth.loader', () => {
       expect.objectContaining({
         path: { id: 'ses_fable_filter' },
         body: expect.objectContaining({
-          noReply: false,
+          messageID: expect.any(String),
+          noReply: true,
           parts: [
             expect.objectContaining({
               type: 'text',
@@ -4826,8 +4851,6 @@ describe('auth.loader', () => {
         }),
       }),
     )
-    const restoreNotificationClosure = await result.fetch(MESSAGES_URL, request)
-    expect(await restoreNotificationClosure.text()).toContain('message_stop')
     expect(normalModels).toHaveLength(12)
 
     const restoredState = await waitForSidebarState((state) =>
