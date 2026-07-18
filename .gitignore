@@ -37,4 +37,5 @@ temp/
 *.flow
 *.flow.log
 captures/*.txt
-/.omo/run-continuation
+# omo/ralph-loop local agent state (never project work)
+/.omo/
