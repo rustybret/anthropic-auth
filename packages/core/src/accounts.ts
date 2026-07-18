@@ -18,6 +18,7 @@ const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
 export const ACCOUNT_FILE_NAME = 'anthropic-auth.json'
 export const ACCOUNT_STATE_FILE_NAME = 'anthropic-auth-state.json'
 export const QUOTA_URL = 'https://api.anthropic.com/api/oauth/usage'
+export const QUOTA_FETCH_TIMEOUT_MS = 30_000
 
 export type QuotaWindowName = 'five_hour' | 'seven_day'
 
@@ -1966,6 +1967,9 @@ function isTransientQuotaError(error: unknown) {
     return true
   }
 
+  const name = (error as { name?: unknown }).name
+  if (name === 'TimeoutError' || name === 'AbortError') return true
+
   if (!(error instanceof Error)) return false
   const message = error.message
   const code = (error as Error & { code?: unknown }).code
@@ -2065,6 +2069,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   accessToken: string
   fetchImpl?: typeof fetch
   now?: () => number
+  timeoutMs?: number
 }): Promise<OAuthQuotaSnapshot> {
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
@@ -2076,6 +2081,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
       'anthropic-beta': 'oauth-2025-04-20',
       'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
     },
+    signal: AbortSignal.timeout(input.timeoutMs ?? QUOTA_FETCH_TIMEOUT_MS),
   })
 
   if (!response.ok) {

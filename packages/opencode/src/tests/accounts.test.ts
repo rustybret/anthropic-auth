@@ -2723,6 +2723,22 @@ describe('isTransientQuotaError via duck-typed error classification', () => {
     })
     expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
   })
+
+  test('AbortSignal.timeout TimeoutError → transient (stalled connection)', () => {
+    const result = buildQuotaOperationError({
+      error: new DOMException('signal timed out', 'TimeoutError'),
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('AbortError (manual abort) → transient', () => {
+    const result = buildQuotaOperationError({
+      error: new DOMException('aborted', 'AbortError'),
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2867,6 +2883,58 @@ describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
     // Verify isTransientQuotaError classifies it as transient
     const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
     expect(result.nextRetryAt!).toBeLessThan(1_000_000 + 5 * 60_000)
+  })
+
+  test('passes an AbortSignal to fetch so a stalled connection can be aborted', async () => {
+    let seenSignal: unknown = 'NOT_SET'
+    const fetchImpl = (async (_url: string, init?: { signal?: unknown }) => {
+      seenSignal = init?.signal
+      return new Response(
+        JSON.stringify({
+          five_hour: { utilization: 1, resets_at: '2026-07-04T12:00:00Z' },
+          seven_day: { utilization: 1, resets_at: '2026-07-08T09:00:00Z' },
+        }),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+
+    await fetchOAuthQuotaSnapshot({
+      accessToken: 't',
+      fetchImpl,
+      now: () => 1_000_000,
+    })
+
+    expect(seenSignal).toBeInstanceOf(AbortSignal)
+  })
+
+  test('rejects (does not hang) when the connection stalls past the timeout', async () => {
+    // Mock only settles via abort; with no timeout signal it hangs forever —
+    // exactly the "Waiting for quota…" bug being fixed.
+    const fetchImpl = ((_url: string, init?: { signal?: AbortSignal }) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) return
+        if (signal.aborted) return reject(signal.reason)
+        signal.addEventListener('abort', () => reject(signal.reason), {
+          once: true,
+        })
+      })
+    }) as unknown as typeof fetch
+
+    const start = Date.now()
+    let thrown: unknown = null
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+        timeoutMs: 20,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).not.toBeNull()
+    expect(Date.now() - start).toBeLessThan(2_000)
   })
 
   test('401 response → thrown error carries .status=401 (NOT transient for quota)', async () => {

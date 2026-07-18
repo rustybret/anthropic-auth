@@ -58,7 +58,11 @@ export type ClaudeOAuthRefreshResult = {
   expiresIn: number
 }
 
+export const TOKEN_REFRESH_TIMEOUT_MS = 30_000
+
 function isTransientNetworkError(error: unknown) {
+  const name = (error as { name?: unknown }).name
+  if (name === 'TimeoutError' || name === 'AbortError') return true
   if (!(error instanceof Error)) return false
   const code = (error as Error & { code?: unknown }).code
   return (
@@ -76,10 +80,12 @@ export async function refreshClaudeOAuthToken(input: {
   now?: () => number
   maxRetries?: number
   baseDelayMs?: number
+  timeoutMs?: number
 }): Promise<ClaudeOAuthRefreshResult> {
   const fetchImpl = input.fetchImpl ?? fetch
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500
+  const timeoutMs = input.timeoutMs ?? TOKEN_REFRESH_TIMEOUT_MS
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -101,6 +107,7 @@ export async function refreshClaudeOAuthToken(input: {
           client_id: CLIENT_ID,
           scope: REFRESH_SCOPE,
         }),
+        signal: AbortSignal.timeout(timeoutMs),
       })
 
       if (!response.ok) {

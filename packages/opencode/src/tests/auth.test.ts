@@ -238,6 +238,49 @@ describe('refreshClaudeOAuthToken', () => {
     expect(result.refresh).toBe('new-refresh')
   })
 
+  test('passes an AbortSignal to fetch so a stalled token refresh can be aborted', async () => {
+    let seenSignal: unknown = 'NOT_SET'
+    await refreshClaudeOAuthToken({
+      refreshToken: 'old-refresh',
+      fetchImpl: mock((_input: unknown, init?: { signal?: unknown }) => {
+        seenSignal = init?.signal
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ access_token: 'a', expires_in: 3600 }),
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch,
+    })
+    expect(seenSignal).toBeInstanceOf(AbortSignal)
+  })
+
+  test('rejects (does not hang) when the token endpoint stalls past the timeout', async () => {
+    const start = Date.now()
+    let thrown: unknown = null
+    try {
+      await refreshClaudeOAuthToken({
+        refreshToken: 'old-refresh',
+        maxRetries: 0,
+        timeoutMs: 20,
+        fetchImpl: ((_input: unknown, init?: { signal?: AbortSignal }) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal
+            if (!signal) return
+            if (signal.aborted) return reject(signal.reason)
+            signal.addEventListener('abort', () => reject(signal.reason), {
+              once: true,
+            })
+          })
+        }) as unknown as typeof fetch,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).not.toBeNull()
+    expect(Date.now() - start).toBeLessThan(2_000)
+  })
+
   test('does not retry OAuth refresh rate limits or invalid grants', async () => {
     for (const status of [400, 429]) {
       let calls = 0
