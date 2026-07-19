@@ -1,6 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from 'bun:test'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { E2EHarness } from '../src/harness.ts'
 
 let harness: E2EHarness | null = null
@@ -11,6 +14,39 @@ afterEach(async () => {
 })
 
 describe('OpenCode Anthropic auth e2e', () => {
+  it('keeps sidebar state inside the isolated run directory', async () => {
+    const fakeTmpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-global-'))
+    const globalStateDir = join(fakeTmpDir, 'opencode-anthropic-auth')
+    const globalStateFile = join(globalStateDir, 'sidebar-state.json')
+    const sentinel = '{"sentinel":"operator-live-state"}\n'
+    await mkdir(globalStateDir)
+    await writeFile(globalStateFile, sentinel)
+
+    try {
+      // Only the child sees the fake TMPDIR; harness lifecycle paths stay in the real system tmpdir.
+      harness = await E2EHarness.create({ childTmpDir: fakeTmpDir })
+      expect(harness.opencode.env.tempDir.startsWith(fakeTmpDir)).toBe(false)
+      harness.script([{ type: 'text', text: 'isolation checked' }])
+      const sessionId = await harness.createSession()
+      await harness.sendPrompt(sessionId, 'verify isolated sidebar state')
+      const isolatedStateFile = join(
+        harness.opencode.env.configDir,
+        'sidebar-state.json',
+      )
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (await Bun.file(isolatedStateFile).exists()) break
+        await Bun.sleep(100)
+      }
+
+      expect(await Bun.file(globalStateFile).text()).toBe(sentinel)
+      expect(await Bun.file(isolatedStateFile).exists()).toBe(true)
+    } finally {
+      await harness?.dispose()
+      harness = null
+      await rm(fakeTmpDir, { recursive: true, force: true })
+    }
+  }, 90_000)
+
   it('strips mcp_ tool names even when Anthropic SSE chunks split the name field', async () => {
     harness = await E2EHarness.create()
     harness.script([

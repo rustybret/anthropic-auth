@@ -1,9 +1,16 @@
-import { createHash } from 'node:crypto'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
+import {
+  lstat,
+  mkdir,
+  readdir,
+  rename,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
-import { isSecretKey, relayLog } from './logger.ts'
+import { isSecretKey, logger, relayLog } from './logger.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
@@ -16,10 +23,27 @@ const DUMP_USAGE_TITLE = '## Claude Dump Usage'
 const DUMP_USAGE =
   'Usage: `/claude-dump`, `/claude-dump on`, or `/claude-dump off`.'
 const DUMP_DIR_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR'
+const DUMP_MAX_BYTES_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES'
 const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
+const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
+const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
+const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
+const DUMP_PARTIAL_STALE_MS = 10 * 60 * 1000
+const DUMP_ARTIFACT_SUFFIX_PATTERN = /\.(body|meta|relay|request)\.json$/
+// Earlier builds emitted five-digit counters; current counters grow without truncation.
+const DUMP_ARTIFACT_ID_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-\d{5,}-(.+)$/
+const DUMP_SEGMENT_PATTERN = '[a-zA-Z0-9._-]'
+const DIRECT_DUMP_PATTERN = new RegExp(
+  `^${DUMP_SEGMENT_PATTERN}{1,80}-direct(?:-${DUMP_SEGMENT_PATTERN}{1,80})?$`,
+)
+const RELAY_DUMP_PATTERN = new RegExp(
+  `^${DUMP_SEGMENT_PATTERN}{1,80}-(?:http|websocket)-p[12]-(?:full_sync|patch)$`,
+)
 
 let dumpEnabled = false
 let nextDumpId = 0
+let lastDumpSweepAt = 0
 
 const DIRECT_DUMP_PREVIOUS_BODY_LIMIT = 100
 const directDumpPreviousBodies = new Map<string, string>()
@@ -41,11 +65,165 @@ export function setDumpEnabled(enabled: boolean) {
 export function resetDumpState() {
   dumpEnabled = false
   nextDumpId = 0
+  lastDumpSweepAt = 0
   directDumpPreviousBodies.clear()
 }
 
 export function getDumpDirectory() {
   return process.env[DUMP_DIR_ENV] || DEFAULT_DUMP_DIR
+}
+
+function getDumpMaxBytes() {
+  const configured = Number(process.env[DUMP_MAX_BYTES_ENV])
+  return Number.isFinite(configured) && configured >= 0
+    ? Math.floor(configured)
+    : DEFAULT_DUMP_MAX_BYTES
+}
+
+function isConfiguredDumpDirectory(path: string) {
+  return resolve(path) === resolve(getDumpDirectory())
+}
+
+function isDumpArtifactFileName(name: string) {
+  const stem = name.replace(DUMP_ARTIFACT_SUFFIX_PATTERN, '')
+  if (stem === name) return false
+  const match = DUMP_ARTIFACT_ID_PATTERN.exec(stem)
+  const requestPath = match?.[1]
+  if (!requestPath) return false
+  return (
+    DIRECT_DUMP_PATTERN.test(requestPath) ||
+    RELAY_DUMP_PATTERN.test(requestPath)
+  )
+}
+
+function isDumpPartialFileName(name: string) {
+  if (!name.endsWith('.partial')) return false
+  const partialStem = name.slice(0, -8)
+  if (isDumpArtifactFileName(partialStem)) return true
+  const separator = partialStem.lastIndexOf('.')
+  if (separator < 0) return false
+  const nonce = partialStem.slice(separator + 1)
+  return (
+    /^[a-f0-9]{24}$/.test(nonce) &&
+    isDumpArtifactFileName(partialStem.slice(0, separator))
+  )
+}
+
+export async function writeDumpFile(path: string, contents: string) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const nonce = randomBytes(12).toString('hex')
+    const partialPath = `${path}.${nonce}.partial`
+    let created = false
+    try {
+      await writeFile(partialPath, contents, { encoding: 'utf8', flag: 'wx' })
+      created = true
+      await rename(partialPath, path)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue
+      if (created) await unlink(partialPath).catch(() => {})
+      throw error
+    }
+  }
+  return false
+}
+
+/**
+ * Caps completed dump artifacts in the configured directory. A zero-byte cap
+ * disables sweeping. Custom directories may contain unrelated files: only
+ * recognized final artifact names and stale partials are eligible. Symlinks,
+ * fresh partial writes, and files younger than the newness floor remain
+ * protected.
+ */
+export async function sweepDumpDirectory(options: {
+  dumpDir?: string
+  maxBytes?: number
+  protectedPaths?: readonly string[]
+  now?: number
+  minAgeMs?: number
+  partialStaleMs?: number
+}) {
+  const dumpDir = options.dumpDir ?? getDumpDirectory()
+  const maxBytes = options.maxBytes ?? getDumpMaxBytes()
+  const now = options.now ?? Date.now()
+  const minAgeMs = options.minAgeMs ?? DUMP_SWEEP_NEWNESS_FLOOR_MS
+  const partialStaleMs = options.partialStaleMs ?? DUMP_PARTIAL_STALE_MS
+  const emptyResult = { removed: 0, freedBytes: 0 }
+  if (!isConfiguredDumpDirectory(dumpDir) || maxBytes <= 0) return emptyResult
+
+  try {
+    const dumpDirStats = await lstat(dumpDir)
+    if (dumpDirStats.isSymbolicLink()) return emptyResult
+    const protectedPaths = new Set(
+      (options.protectedPaths ?? []).map((path) => resolve(path)),
+    )
+    const entries = await readdir(dumpDir, { withFileTypes: true })
+    const files: {
+      path: string
+      size: number
+      mtimeMs: number
+      partial: boolean
+    }[] = []
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isFile()) return
+        const partial = isDumpPartialFileName(entry.name)
+        if (!partial && !isDumpArtifactFileName(entry.name)) return
+        const path = join(dumpDir, entry.name)
+        try {
+          const stats = await lstat(path)
+          if (!stats.isFile() || stats.isSymbolicLink()) return
+          files.push({
+            path,
+            size: stats.size,
+            mtimeMs: stats.mtimeMs,
+            partial,
+          })
+        } catch {
+          // Files can disappear while concurrent dump requests finish.
+        }
+      }),
+    )
+
+    let totalBytes = files.reduce((total, file) => total + file.size, 0)
+    files.sort(
+      (left, right) =>
+        left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
+    )
+
+    let removed = 0
+    let freedBytes = 0
+    for (const file of files) {
+      if (protectedPaths.has(resolve(file.path))) continue
+      const ageMs = now - file.mtimeMs
+      const stalePartial = file.partial && ageMs >= partialStaleMs
+      if (!stalePartial && totalBytes <= maxBytes) continue
+      if (file.partial ? !stalePartial : ageMs < minAgeMs) continue
+      try {
+        await unlink(file.path)
+        totalBytes -= file.size
+        freedBytes += file.size
+        removed += 1
+      } catch {
+        // Dump cleanup is best-effort and must not affect request handling.
+      }
+    }
+
+    if (removed > 0) {
+      logger.debug('dump', 'removed old dump files', { removed, freedBytes })
+    }
+    return { removed, freedBytes }
+  } catch {
+    return emptyResult
+  }
+}
+
+function scheduleDumpSweep(dumpDir: string, protectedPaths: readonly string[]) {
+  const now = Date.now()
+  if (now - lastDumpSweepAt < DUMP_SWEEP_INTERVAL_MS) return
+  lastDumpSweepAt = now
+  void sweepDumpDirectory({ dumpDir, protectedPaths }).catch(() => {})
 }
 
 export function parseDumpCommandAction(
@@ -298,7 +476,7 @@ async function dumpRequest(input: {
   if (!dumpEnabled) return
   nextDumpId += 1
   const affinity = input.affinity?.trim() || 'session-unknown'
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${dumpFileSessionSegment(affinity)}-${dumpRequestSegment(input)}`
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(6, '0')}-${dumpFileSessionSegment(affinity)}-${dumpRequestSegment(input)}`
   const dumpDir = getDumpDirectory()
   const prefix = join(dumpDir, id)
   const files: {
@@ -334,27 +512,22 @@ async function dumpRequest(input: {
     }
 
     const writes = [
-      writeFile(files.body, input.bodyText, 'utf8'),
-      writeFile(
-        files.metadata,
-        `${JSON.stringify(metadata, null, 2)}\n`,
-        'utf8',
-      ),
+      writeDumpFile(files.body, input.bodyText),
+      writeDumpFile(files.metadata, `${JSON.stringify(metadata, null, 2)}\n`),
     ]
 
     if (input.payload !== undefined && files.relay) {
       writes.push(
-        writeFile(
+        writeDumpFile(
           files.relay,
           `${JSON.stringify(redactForDump(input.payload), null, 2)}\n`,
-          'utf8',
         ),
       )
     }
 
     if (input.request !== undefined && files.request) {
       writes.push(
-        writeFile(
+        writeDumpFile(
           files.request,
           `${JSON.stringify(
             redactForDump({
@@ -364,12 +537,12 @@ async function dumpRequest(input: {
             null,
             2,
           )}\n`,
-          'utf8',
         ),
       )
     }
 
     await Promise.all(writes)
+    scheduleDumpSweep(dumpDir, Object.values(files))
 
     relayLog(
       `dumped request id=${id} session=${shortAffinity(affinity)} body=${files.body} meta=${files.metadata}`,
