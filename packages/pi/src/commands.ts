@@ -17,6 +17,7 @@ import {
   getPersistedLogLevel,
   getRoutingMode,
   isCache1hPersistentlyEnabled,
+  isCacheKeepAlways,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isDumpPersistentlyEnabled,
@@ -33,6 +34,7 @@ import {
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setCacheKeepPersistentAlways,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
@@ -48,6 +50,10 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 
 import { getPiAccountStoragePath } from './paths.ts'
+import {
+  clearPiStickyRoutingSession,
+  getPiTrackedCacheKeepSessions,
+} from './stream.ts'
 
 type NotifyKind = 'info' | 'warning' | 'error'
 
@@ -98,7 +104,8 @@ export function registerCommands(pi: ExtensionAPI) {
   })
 
   pi.registerCommand(CLAUDE_CACHE_KEEP_COMMAND_NAME, {
-    description: 'Keep hybrid Claude cache warm during a local time window',
+    description:
+      'Keep hybrid Claude cache warm always or during a local time window',
     handler: async (args, ctx) => {
       const path = getPiAccountStoragePath()
       let storage = await loadAccounts(path)
@@ -110,19 +117,31 @@ export function registerCommands(pi: ExtensionAPI) {
           action.endHour,
           path,
         )
+      } else if (action.type === 'always') {
+        storage = await setCacheKeepPersistentAlways(path)
       } else if (action.type === 'disable') {
         storage = await setCacheKeepPersistentEnabled(false, path)
       } else if (action.type === 'subagents') {
         storage = await setCacheKeepSubagentsEnabled(action.enabled, path)
       }
 
+      const trackedSessionDetails = await getPiTrackedCacheKeepSessions()
+      const nextPrewarmAt = trackedSessionDetails.length
+        ? Math.min(
+            ...trackedSessionDetails.map((session) => session.nextPrewarmAt),
+          )
+        : undefined
       notify(
         ctx,
         executeCacheKeepCommand({
           argumentsText: args ?? '',
           enabled: isCacheKeepPersistentlyEnabled(storage),
+          always: isCacheKeepAlways(storage),
           window: getCacheKeepWindow(storage),
           hybridActive: isCacheKeepHybridActive(storage),
+          trackedSessions: trackedSessionDetails.length,
+          trackedSessionDetails,
+          nextPrewarmAt,
         }),
         action.type === 'usage' ? 'warning' : 'info',
       )
@@ -204,6 +223,11 @@ export function registerCommands(pi: ExtensionAPI) {
 
       if (action.type === 'mode') {
         storage = await setRoutingMode(action.mode, path)
+      } else if (action.type === 'reset') {
+        await clearPiStickyRoutingSession(
+          path,
+          ctx.sessionManager.getSessionId(),
+        )
       }
 
       notify(

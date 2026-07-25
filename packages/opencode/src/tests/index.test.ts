@@ -1,20 +1,26 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
+  __setLogTestSink,
   type AccountStorage,
+  acquireRefreshFileLock,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   getAccountStatePath,
   hashRefreshToken,
+  type LogTestRecord,
   loadAccounts,
+  type OAuthAccount,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PROFILE_TTL_MS,
   resetCache1hState,
   resetDumpState,
   resetFastModeState,
   saveAccountState,
   saveAccounts,
+  setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
@@ -23,9 +29,13 @@ import {
   resetNotificationsForTest,
 } from '../rpc/notifications'
 import {
+  __setInitialSidebarRoutingTestHooks,
+  __setSidebarStateWriteTestHooks,
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,
+  resolveActiveAccount,
+  setSidebarState,
 } from '../sidebar-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
@@ -130,7 +140,16 @@ async function useTempAccountFile(storage: AccountStorage) {
     tempConfigDir,
     'sidebar-state.json',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
+    tempConfigDir,
+    'cachekeep-registry',
+  )
   await saveAccounts(storage)
+  if (storage.main?.profile) {
+    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+      mainProfile: true,
+    })
+  }
 }
 
 function restoreProcessTestFiles() {
@@ -144,6 +163,10 @@ function restoreProcessTestFiles() {
     testDir,
     'sidebar-state.json',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
+    testDir,
+    'cachekeep-registry',
+  )
 }
 
 async function waitForSidebarState(
@@ -156,6 +179,31 @@ async function waitForSidebarState(
   }
   const state = await getSidebarState()
   throw new Error(`Sidebar state did not match: ${JSON.stringify(state)}`)
+}
+
+async function waitForAccountStorage(
+  predicate: (storage: Awaited<ReturnType<typeof loadAccounts>>) => boolean,
+) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const storage = await loadAccounts()
+    if (predicate(storage)) return storage
+    await Bun.sleep(10)
+  }
+  const storage = await loadAccounts()
+  throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
+}
+
+async function seedSidebarRouting(
+  activeId: string,
+  route: string,
+  lastUpdated: number,
+) {
+  await setSidebarState({
+    ...(await getSidebarState()),
+    activeId,
+    route,
+    lastUpdated,
+  })
 }
 
 async function waitForMockCall(fn: { mock?: { calls: unknown[] } }) {
@@ -301,26 +349,10 @@ describe('package metadata', () => {
     }
   })
 
-  test('package TUI entrypoint imports under OpenTUI runtime support', () => {
-    const result = Bun.spawnSync({
-      cmd: [
-        process.execPath,
-        '-e',
-        `import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure'
-ensureRuntimePluginSupport()
-const mod = await import('@cortexkit/opencode-anthropic-auth/tui')
-if (mod.default?.id !== 'cortexkit.anthropic-auth' || typeof mod.default?.tui !== 'function') {
-  throw new Error('invalid TUI plugin export')
-}
-`,
-      ],
-      cwd: new URL('../..', import.meta.url).pathname,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-    if (result.exitCode !== 0) {
-      throw new Error(new TextDecoder().decode(result.stderr))
-    }
+  test('raw TUI fallback is loadable for development hosts', async () => {
+    const mod = await import('../tui.tsx')
+    expect(mod.default?.id).toBe('cortexkit.anthropic-auth')
+    expect(mod.default?.tui).toBeFunction()
   })
 })
 
@@ -443,6 +475,11 @@ test('test setup keeps sidebar state off the production default path', () => {
   if (!testDir) throw new Error('missing test directory')
   restoreProcessTestFiles()
   expect(getSidebarStateFile().startsWith(`${testDir}/`)).toBe(true)
+  expect(
+    process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR?.startsWith(
+      `${testDir}/`,
+    ),
+  ).toBe(true)
 })
 
 describe('provider.models', () => {
@@ -543,6 +580,61 @@ describe('provider.models', () => {
     })
   })
 
+  test('replaces stale Opus 5 manual-thinking variants with adaptive efforts', async () => {
+    const plugin = await getPlugin()
+    const models = {
+      'claude-opus-4-8': {
+        id: 'claude-opus-4-8',
+        variants: {
+          high: {
+            thinking: { type: 'adaptive', display: 'summarized' },
+            effort: 'high',
+          },
+        },
+      },
+      'claude-opus-5': {
+        id: 'claude-opus-5',
+        api: { id: 'claude-opus-5' },
+        variants: {
+          high: { thinking: { type: 'enabled', budgetTokens: 16_000 } },
+          max: { thinking: { type: 'enabled', budgetTokens: 31_999 } },
+        },
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'api' } } as never,
+    )
+
+    expect(result?.['claude-opus-5']?.variants).toEqual({
+      low: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'low',
+      },
+      medium: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'medium',
+      },
+      high: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'high',
+      },
+      xhigh: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'xhigh',
+      },
+      max: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'max',
+      },
+    })
+    expect(models['claude-opus-5'].variants.max.thinking).toEqual({
+      type: 'enabled',
+      budgetTokens: 31_999,
+    })
+  })
+
   test('does not zero OAuth model costs when costZeroing is disabled', async () => {
     await useTempAccountFile(
       createFallbackStorage({ accounts: [], costZeroing: { enabled: false } }),
@@ -579,6 +671,7 @@ describe('auth.loader', () => {
   const originalSetInterval = globalThis.setInterval
   const originalClearInterval = globalThis.clearInterval
   const originalRandom = Math.random
+  const originalDateNow = Date.now
 
   beforeEach(async () => {
     globalThis.fetch = originalFetch
@@ -586,10 +679,14 @@ describe('auth.loader', () => {
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
+    Date.now = originalDateNow
     resetCache1hState()
     resetDumpState()
     resetFastModeState()
     resetNotificationsForTest()
+    __setInitialSidebarRoutingTestHooks(null)
+    __setSidebarStateWriteTestHooks(null)
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -599,7 +696,11 @@ describe('auth.loader', () => {
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
+    Date.now = originalDateNow
     resetNotificationsForTest()
+    __setInitialSidebarRoutingTestHooks(null)
+    __setSidebarStateWriteTestHooks(null)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -631,6 +732,680 @@ describe('auth.loader', () => {
     )
     expect(result.apiKey).toBe('')
     expect(result.fetch).toBeFunction()
+  })
+
+  test('boot seeds fallback-first sidebar routing from the first enabled OAuth fallback', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot preserves fresh sidebar routing from another live session', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot re-reads sidebar routing written after plugin creation', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+
+    const plugin = await getPlugin()
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot reads preserved routing after its asynchronous storage load', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+
+    let sequence = 0
+    let sidebarReadAt = 0
+    let storageLoadedAt = 0
+    let storageLoadStarted!: () => void
+    const storageLoadPaused = new Promise<void>((resolve) => {
+      storageLoadStarted = resolve
+    })
+    let resumeStorageLoad!: () => void
+    const storageLoadResumed = new Promise<void>((resolve) => {
+      resumeStorageLoad = resolve
+    })
+    __setInitialSidebarRoutingTestHooks({
+      beforeSidebarRead: () => {
+        sidebarReadAt = ++sequence
+      },
+      beforeStorageLoad: async () => {
+        storageLoadStarted()
+        await storageLoadResumed
+      },
+      afterStorageLoad: () => {
+        storageLoadedAt = ++sequence
+      },
+    })
+
+    const plugin = await getPlugin()
+    const loaderResult = plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await storageLoadPaused
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+    resumeStorageLoad()
+    await loaderResult
+    await drainSidebarWrites()
+
+    expect(storageLoadedAt).toBeLessThan(sidebarReadAt)
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot write preserves routing written after its initial resolution', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    const foreignUpdatedAt = Date.now()
+    const resolvedByBoot = {
+      ...(await getSidebarState()),
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: foreignUpdatedAt - 1000,
+    }
+    await seedSidebarRouting('work-alt', 'fallback-first', foreignUpdatedAt)
+
+    await setSidebarState(resolvedByBoot, getSidebarStateFile(), {
+      routingAuthoritative: false,
+      resolvePreservedRouting: (current) =>
+        current.activeId === 'work-alt'
+          ? { activeId: current.activeId, route: current.route }
+          : undefined,
+    })
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+    expect(state.lastUpdated).toBe(foreignUpdatedAt)
+  })
+
+  test('boot preserves fresh routing for an account added after plugin creation', async () => {
+    const capturedStorage = createFallbackStorage({
+      accounts: [],
+      routing: { mode: 'fallback-first' },
+    })
+    expect(
+      capturedStorage.accounts.some((account) => account.id === 'work-2'),
+    ).toBe(false)
+    await useTempAccountFile(capturedStorage)
+    const plugin = await getPlugin()
+    await saveAccounts(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'work-2',
+            type: 'oauth',
+            access: 'work-2-access',
+            refresh: 'work-2-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    expect(
+      (await loadAccounts())?.accounts.some(
+        (account) => account.id === 'work-2',
+      ),
+    ).toBe(true)
+    await seedSidebarRouting('work-2', 'fallback-first', Date.now())
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-2')
+    expect(state.route).toBe('fallback-first')
+    expect(state.fallbacks.map((account) => account.id)).toContain('work-2')
+    expect(resolveActiveAccount(state).id).toBe('work-2')
+  })
+
+  test('stale main routing write carries forward accounts added after plugin creation', async () => {
+    const capturedStorage = createFallbackStorage({ accounts: [] })
+    await useTempAccountFile(capturedStorage)
+    const plugin = await getPlugin()
+    await saveAccounts(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-fresh',
+            type: 'oauth',
+            access: 'work-fresh-access',
+            refresh: 'work-fresh-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    await seedSidebarRouting('main', 'main', Date.now())
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('main')
+    expect(state.route).toBe('main')
+    expect(state.fallbacks.map((account) => account.id)).toContain('work-fresh')
+  })
+
+  test('stale writer does not resurrect a deleted active account', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'work-deleted',
+            type: 'oauth',
+            access: 'work-deleted-access',
+            refresh: 'work-deleted-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    const plugin = await getPlugin()
+    // v1.16.0's mergeAccountsForSave unions existing+incoming accounts, so a
+    // deletion must be declared explicitly via removedAccountIds — a plain
+    // save without the account no longer removes it.
+    await saveAccounts(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'work-current',
+            type: 'oauth',
+            access: 'work-current-access',
+            refresh: 'work-current-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+      undefined,
+      { removedAccountIds: ['work-deleted'] },
+    )
+    await seedSidebarRouting('work-deleted', 'fallback-first', Date.now())
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-current')
+    expect(state.route).toBe('fallback-first')
+    expect(state.fallbacks.map((account) => account.id)).toEqual([
+      'work-current',
+    ])
+  })
+
+  test('boot ignores stale sidebar routing and derives fallback-first routing', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    await seedSidebarRouting('main', 'main', Date.now() - 11 * 60 * 1000)
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot ignores fresh sidebar routing for an unknown account', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    await seedSidebarRouting('removed-account', 'fallback-first', Date.now())
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot keeps main-first sidebar routing on main', async () => {
+    await useTempAccountFile(createFallbackStorage())
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('main')
+    expect(state.route).toBe('main')
+  })
+
+  async function runQuotaRefreshWithFailedStorageReload(
+    clearExistingRouting: boolean,
+  ) {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+    if (clearExistingRouting) {
+      const current = await getSidebarState()
+      await setSidebarState({
+        ...current,
+        activeId: undefined,
+        route: 'main',
+        lastUpdated: Date.now(),
+      })
+    } else {
+      await seedSidebarRouting('fallback-1', 'fallback-first', Date.now())
+    }
+
+    let signalBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      signalBlocked = resolve
+    })
+    let releaseWrite!: () => void
+    const released = new Promise<void>((resolve) => {
+      releaseWrite = resolve
+    })
+    let shouldBlock = true
+    __setSidebarStateWriteTestHooks({
+      beforeRename: async () => {
+        if (!shouldBlock) return
+        shouldBlock = false
+        signalBlocked()
+        await released
+      },
+    })
+
+    const blockingWrite = setSidebarState(await getSidebarState())
+    await blocked
+    try {
+      await expectHandledCommandResponse(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      )
+      const accountFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      if (!accountFile) throw new Error('Expected isolated account file')
+      await rm(accountFile)
+      await mkdir(accountFile)
+    } finally {
+      releaseWrite()
+    }
+    await blockingWrite
+    await drainSidebarWrites()
+    __setSidebarStateWriteTestHooks(null)
+    return getSidebarState()
+  }
+
+  test('quota refresh preserves existing fallback routing when storage reload fails', async () => {
+    const state = await runQuotaRefreshWithFailedStorageReload(false)
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('quota refresh uses supplied routing when storage reload fails without existing routing', async () => {
+    const state = await runQuotaRefreshWithFailedStorageReload(true)
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('/claude-quota preserves the last sidebar routing decision', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('/claude-quota preserves fresher routing from another session', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'fallback-a',
+            type: 'oauth',
+            access: 'fallback-a-access',
+            refresh: 'fallback-a-refresh',
+            expires: Date.now() + 100000,
+          },
+          {
+            id: 'fallback-b',
+            type: 'oauth',
+            access: 'fallback-b-access',
+            refresh: 'fallback-b-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await seedSidebarRouting('fallback-b', 'fallback-first', Date.now())
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-b')
+    expect(state.route).toBe('fallback-first')
+
+    await seedSidebarRouting(
+      'fallback-b',
+      'fallback-first',
+      Date.now() - 11 * 60 * 1000,
+    )
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    await drainSidebarWrites()
+
+    const stateAfterStaleFile = await getSidebarState()
+    expect(stateAfterStaleFile.activeId).toBe('fallback-b')
+    expect(stateAfterStaleFile.route).toBe('fallback-first')
+  })
+
+  test('real routing decisions overwrite fresh routing from another session', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: { enabled: false },
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('main')
+    expect(state.route).toBe('main')
   })
 
   test('dumps direct Anthropic requests when relay is disabled', async () => {
@@ -838,7 +1613,7 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
-  test('cachekeep tracks OAuth fallback routes with OpenCode session affinity', async () => {
+  test('cachekeep lists tracked sessions across OpenCode plugin instances', async () => {
     const nowHour = new Date().getHours()
     const startHour = (nowHour + 23) % 24
     const endHour = (nowHour + 1) % 24
@@ -888,6 +1663,35 @@ describe('auth.loader', () => {
       }),
     })
 
+    const secondPlugin = await getPlugin(createMockClient())
+    const secondResult = await secondPlugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await secondResult.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'session-2' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    const registryDirectory =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
+    if (!registryDirectory)
+      throw new Error('missing cachekeep registry directory')
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const entries = await readdir(registryDirectory).catch(() => [])
+      if (entries.filter((entry) => entry.endsWith('.json')).length >= 2) break
+      await Bun.sleep(10)
+    }
     await expectHandledCommandResponse(
       plugin['command.execute.before']({
         command: 'claude-cachekeep',
@@ -901,7 +1705,10 @@ describe('auth.loader', () => {
       }
     ).mock.calls
     const latestCall = promptCalls.at(-1)?.[0]
-    expect(latestCall?.body.parts[0]?.text).toContain('Tracked sessions: 1')
+    expect(latestCall?.body.parts[0]?.text).toContain('Tracked sessions: 2')
+    expect(latestCall?.body.parts[0]?.text).toContain(
+      'Sessions:\n- session-1\n- session-2',
+    )
   })
 
   test('routes Fable requests to OAuth fallback when main scoped Fable quota is exhausted', async () => {
@@ -2383,7 +3190,7 @@ describe('auth.loader', () => {
     expect(latestCall?.body.parts[0]?.text).toContain(
       '## Claude Cache Keep Enabled',
     )
-    expect(latestCall?.body.parts[0]?.text).toContain('Window: 09-23')
+    expect(latestCall?.body.parts[0]?.text).toContain('Schedule: 09-23')
     expect(latestCall?.body.parts[0]?.text).toContain('Hybrid active: yes')
 
     const saved = JSON.parse(
@@ -2391,9 +3198,22 @@ describe('auth.loader', () => {
     )
     expect(saved.cacheKeep).toEqual({
       enabled: true,
+      always: false,
       startHour: 9,
       endHour: 23,
     })
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-cachekeep',
+        arguments: 'always',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const always = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(always.cacheKeep).toEqual({ enabled: true, always: true })
   })
 
   test('registers and handles /claude-fast slash command with ignored status replies', async () => {
@@ -2453,7 +3273,7 @@ describe('auth.loader', () => {
     await expect(
       plugin['command.execute.before']({
         command: 'claude-routing',
-        arguments: 'fallback-first',
+        arguments: 'sticky-balanced',
         sessionID: 'session-1',
       }),
     ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
@@ -2466,7 +3286,7 @@ describe('auth.loader', () => {
           {
             type: 'text',
             ignored: true,
-            text: expect.stringContaining('Mode updated to `fallback-first`.'),
+            text: expect.stringContaining('Mode updated to `sticky-balanced`.'),
           },
         ],
       },
@@ -2487,13 +3307,29 @@ describe('auth.loader', () => {
     ).mock.calls
     const latestCall = promptCalls.at(-1)?.[0]
     expect(latestCall?.body.parts[0]?.text).toContain(
-      '- Mode: `fallback-first`',
+      '- Mode: `sticky-balanced`',
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-routing',
+        arguments: 'reset',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const resetCall = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls.at(-1)?.[0]
+    expect(resetCall?.body.parts[0]?.text).toContain(
+      'Claude Routing Assignment Reset',
     )
 
     const saved = JSON.parse(
       await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
     )
-    expect(saved.routing).toEqual({ mode: 'fallback-first' })
+    expect(saved.routing).toEqual({ mode: 'sticky-balanced' })
   })
 
   test('hidden slash-command replies preserve previous assistant model and variant', async () => {
@@ -2737,6 +3573,1226 @@ describe('auth.loader', () => {
     expect(text).toContain('### fallback personal (fallback)')
     expect(text).toContain('5h: 75% remaining')
     expect(text).toContain('1w: 50% remaining')
+  })
+
+  test('/claude-quota bounds stalled profile hydration without hiding quota output', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileSignal: AbortSignal | undefined
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/profile')) {
+          profileSignal = init?.signal ?? undefined
+          return new Promise<Response>((_resolve, reject) => {
+            profileSignal?.addEventListener(
+              'abort',
+              () => reject(profileSignal?.reason),
+              { once: true },
+            )
+          })
+        }
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 25 },
+              seven_day: { utilization: 50 },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    const startedAt = performance.now()
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(performance.now() - startedAt).toBeLessThan(4_000)
+    expect(profileSignal?.aborted).toBe(true)
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+    expect(text).toContain('## Claude Quotas')
+    expect(text).toContain('5h: 75% remaining')
+    expect(text).not.toContain('Max 20x')
+  }, 5_000)
+
+  test('/claude-quota renders hydrated profile without waiting for profile persistence', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          Response.json({
+            five_hour: { utilization: 25 },
+            seven_day: { utilization: 50 },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    const configLock = await acquireRefreshFileLock({
+      name: 'config-write',
+      path: process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+      ttlMs: 10_000,
+      renew: true,
+    })
+    expect(configLock).not.toBeNull()
+    if (!configLock) throw new Error('expected account config lock')
+
+    const command = expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    try {
+      const rendered = await Promise.race([
+        command.then(() => true),
+        Bun.sleep(100).then(() => false),
+      ])
+
+      expect(rendered).toBe(true)
+      expect(profileCalls).toBe(1)
+      const text = (mockClient.session.promptAsync as any).mock.calls.at(
+        -1,
+      )?.[0]?.body.parts[0]?.text as string
+      expect(text).toContain('Max 20x')
+      expect((await loadAccounts())?.main?.profile).toBeUndefined()
+    } finally {
+      await configLock.release()
+      await command
+    }
+
+    const persistedStorage = await waitForAccountStorage(
+      (storage) => storage?.main?.profile?.tier === 'default_claude_max_20x',
+    )
+    expect(persistedStorage?.main?.profile?.tier).toBe('default_claude_max_20x')
+  })
+
+  test('profile fetch runs once per account per boot and persists the result', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const mockClient = createMockClient()
+    const profileCalls: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        const auth = new Headers(init?.headers).get('authorization') ?? ''
+        if (url.includes('/api/oauth/profile')) {
+          profileCalls.push(auth)
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: auth.includes('fallback')
+                  ? 'claude_team'
+                  : 'claude_max',
+                rate_limit_tier: auth.includes('fallback')
+                  ? 'default_claude_max_5x'
+                  : 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    for (let call = 0; call < 2; call++) {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      if (call === 0) {
+        await waitForAccountStorage(
+          (storage) =>
+            storage?.main?.profile?.tier === 'default_claude_max_20x' &&
+            (storage.accounts[0] as OAuthAccount | undefined)?.profile?.tier ===
+              'default_claude_max_5x',
+        )
+      }
+    }
+
+    expect(profileCalls).toEqual([
+      'Bearer main-access',
+      'Bearer fallback-access',
+    ])
+    const loaded = await loadAccounts()
+    expect(loaded?.main?.profile?.tier).toBe('default_claude_max_20x')
+    expect((loaded?.accounts[0] as any)?.profile?.tier).toBe(
+      'default_claude_max_5x',
+    )
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+    expect(text).toContain('Max 20x')
+    expect(text).toContain('Max 5x')
+  })
+
+  test('fresh profile under seven days skips fetch', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('main token rotation clears a stale bound profile before display', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('old-access'),
+          },
+        },
+      }),
+    )
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? new Response('failed', { status: 500 })
+          : new Response('ok'),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'new-access',
+          refresh: 'new-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text
+
+    expect(text).not.toContain('Max 20x')
+    const clearedStorage = await waitForAccountStorage(
+      (storage) => storage?.main?.profile === undefined,
+    )
+    expect(clearedStorage?.main?.profile).toBeUndefined()
+  })
+
+  test('same main token keeps a fresh bound profile without refetching', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+    expect((await loadAccounts())?.main?.profile?.tier).toBe(
+      'default_claude_max_20x',
+    )
+  })
+
+  test('boot profile hydration publishes tier labels to the sidebar', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const state = await waitForSidebarState(
+      (value) => value.main.tierLabel === 'Max 20x',
+    )
+
+    expect(state.main.tierLabel).toBe('Max 20x')
+    expect(profileCalls).toBe(1)
+  })
+
+  test('late fallback profile hydration cannot restore rotated credentials', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: { enabled: false },
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+        accounts: [
+          {
+            id: 'fb',
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            lastRefreshedAt: 100,
+          },
+        ],
+      }),
+    )
+    let resolveProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveProfile = resolve
+        })
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await profileStarted
+    await drainSidebarWrites()
+    const initialSidebarUpdatedAt = (await getSidebarState()).lastUpdated
+
+    const rotated = await loadAccounts()
+    const fallback = rotated?.accounts[0]
+    if (!rotated || fallback?.type !== 'oauth') {
+      throw new Error('expected fallback OAuth account')
+    }
+    fallback.access = 'new-access'
+    fallback.refresh = 'new-refresh'
+    fallback.lastRefreshedAt = 200
+    await saveAccounts(rotated)
+    await Bun.sleep(2)
+    resolveProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_team',
+          rate_limit_tier: 'default_claude_max_5x',
+        },
+      }),
+    )
+    await waitForSidebarState(
+      (state) => state.lastUpdated > initialSidebarUpdatedAt,
+    )
+
+    const reloaded = await loadAccounts()
+    const reloadedFallback = reloaded?.accounts[0]
+    expect(reloadedFallback).toMatchObject({
+      access: 'new-access',
+      refresh: 'new-refresh',
+      lastRefreshedAt: 200,
+    })
+    if (reloadedFallback?.type !== 'oauth') {
+      throw new Error('expected reloaded fallback OAuth account')
+    }
+    expect(reloadedFallback.profile).toBeUndefined()
+  })
+
+  test('late main profile hydration cannot replace a rotated-token profile', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let liveAccess = 'old-main-access'
+    let resolveProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveProfile = resolve
+        })
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await profileStarted
+    await drainSidebarWrites()
+    const initialSidebarUpdatedAt = (await getSidebarState()).lastUpdated
+
+    liveAccess = 'new-main-access'
+    const rotated = await loadAccounts()
+    if (!rotated) throw new Error('expected account storage')
+    rotated.main = {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: {
+        tier: 'default_claude_max_20x',
+        orgType: 'claude_max',
+        checkedAt: Date.now(),
+        tokenFingerprint: tokenFingerprint(liveAccess),
+      },
+    }
+    await saveAccountState(rotated, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+      mainProfile: true,
+    })
+    await Bun.sleep(2)
+    resolveProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_team',
+          rate_limit_tier: 'default_claude_max_5x',
+        },
+      }),
+    )
+    await waitForSidebarState(
+      (state) => state.lastUpdated > initialSidebarUpdatedAt,
+    )
+
+    expect((await loadAccounts())?.main?.profile).toMatchObject({
+      tier: 'default_claude_max_20x',
+      tokenFingerprint: tokenFingerprint('new-main-access'),
+    })
+  })
+
+  test('delayed boot hydration preserves a live fallback sidebar route', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    let resolveMainProfile!: (response: Response) => void
+    let markMainProfileStarted!: () => void
+    const mainProfileStarted = new Promise<void>((resolve) => {
+      markMainProfileStarted = resolve
+    })
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (
+          url.includes('/api/oauth/profile') &&
+          authorization === 'Bearer main-access'
+        ) {
+          markMainProfileStarted()
+          return new Promise<Response>((resolve) => {
+            resolveMainProfile = resolve
+          })
+        }
+        if (url.includes('/api/oauth/profile')) {
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: 'claude_team',
+                rate_limit_tier: 'default_claude_max_5x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await mainProfileStarted
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    await waitForSidebarState(
+      (state) =>
+        state.activeId === 'fallback-1' && state.route === 'fallback-first',
+    )
+    resolveMainProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    )
+
+    const hydratedState = await waitForSidebarState(
+      (state) => state.main.tierLabel === 'Max 20x',
+    )
+    expect(hydratedState).toMatchObject({
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+    })
+  })
+
+  test('profile hydration keeps its plugin-scoped fetch across test turnover', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage())
+    let resolveMainProfile!: (response: Response) => void
+    let markMainProfileStarted!: () => void
+    const mainProfileStarted = new Promise<void>((resolve) => {
+      markMainProfileStarted = resolve
+    })
+    const firstFetchCalls: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const authorization = new Headers(
+          input instanceof Request ? input.headers : init?.headers,
+        ).get('authorization')
+        firstFetchCalls.push(authorization ?? '')
+        if (authorization === 'Bearer main-access') {
+          markMainProfileStarted()
+          return new Promise<Response>((resolve) => {
+            resolveMainProfile = resolve
+          })
+        }
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_team',
+              rate_limit_tier: 'default_claude_max_5x',
+            },
+          }),
+        )
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await mainProfileStarted
+
+    const nextTestFetch = mock(() => Promise.resolve(new Response('ok')))
+    globalThis.fetch = nextTestFetch as unknown as typeof fetch
+    resolveMainProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    )
+    await waitForSidebarState(
+      (state) => state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
+    )
+
+    expect(firstFetchCalls).toEqual([
+      'Bearer main-access',
+      'Bearer fallback-access',
+    ])
+    expect(nextTestFetch).not.toHaveBeenCalled()
+  })
+
+  test('mock-environment opt-out prevents boot profile network calls', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await Bun.sleep(20)
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('mock-environment opt-out prevents command profile network calls', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          Response.json({
+            five_hour: { utilization: 10 },
+            seven_day: { utilization: 20 },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('boot hydration publishes storage reloaded after the profile await', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let resolveProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveProfile = resolve
+        })
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await profileStarted
+
+    const storage = await loadAccounts()
+    if (!storage?.quota) throw new Error('expected quota storage')
+    const backoff = {
+      message: 'Claude quota check failed: 429 — rate limited',
+      checkedAt: Date.now(),
+      nextRetryAt: Date.now() + 60_000,
+      retryCount: 1,
+    }
+    storage.quota.mainLastQuotaApiError = backoff
+    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+      mainQuota: true,
+    })
+    resolveProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    )
+
+    const state = await waitForSidebarState(
+      (value) => value.main.tierLabel === 'Max 20x',
+    )
+    expect(state.main.quotaBackedOff).toBe(true)
+    expect((await loadAccounts())?.quota?.mainLastQuotaApiError).toEqual(
+      backoff,
+    )
+  })
+
+  test('token rotation hydrates the new profile once and restores its tier label', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const profileCalls: string[] = []
+    let liveAccess = 'token-a'
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (extractUrl(input).includes('/api/oauth/profile')) {
+          const authorization = new Headers(init?.headers).get('authorization')
+          profileCalls.push(authorization ?? '')
+          const firstToken = authorization?.includes('token-a')
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: firstToken ? 'claude_team' : 'claude_max',
+                rate_limit_tier: firstToken
+                  ? 'default_claude_max_5x'
+                  : 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    const showAccounts = async () => {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      return (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+        ?.body.parts[0]?.text as string
+    }
+
+    expect(await showAccounts()).toContain('Team · Max 5x')
+    await waitForAccountStorage(
+      (storage) =>
+        storage?.main?.profile?.tokenFingerprint ===
+        tokenFingerprint('token-a'),
+    )
+    liveAccess = 'token-b'
+    expect(await showAccounts()).toContain('Max 20x')
+    await waitForAccountStorage(
+      (storage) =>
+        storage?.main?.profile?.tokenFingerprint ===
+        tokenFingerprint('token-b'),
+    )
+    expect(await showAccounts()).toContain('Max 20x')
+
+    expect(profileCalls).toEqual(['Bearer token-a', 'Bearer token-b'])
+    expect((await loadAccounts())?.main?.profile?.tokenFingerprint).toBe(
+      tokenFingerprint('token-b'),
+    )
+  })
+
+  test('expired profile TTL triggers a fresh hydration in the same process', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const originalDateNow = Date.now
+    let now = 1_000_000
+    let profileCalls = 0
+    Date.now = () => now
+    try {
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/profile')) {
+          profileCalls++
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: 'claude_max',
+                rate_limit_tier: 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(mockClient)
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: now + PROFILE_TTL_MS * 3,
+          }),
+        { models: {} },
+      )
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+      const showAccounts = async () => {
+        await expect(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: '',
+            sessionID: 'session-1',
+          }),
+        ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      }
+
+      await showAccounts()
+      await waitForAccountStorage(
+        (storage) => storage?.main?.profile?.checkedAt === now,
+      )
+      now += PROFILE_TTL_MS + 1
+      await showAccounts()
+
+      expect(profileCalls).toBe(2)
+      const refreshedStorage = await waitForAccountStorage(
+        (storage) => storage?.main?.profile?.checkedAt === now,
+      )
+      expect(refreshedStorage?.main?.profile?.checkedAt).toBe(now)
+    } finally {
+      Date.now = originalDateNow
+    }
+  })
+
+  test('completed profile hydrations do not block later token generations', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileCalls = 0
+    let liveAccess = 'token-0'
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    const showAccounts = async () => {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    }
+
+    for (let generation = 0; generation < 66; generation++) {
+      liveAccess = `token-${generation}`
+      await showAccounts()
+    }
+    liveAccess = 'token-0'
+    await showAccounts()
+
+    expect(profileCalls).toBe(67)
+  })
+
+  test('stale profile refreshes on display', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'old',
+            orgType: 'claude_max',
+            checkedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(1)
+    const refreshedStorage = await waitForAccountStorage(
+      (storage) => storage?.main?.profile?.tier === 'default_claude_max_20x',
+    )
+    expect(refreshedStorage?.main?.profile?.tier).toBe('default_claude_max_20x')
+  })
+
+  test('profile fetch failure is silent and label is omitted', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? new Response('failed', { status: 500 })
+          : Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
+
+    try {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel('info')
+    }
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text
+
+    expect(text).not.toContain('Max 20x')
+    expect(
+      records.filter(
+        (record) =>
+          record.level === 'debug' &&
+          record.channel === 'quota' &&
+          record.message === 'failed to hydrate account profile' &&
+          record.payload?.account === 'main',
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('profile persistence failure does not block account display', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? Response.json({
+              organization: {
+                organization_type: 'claude_max',
+                rate_limit_tier: 'default_claude_max_20x',
+              },
+            })
+          : new Response('ok'),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    const statePath = getAccountStatePath(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+    )
+    const stateDir = dirname(statePath)
+    await chmod(stateDir, 0o555)
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
+
+    let commandError: unknown
+    try {
+      await plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      })
+    } catch (error) {
+      commandError = error
+    } finally {
+      await chmod(stateDir, 0o755)
+      __setLogTestSink(null)
+      setLogLevel('info')
+    }
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+
+    expect(commandError).toBeInstanceOf(Error)
+    expect((commandError as Error).message).toContain(
+      '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__',
+    )
+    expect(text).toContain('Max 20x')
+    expect(
+      records.filter(
+        (record) =>
+          record.level === 'debug' &&
+          record.channel === 'quota' &&
+          record.message === 'failed to persist account profile',
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('ordinary model request never calls the profile endpoint', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(profileCalls).toBe(0)
   })
 
   test('persistent claudeFast setting makes fetch wrapper request fast mode', async () => {
@@ -4284,16 +6340,32 @@ describe('auth.loader', () => {
         'message-1',
       )
       now = 120000
+      // The second quota fetch never resolves. A correct background refresh
+      // still lets the model response settle; a blocking implementation hits
+      // this deadlock backstop regardless of machine speed.
+      let timeout: ReturnType<typeof setTimeout> | undefined
       const second = await Promise.race([
         result
           .fetch(MESSAGES_URL, EMPTY_POST)
           .then((response: Response) => response.text()),
-        new Promise((resolve) => setTimeout(() => resolve('blocked'), 20)),
-      ])
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('model request blocked on quota refresh')),
+            2_000,
+          )
+        }),
+      ]).finally(() => {
+        if (timeout) clearTimeout(timeout)
+      })
 
       expect(second).toBe('message-2')
-      // Background quota refresh involves file-lock I/O; wait for it to fire.
-      await new Promise((r) => setTimeout(r, 50))
+      // Background quota refresh involves file-lock I/O; poll until it fires
+      // instead of sleeping a fixed interval (flaky under CI load). Date.now
+      // is mocked here, so the deadline uses the real clock.
+      const refreshDeadline = originalDateNow() + 5000
+      while (quotaCalls < 2 && originalDateNow() < refreshDeadline) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
       expect(quotaCalls).toBe(2)
       expect(messageCalls).toBe(2)
     } finally {
@@ -4601,6 +6673,547 @@ describe('auth.loader', () => {
     expect(calls).toBe(1)
   })
 
+  test('sticky-balanced assigns cold Fable to abundant quota and keeps Opus recovery on that account', async () => {
+    const checkedAt = Date.now()
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 100 - fableRemaining,
+        remainingPercent: Math.max(40, fableRemaining),
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(0),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'yiyi',
+            type: 'oauth',
+            access: 'scarce-access',
+            refresh: 'scarce-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(13),
+          },
+          {
+            id: 'ufuk2',
+            type: 'oauth',
+            access: 'abundant-access',
+            refresh: 'abundant-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(98),
+          },
+        ],
+      }),
+    )
+    const models: string[] = []
+    const authorizations: string[] = []
+    let refusal = true
+    let rejectMain = false
+    const refusalSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const successSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.max_tokens === 0) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      models.push(String(body.model))
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      authorizations.push(authorization)
+      if (rejectMain && authorization === 'Bearer main-access') {
+        return Promise.resolve(new Response('forbidden', { status: 403 }))
+      }
+      if (refusal) {
+        refusal = false
+        return Promise.resolve(new Response(refusalSse, { status: 200 }))
+      }
+      return Promise.resolve(new Response(successSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 100_000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_fable' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    const filtered = await result.fetch(MESSAGES_URL, request)
+    await expect(filtered.text()).rejects.toThrow()
+    const opus = await result.fetch(MESSAGES_URL, request)
+    await opus.text()
+
+    expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
+    expect(authorizations).toEqual([
+      'Bearer abundant-access',
+      'Bearer abundant-access',
+    ])
+
+    const directOpus = await result.fetch(MESSAGES_URL, {
+      ...request,
+      headers: { 'x-session-affinity': 'ses_direct_opus' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 128_000,
+        stream: true,
+        messages: [{ role: 'user', content: 'direct Opus' }],
+      }),
+    })
+    await directOpus.text()
+    expect(authorizations.at(-1)).toBe('Bearer main-access')
+
+    rejectMain = true
+    const migratedOpus = await result.fetch(MESSAGES_URL, {
+      ...request,
+      headers: { 'x-session-affinity': 'ses_direct_opus_migration' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        stream: true,
+        messages: [{ role: 'user', content: 'migrate Opus' }],
+      }),
+    })
+    await migratedOpus.text()
+    expect(authorizations.slice(-2)).toEqual([
+      'Bearer main-access',
+      'Bearer scarce-access',
+    ])
+  })
+
+  test('sticky-balanced uses API routes only after confirmed OAuth exhaustion', async () => {
+    const checkedAt = Date.now()
+    const quota = (remainingPercent: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - remainingPercent,
+          remainingPercent,
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(0),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'oauth-fallback',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(100),
+          },
+          {
+            id: 'api-fallback',
+            type: 'api',
+            baseURL: 'https://provider.example/anthropic',
+            authHeader: 'authorization-bearer',
+            apiKey: 'api-key',
+          },
+        ],
+      }),
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 100 },
+              seven_day: { utilization: 100 },
+              limits: [
+                {
+                  kind: 'weekly_scoped',
+                  group: 'weekly',
+                  percent: 100,
+                  scope: { model: { display_name: 'Fable' } },
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      authorizations.push(authorization)
+      return Promise.resolve(
+        authorization === 'Bearer fallback-access'
+          ? new Response('exhausted', { status: 429 })
+          : new Response('ok', { status: 200 }),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 100_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_api' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('ok')
+    expect(authorizations).toEqual(['Bearer fallback-access', 'Bearer api-key'])
+  })
+
+  test('sticky-balanced seeds an already-warm CacheKeep session from its current account', async () => {
+    const checkedAt = Date.now()
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'main-first' },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(13),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'ufuk2',
+            type: 'oauth',
+            access: 'abundant-access',
+            refresh: 'abundant-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(98),
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 100_000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_warm_cutover' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        system: [{ type: 'text', text: 'stable' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    await (await result.fetch(MESSAGES_URL, request)).text()
+    const storage = await loadAccounts(process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
+    if (!storage) throw new Error('missing test storage')
+    storage.routing = { mode: 'sticky-balanced' }
+    await saveAccounts(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
+    await (await result.fetch(MESSAGES_URL, request)).text()
+
+    expect(authorizations).toEqual(['Bearer main-access', 'Bearer main-access'])
+  })
+
+  test('sticky-balanced retains the assigned account across transient errors and a short 5h reset', async () => {
+    const checkedAt = Date.now()
+    const shortResetAt = new Date(checkedAt + 14 * 60_000).toISOString()
+    const longResetAt = new Date(checkedAt + 2 * 60 * 60_000).toISOString()
+    let useLongReset = false
+    let now = checkedAt
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 5 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(0),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'yiyi',
+            type: 'oauth',
+            access: 'scarce-access',
+            refresh: 'scarce-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(13),
+          },
+          {
+            id: 'ufuk2',
+            type: 'oauth',
+            access: 'abundant-access',
+            refresh: 'abundant-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(98),
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+    let modelRequest = 0
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        const abundant = authorization === 'Bearer abundant-access'
+        const main = authorization === 'Bearer main-access'
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: abundant ? 100 : 0,
+                resets_at: useLongReset ? longResetAt : shortResetAt,
+              },
+              seven_day: { utilization: 0 },
+              limits: [
+                {
+                  kind: 'weekly_scoped',
+                  group: 'weekly',
+                  percent: main ? 100 : abundant ? 2 : 87,
+                  resets_at: new Date(
+                    checkedAt + 4 * 24 * 60 * 60_000,
+                  ).toISOString(),
+                  scope: { model: { display_name: 'Fable' } },
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      modelRequest += 1
+      if (modelRequest === 1) {
+        return Promise.resolve(new Response('temporary', { status: 500 }))
+      }
+      if (modelRequest === 2) {
+        return Promise.resolve(
+          new Response(
+            'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"five-hour"}}\n\n',
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    Date.now = mock(() => now) as unknown as typeof Date.now
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 10 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_hold' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    expect((await result.fetch(MESSAGES_URL, request)).status).toBe(500)
+    const held = await result.fetch(MESSAGES_URL, request)
+    expect(held.status).toBe(429)
+    expect(Number(held.headers.get('retry-after'))).toBeGreaterThanOrEqual(
+      13 * 60,
+    )
+    expect(Number(held.headers.get('retry-after'))).toBeLessThanOrEqual(15 * 60)
+    expect((await result.fetch(MESSAGES_URL, request)).status).toBe(429)
+
+    useLongReset = true
+    now += 6 * 60_000
+    const migrated = await result.fetch(MESSAGES_URL, request)
+    expect(migrated.status).toBe(200)
+    expect(authorizations).toEqual([
+      'Bearer abundant-access',
+      'Bearer abundant-access',
+      'Bearer scarce-access',
+    ])
+  })
+
   test('downgrades a filtered Fable session for ten successful Opus turns and warms Fable after each', async () => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -4807,6 +7420,29 @@ describe('auth.loader', () => {
     await new Promise((resolve) => setTimeout(resolve, 5))
     expect(normalModels).toHaveLength(11)
     expect(releaseFinalWarm).toBeDefined()
+
+    const opus5Request = {
+      ...request,
+      body: JSON.stringify({
+        ...JSON.parse(request.body),
+        model: 'claude-opus-5',
+      }),
+    }
+    const opus5ResponsePromise = result.fetch(MESSAGES_URL, opus5Request)
+    for (
+      let attempt = 0;
+      attempt < 1_000 && normalModels.at(-1) !== 'claude-opus-5';
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    const opus5ReachedUpstream = normalModels.at(-1) === 'claude-opus-5'
+    if (!opus5ReachedUpstream) releaseFinalWarm?.()
+    expect(opus5ReachedUpstream).toBe(true)
+    const opus5Response = await opus5ResponsePromise
+    await opus5Response.text()
+    expect(normalModels).toHaveLength(12)
+
     const waitingState = await waitForSidebarState((state) =>
       Boolean(
         state.fableRecoveries?.some(
@@ -4851,7 +7487,7 @@ describe('auth.loader', () => {
         }),
       }),
     )
-    expect(normalModels).toHaveLength(12)
+    expect(normalModels).toHaveLength(13)
 
     const restoredState = await waitForSidebarState((state) =>
       Boolean(
@@ -5155,6 +7791,758 @@ describe('auth.loader', () => {
     )
     expect(state.fallbacks[0]?.id).toBe('fallback-1')
   })
+
+  describe('quota header harvest', () => {
+    const quotaHeaders = {
+      'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+      'anthropic-ratelimit-unified-5h-utilization': '0.78',
+      'anthropic-ratelimit-unified-5h-reset': '1784246400',
+      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+      'anthropic-ratelimit-unified-7d-reset': '1784628000',
+    }
+
+    const harvestStorage = (
+      accounts: AccountStorage['accounts'] = [],
+      overrides: Partial<AccountStorage> = {},
+    ) =>
+      createFallbackStorage({
+        accounts,
+        quota: { enabled: false },
+        ...overrides,
+      })
+
+    function installRelayWebSocket(responseHeaders: Record<string, string>) {
+      const originalWebSocket = globalThis.WebSocket
+
+      class RelayWebSocket extends EventTarget {
+        binaryType = 'arraybuffer'
+
+        constructor() {
+          super()
+          queueMicrotask(() => {
+            this.dispatchEvent(new Event('open'))
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'ready',
+                  state: null,
+                }),
+              }),
+            )
+          })
+        }
+
+        send(data: string) {
+          const payload = JSON.parse(data)
+          queueMicrotask(() => {
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'accepted',
+                  id: payload.id,
+                  hash: payload.next_hash,
+                  revision: payload.revision,
+                }),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'response_start',
+                  id: payload.id,
+                  status: 200,
+                  headers: responseHeaders,
+                }),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: Buffer.from('event: message_stop\n\n'),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'done',
+                  id: payload.id,
+                }),
+              }),
+            )
+          })
+        }
+
+        close() {
+          this.dispatchEvent(new Event('close'))
+        }
+      }
+
+      globalThis.WebSocket = RelayWebSocket as unknown as typeof WebSocket
+      return () => {
+        globalThis.WebSocket = originalWebSocket
+      }
+    }
+
+    async function loadFetch(
+      getAccessToken: () => string = () => 'main-access',
+    ) {
+      const plugin = await getPlugin()
+      return plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: getAccessToken(),
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+    }
+
+    async function waitForState(predicate: (state: any) => boolean) {
+      let lastState: unknown
+      for (let attempt = 0; attempt < 200; attempt++) {
+        try {
+          const state = JSON.parse(
+            await readFile(
+              getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
+              'utf8',
+            ),
+          )
+          lastState = state
+          if (predicate(state)) return state
+        } catch {}
+        await Bun.sleep(10)
+      }
+      throw new Error(
+        `quota state did not persist: ${JSON.stringify(lastState)}`,
+      )
+    }
+
+    test('main 200 response pushes unified headers before returning the response', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('main-ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(await response.text()).toBe('main-ok')
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('fresh header exhaustion licenses API-key fallback on the next request', async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          accounts: [
+            {
+              id: 'kie-opus',
+              type: 'api',
+              apiKey: 'kie-key',
+              baseURL: 'https://api.kie.ai/claude',
+              authHeader: 'authorization-bearer',
+            },
+          ],
+          quota: { enabled: false },
+        }),
+      )
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        const authorization = new Headers(init?.headers).get('authorization')
+        authorizations.push(authorization)
+        return Promise.resolve(
+          new Response('ok', {
+            headers:
+              authorization === 'Bearer main-access'
+                ? {
+                    ...quotaHeaders,
+                    'anthropic-ratelimit-unified-5h-utilization': '1',
+                  }
+                : undefined,
+          }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(authorizations).toEqual(['Bearer main-access', 'Bearer kie-key'])
+    })
+
+    test('stale header exhaustion does not license API-key fallback', async () => {
+      const checkedAt = Date.now() - 60 * 60 * 1000
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          accounts: [
+            {
+              id: 'kie-opus',
+              type: 'api',
+              apiKey: 'kie-key',
+              baseURL: 'https://api.kie.ai/claude',
+              authHeader: 'authorization-bearer',
+            },
+          ],
+          quota: {
+            enabled: false,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt,
+              },
+              source: 'headers',
+              checkedAt,
+            },
+            mainQuotaCheckedAt: checkedAt,
+            mainQuotaToken: tokenFingerprint('main-access'),
+          },
+        }),
+      )
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        authorizations.push(new Headers(init?.headers).get('authorization'))
+        return Promise.resolve(new Response('ok'))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(authorizations).toEqual(['Bearer main-access'])
+    })
+    test('websocket relay response_start pushes unified headers for the served account', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'websocket',
+          },
+        }),
+      )
+      const restoreWebSocket = installRelayWebSocket(quotaHeaders)
+      const result = await loadFetch()
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-websocket' },
+        })
+        expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
+          'true',
+        )
+        await response.text()
+      } finally {
+        restoreWebSocket()
+      }
+
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('relay fallback to direct harvests quota headers exactly once', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'http',
+          },
+        }),
+      )
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url === 'https://relay.example.test') {
+          return Promise.resolve(
+            new Response('relay unavailable', { status: 503 }),
+          )
+        }
+        return Promise.resolve(
+          new Response('direct', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-direct-fallback' },
+        })
+        expect(await response.text()).toBe('direct')
+        await waitForState((value) => value.main?.quota?.source === 'headers')
+        expect(
+          records.filter(
+            (record) =>
+              record.channel === 'quota' &&
+              record.message === 'harvested response quota',
+          ),
+        ).toHaveLength(1)
+      } finally {
+        __setLogTestSink(null)
+        setLogLevel('info')
+      }
+    })
+
+    test('websocket optimistic response headers without quota data do not persist', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'websocket',
+          },
+        }),
+      )
+      const restoreWebSocket = installRelayWebSocket({
+        'content-type': 'text/event-stream',
+      })
+      const result = await loadFetch()
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-synthetic-only' },
+        })
+        expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
+          'true',
+        )
+        await response.text()
+      } finally {
+        restoreWebSocket()
+      }
+
+      await Bun.sleep(30)
+      expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
+    })
+
+    test('main header push skips persistence after access-token rotation', async () => {
+      let liveAccessToken = 'old-main-access'
+      const existingQuota = {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 1,
+        },
+        source: 'poll' as const,
+        checkedAt: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainQuota: existingQuota,
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: tokenFingerprint('new-main-access'),
+          },
+        }),
+      )
+      let resolveResponse: ((response: Response) => void) | undefined
+      let markRequestStarted: (() => void) | undefined
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve
+      })
+      const requestAuthorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        (_input: string | URL | Request, init?: RequestInit) =>
+          new Promise<Response>((resolve) => {
+            requestAuthorizations.push(
+              new Headers(init?.headers).get('authorization'),
+            )
+            resolveResponse = resolve
+            markRequestStarted?.()
+          }),
+      ) as unknown as typeof fetch
+      const result = await loadFetch(() => liveAccessToken)
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      setLogLevel('debug')
+
+      const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await requestStarted
+      liveAccessToken = 'new-main-access'
+      resolveResponse?.(new Response('main-ok', { headers: quotaHeaders }))
+      await responsePromise
+      await Bun.sleep(100)
+      const rawState = JSON.parse(
+        await readFile(
+          getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
+          'utf8',
+        ),
+      )
+      const reloaded = await loadAccounts()
+
+      expect(
+        records.some(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+        ),
+      ).toBe(true)
+      expect(requestAuthorizations[0]).toBe('Bearer old-main-access')
+      expect(rawState.main.quota).toEqual(existingQuota)
+      expect(rawState.main.quotaToken).toBe(tokenFingerprint('new-main-access'))
+      expect(reloaded?.quota?.mainQuota).toEqual(existingQuota)
+      expect(reloaded?.quota?.mainQuotaToken).toBe(
+        tokenFingerprint('new-main-access'),
+      )
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('main header push preserves persisted poll backoff across reload', async () => {
+      const pollBackoff = {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: Date.now(),
+        nextRetryAt: Date.now() + 60_000,
+        retryCount: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainLastQuotaApiError: pollBackoff,
+          },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('main-ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'main-ok',
+      )
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      const reloaded = await loadAccounts()
+
+      expect(state.main.lastQuotaApiError).toEqual(pollBackoff)
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(reloaded?.quota?.mainLastQuotaApiError).toEqual(pollBackoff)
+      expect(reloaded?.quota?.mainQuota?.source).toBe('headers')
+    })
+
+    test('primary adapter harvests one response frame and makes no corroborating usage request', async () => {
+      await useTempAccountFile(harvestStorage())
+      let messageCalls = 0
+      let usageCalls = 0
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) usageCalls++
+        if (url.includes('/v1/messages')) messageCalls++
+        return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+
+      expect(messageCalls).toBe(1)
+      expect(usageCalls).toBe(0)
+      expect(
+        records.filter(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+        ),
+      ).toHaveLength(1)
+      expect(state.main.quota.source).toBe('headers')
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('fallback-served response updates that fallback and not main', async () => {
+      await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'fallback-ok',
+      )
+      const state = await waitForState(
+        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
+      )
+      expect(state.main?.quota?.source).not.toBe('headers')
+    })
+
+    test('fallback header push preserves persisted poll backoff across reload', async () => {
+      const pollBackoff = {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: Date.now(),
+        nextRetryAt: Date.now() + 60_000,
+        retryCount: 1,
+      }
+      const fallback = createFallbackStorage().accounts[0]
+      if (fallback?.type !== 'oauth') {
+        throw new Error('expected OAuth fallback fixture')
+      }
+      await useTempAccountFile(
+        harvestStorage([{ ...fallback, lastQuotaRefreshError: pollBackoff }]),
+      )
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'fallback-ok',
+      )
+      const state = await waitForState(
+        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
+      )
+      const reloaded = await loadAccounts()
+      const reloadedFallback = reloaded?.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === 'fallback-1' && account.type === 'oauth',
+      )
+
+      expect(state.accounts['fallback-1'].lastQuotaRefreshError).toEqual(
+        pollBackoff,
+      )
+      expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(78)
+      expect(reloadedFallback?.lastQuotaRefreshError).toEqual(pollBackoff)
+      expect(reloadedFallback?.quota?.source).toBe('headers')
+    })
+
+    test('sidebar state reflects header-pushed freshness and served fallback attribution', async () => {
+      await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForSidebarState(
+        (value) =>
+          value.activeId === 'fallback-1' &&
+          value.fallbacks[0]?.quota?.five_hour?.usedPercent === 78,
+      )
+
+      expect(state.main.quota?.five_hour?.usedPercent).not.toBe(78)
+      expect(state.fallbacks[0]?.id).toBe('fallback-1')
+      expect(state.lastUpdated).toBeGreaterThan(0)
+    })
+
+    test('non-quota response does not push or persist quota', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('ok')),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await Bun.sleep(30)
+
+      expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
+    })
+
+    test('non-finite utilization headers leave stored quota untouched', async () => {
+      const existingQuota = {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 1,
+        },
+        fallbackAdvised: true,
+        source: 'poll' as const,
+        checkedAt: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainQuota: existingQuota,
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: tokenFingerprint('main-access'),
+          },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('ok', {
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': 'garbage',
+              'anthropic-ratelimit-unified-7d-utilization': 'NaN',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await Bun.sleep(30)
+
+      expect((await loadAccounts())?.quota?.mainQuota).toEqual(existingQuota)
+    })
+
+    test('malformed quota headers never reject or replace the original response', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('original', {
+            status: 202,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.5',
+              'anthropic-ratelimit-unified-5h-reset': '1e308',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(202)
+      expect(await response.text()).toBe('original')
+    })
+
+    test('header push persists source headers and refreshes sidebar checkedAt without a usage poll', async () => {
+      await useTempAccountFile(harvestStorage())
+      let usageCalls = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
+        return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForSidebarState(
+        (value) => value.main.quota?.five_hour?.usedPercent === 78,
+      )
+
+      expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
+      expect(state.lastUpdated).toBeGreaterThan(0)
+      expect(usageCalls).toBe(0)
+    })
+
+    test('successful harvest emits one quota debug record without raw headers', async () => {
+      await useTempAccountFile(harvestStorage())
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      const harvested = records.filter(
+        (record) =>
+          record.channel === 'quota' &&
+          record.message === 'harvested response quota',
+      )
+      expect(harvested).toHaveLength(1)
+      expect(JSON.stringify(harvested[0])).not.toContain('anthropic-ratelimit')
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('repeated out-of-range resets do not warn and restore log state', async () => {
+      await useTempAccountFile(harvestStorage())
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('ok', {
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.5',
+              'anthropic-ratelimit-unified-5h-reset': '1e308',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(
+        records.filter(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'failed to normalize response quota headers',
+        ),
+      ).toHaveLength(0)
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+  })
 })
 
 describe('killswitch fetch gate', () => {
@@ -5163,6 +8551,7 @@ describe('killswitch fetch gate', () => {
 
   beforeEach(() => {
     globalThis.fetch = originalFetch
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     // Prevent the plugin's background quota-refresh interval from leaking a
     // real timer that fires during later tests (test-isolation flake).
     globalThis.setInterval = mock(
@@ -5173,6 +8562,7 @@ describe('killswitch fetch gate', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch
     globalThis.setInterval = originalSetInterval
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
   })
 
   const oauthLoader = () =>

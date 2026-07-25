@@ -55,11 +55,13 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 ## C. Multi-account & fallback — [G+A]
 
 - **What:** Ordered fallback accounts (OAuth + API-key); auto-route off the main account on
-  rate-limit/auth failure; main-first or fallback-first ordering.
+  rate-limit/auth failure; main-first, fallback-first, or quota-weighted sticky-balanced routing.
 - **How:** `core/accounts.ts` — two-file sidecar store (config `anthropic-auth.json` + runtime
   `anthropic-auth-state.json`), atomic temp+rename writes, cross-process file lock. `FallbackAccount`
   Manager` orchestrates per-account background refresh + quota. `getUsableFallbackAccounts()` FILTERS
-  (never ranks) by quota policy + killswitch + `enabled`. `shouldFallbackStatus()` = [401,403,429].
+  (never ranks) by quota policy + killswitch + `enabled`. `core/sticky-routing.ts` persists hashed
+  session assignments and allocates cold sessions by reset-normalized spendable quota headroom plus
+  weighted initial-prompt deficit. `shouldFallbackStatus()` = [401,403,429].
   Ingestion is **CLI-only** (`upsertAccount` called only from `cli.ts` login/api routes).
 - **Coupling:** store mechanics, file lock, backoff, selection-as-filter, routing modes **[G]**;
   OAuth account shape + the request-time quota pull (Anthropic GET) **[A]**. Provider seam = 2 fns
@@ -88,10 +90,13 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 
 - **1h cache** (`core/cache1h.ts`, `/claude-cache on|off|mode explicit|automatic|hybrid`): chooses how
   `cache_control` breakpoints + extended-TTL beta are applied. **[A]** (Anthropic prompt-cache model).
-- **cacheKeep** (`core/cachekeep.ts`, `/claude-cachekeep status|off|HH-HH`): keeps the Anthropic
-  **1-hour** extended cache warm. SELF-ARMING via `track()` (every real main request arms the timer +
-  captures freshest body); 60s tick prewarms ≤5min before expiry; replays captured body w/ max_tokens=0.
-  **[G]** self-arming timer + replay pattern; **[A]** 1h TTL, cache_control gate, max_tokens=0. memory #405.
+- **cacheKeep** (`core/cachekeep.ts`, `core/cachekeep-registry.ts`, `/claude-cachekeep status|always|off|HH-HH`): keeps the Anthropic
+  **1-hour** extended cache warm. SELF-ARMING via `track()` (every eligible OAuth request arms the timer +
+  captures the freshest body); a 60s tick prewarms ≤5min before expiry and replays the captured body with
+  `max_tokens=0`. `always` removes the local-hour gate and keeps targets active across midnight while
+  the process remains open. A temporary host-scoped lease registry lets status aggregate live session IDs across
+  plugin/process instances without persisting bodies, headers, or credentials. **[G]** self-arming timer +
+  replay/lease pattern; **[A]** 1h TTL, cache_control gate, max_tokens=0. memory #405.
 
 ## G. Fast mode — [A]
 

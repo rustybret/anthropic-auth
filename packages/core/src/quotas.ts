@@ -4,9 +4,11 @@ import type {
   AccountStorage,
   OAuthAccount,
   OAuthQuotaSnapshot,
+  QuotaMoney,
   QuotaWindowName,
 } from './accounts.ts'
 import { isOAuthAccount } from './accounts.ts'
+import { formatOAuthAccountTier } from './oauth-profile.ts'
 
 export const CLAUDE_QUOTAS_COMMAND_NAME = 'claude-quota'
 
@@ -22,6 +24,7 @@ export type QuotaAccountSummary = {
   quota?: OAuthQuotaSnapshot
   lastRefreshedAt?: number
   error?: string
+  tierLabel?: string
 }
 
 function formatPercent(value: number) {
@@ -65,13 +68,28 @@ function formatWindow(
   key: QuotaWindowName,
   window: AccountQuotaWindow | undefined,
   now: number,
+  bindingWindow?: string,
 ) {
   if (!window) return `  - ${WINDOW_LABELS[key]}: unknown`
-  return [
+  const line = [
     `  - ${WINDOW_LABELS[key]}: ${formatPercent(window.remainingPercent)} remaining`,
     ` (${formatPercent(window.usedPercent)} used`,
     `${formatReset(window.resetsAt, now)}, checked ${formatAge(window.checkedAt, now)})`,
   ].join('')
+  return bindingWindow === key ? `${line} •` : line
+}
+
+export function formatQuotaMoney(money: QuotaMoney) {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: money.currency,
+      minimumFractionDigits: money.exponent,
+      maximumFractionDigits: money.exponent,
+    }).format(money.amountMinor / 10 ** money.exponent)
+  } catch {
+    return `${money.amountMinor} ${money.currency}`
+  }
 }
 
 function formatScopedWindow(window: AccountScopedQuotaWindow, now: number) {
@@ -104,6 +122,9 @@ export function buildFallbackQuotaSummaries(
       role: 'fallback' as const,
       enabled: account.enabled !== false,
       quota: account.quota,
+      ...(formatOAuthAccountTier(account.profile) && {
+        tierLabel: formatOAuthAccountTier(account.profile),
+      }),
       lastRefreshedAt: account.lastRefreshedAt,
       ...(error && { error }),
     }
@@ -131,6 +152,7 @@ export function buildClaudeQuotaSummary(input: {
     const role = account.role === 'main' ? 'main' : 'fallback'
     const disabled = account.enabled === false ? ' disabled' : ''
     lines.push(`### ${account.name} (${role}${disabled})`)
+    if (account.tierLabel) lines.push(`  - Tier: ${account.tierLabel}`)
     if (account.lastRefreshedAt) {
       lines.push(
         `  - Last token refresh: ${formatAge(account.lastRefreshedAt, now)}`,
@@ -139,10 +161,38 @@ export function buildClaudeQuotaSummary(input: {
     if (account.error) {
       lines.push(`  - Error: ${account.error}`)
     }
-    lines.push(formatWindow('five_hour', account.quota?.five_hour, now))
-    lines.push(formatWindow('seven_day', account.quota?.seven_day, now))
+    lines.push(
+      formatWindow(
+        'five_hour',
+        account.quota?.five_hour,
+        now,
+        account.quota?.bindingWindow,
+      ),
+    )
+    lines.push(
+      formatWindow(
+        'seven_day',
+        account.quota?.seven_day,
+        now,
+        account.quota?.bindingWindow,
+      ),
+    )
     for (const window of account.quota?.scoped ?? []) {
-      lines.push(formatScopedWindow(window, now))
+      const line = formatScopedWindow(window, now)
+      lines.push(
+        account.quota?.bindingWindow === window.id ? `${line} •` : line,
+      )
+    }
+    const extraUsage = account.quota?.extraUsage
+    if (extraUsage) {
+      const used = formatQuotaMoney(extraUsage.used)
+      const limit = formatQuotaMoney(extraUsage.limit)
+      lines.push(
+        `  - credits ${used}/${limit}${extraUsage.exhausted ? ' · exhausted' : ''}`,
+      )
+    }
+    if (account.quota?.fallbackAdvised === true) {
+      lines.push('  - → fallback advised')
     }
     lines.push('')
   }

@@ -23,3 +23,9 @@ Guidance for future audits of intentional tradeoffs in this repository.
 ## Logging
 
 - **The temp-file logger uses buffered synchronous writes.** It flushes at a 500ms cadence or 50-line buffer to avoid losing diagnostics on crashes while keeping normal request-path overhead low. Do not flag as a correctness issue without latency measurements showing it is material.
+
+## Sticky-balanced routing
+
+- **Session affinity intentionally outranks moment-to-moment quota ranking.** Once assigned, a session remains on its OAuth account across transient transport/provider/quota-probe failures and relative quota changes so its large prompt cache is not rewritten on another account.
+- **A confirmed five-hour exhaustion does not migrate when reset is within 15 minutes.** The route returns `Retry-After` and remains assigned; longer 5h exhaustion, 7d/model-scoped exhaustion, killswitch blocks, removed/disabled accounts, and permanent re-login failures may migrate.
+- **API-key routes are not candidates for quota-balanced first assignment.** Their existing confirmed-main-exhaustion gate remains authoritative.

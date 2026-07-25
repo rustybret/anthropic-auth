@@ -26,13 +26,13 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 ## What CortexKit adds over the original plugin
 
 - **Fallback Claude accounts**: keep each agent's normal Anthropic login as the primary account, then route to ordered fallback OAuth accounts on auth/quota/rate-limit failures.
-- **Routing mode toggle**: use `/claude-routing fallback-first` to prefer sidecar fallback accounts before the main account.
+- **Routing modes**: use `/claude-routing sticky-balanced` to distribute cold sessions by current OAuth quota headroom while keeping each session on one account, or choose `main-first` / `fallback-first` ordering.
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
-- **Cache keepalive**: use `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
+- **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
-- **Fable/Mythos reasoning visibility**: request summarized adaptive thinking for Claude Fable 5 and Mythos 5 so agents can display reasoning summaries instead of blank signed-thinking blocks.
-- **Fable content-filter recovery**: when Fable ends a session response with Anthropic's `refusal` content-filter reason, transparently retry with Opus 4.8 for 10 successful model responses. After each Opus response, a zero-output Fable prewarm advances the same prompt cache using the OAuth account that served the filtered Fable request. The latest Opus cache boundary is retained so a later refusal can bridge back to Opus even after more than 20 Fable content blocks; the selected OpenCode model remains Fable. The TUI sidebar shows the per-session recovery countdown and return to Fable, while OpenCode Desktop receives ignored `promptAsync` notices for both transitions.
+- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
+- **Fable/Opus 5 content-filter recovery**: when Fable or Opus 5 ends a session response with Anthropic's `refusal` content-filter reason, transparently retry that source-model family with Opus 4.8 for 10 successful model responses. Recovery state and pending cache warms remain independent when a session switches between Fable and Opus 5. After each downgraded response, a zero-output prewarm advances the source model's prompt cache using the OAuth account that served the filtered request. The latest Opus cache boundary is retained so a later refusal can bridge back even after more than 20 content blocks. The TUI sidebar and OpenCode Desktop report both transitions while preserving the selected model.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
@@ -189,6 +189,7 @@ Example:
   },
   "cacheKeep": {
     "enabled": false,
+    "always": false,
     "startHour": 9,
     "endHour": 23
   },
@@ -214,13 +215,17 @@ Example:
 
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
 
-Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Background refresh and quota checks write only the state file, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
+Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
 ## Fallback accounts
 
 Fallback accounts are separate Claude OAuth accounts or Anthropic-compatible API-key routes managed by this plugin. By default, the main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
 
-Use `/claude-routing fallback-first` to prefer usable fallback accounts before the main account. Use `/claude-routing main-first` to restore the default. The command persists `routing.mode` and takes effect on the next request without restarting.
+Use `/claude-routing fallback-first` to prefer usable fallback accounts before the main account, `/claude-routing main-first` to restore the default, or `/claude-routing sticky-balanced` to allocate each new session according to spendable 5-hour, 7-day, and matching model-scoped OAuth quota headroom. The command persists `routing.mode` and takes effect on the next request without restarting. `/claude-routing reset` clears only the current session's assignment so its next request is allocated again.
+
+`sticky-balanced` normalizes quota headroom by time until reset and tracks weighted initial-prompt deficit until the next quota refresh. Assignments are persisted by hashed session ID in `anthropic-auth-routing-state.json`, shared safely across OpenCode plugin instances and restarts. Active hybrid CacheKeep sessions seed their current route when the mode is first enabled.
+
+Affinity survives network/relay failures, 5xx responses, unconfirmed 429s, quota-probe failures, and relative quota changes. Confirmed 7-day or matching model-scoped exhaustion migrates a session. Confirmed 5-hour exhaustion migrates only when more than 15 minutes remain; otherwise the plugin retains the route and returns `Retry-After`. Fable content-filter recovery keeps Fable, Opus 4.8, and Fable prewarms on the same sticky account. Direct Opus sessions first prefer an otherwise usable account whose Fable quota is exhausted.
 
 Default fallback statuses:
 
@@ -359,13 +364,16 @@ In OpenCode, subagent requests do not receive 1-hour TTL caching. The plugin det
 
 ```text
 /claude-cachekeep
+/claude-cachekeep always
 /claude-cachekeep 09-23
 /claude-cachekeep off
 ```
 
-The hour range uses local 24-hour time and is start-inclusive/end-exclusive. `09-23` means cache keepalive may run from 09:00 until 22:59. Overnight windows such as `23-09` are accepted.
+`always` keeps tracked sessions warm continuously for as long as the OpenCode process remains open. Hour ranges use local 24-hour time and are start-inclusive/end-exclusive: `09-23` runs from 09:00 until 22:59, and overnight windows such as `23-09` are accepted.
 
-Cache keepalive only tracks requests when `/claude-cache` is enabled in `hybrid` mode. For each active session seen that day, the package keeps an in-memory clone of the latest rewritten Anthropic request and sends a non-streaming `max_tokens: 0` pre-warm request about five minutes before the 1-hour cache entry would expire. Nothing is written to disk except the schedule configuration.
+Cache keepalive only tracks requests when `/claude-cache` is enabled in `hybrid` mode. For each active session seen in the configured schedule, the package keeps an in-memory clone of the latest rewritten Anthropic request and sends a non-streaming `max_tokens: 0` pre-warm request about five minutes before the 1-hour cache entry would expire. Running `/claude-cachekeep` without arguments lists every live tracked session across OpenCode projects and plugin processes.
+
+Request bodies, headers, and tokens remain in memory. A lease-backed file under the system temporary directory shares only session IDs and cache timing for cross-instance status; records from stopped processes disappear from status after about three minutes.
 
 Pre-warm requests preserve explicit cache anchors but remove response-only fields that Anthropic rejects with `max_tokens: 0`, such as streaming, enabled thinking, structured output format, and forced/any tool choice. The feature works only while OpenCode or Pi is running and the machine is awake, and cache writes are still billed when the cache entry is no longer warm.
 
@@ -379,7 +387,7 @@ Both OpenCode and Pi packages can persistently request Anthropic fast mode for s
 /claude-fast off
 ```
 
-When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, and `claude-opus-4-8`; Claude Fable 5 and Mythos 5 are not fast-mode models.
+When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, and `claude-opus-5`; Claude Fable 5 and Mythos 5 are not fast-mode models.
 
 Fast and standard speeds do not share prompt-cache prefixes, so switching this setting can cause cache misses.
 

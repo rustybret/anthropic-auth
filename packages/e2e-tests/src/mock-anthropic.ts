@@ -11,6 +11,7 @@ export type MockResponse =
       text: string
       delayMs?: number
       usage?: MockUsage
+      headers?: Record<string, string>
     }
   | {
       type: 'tool_use'
@@ -19,16 +20,19 @@ export type MockResponse =
       input: Record<string, unknown>
       splitToolNameChunk?: boolean
       usage?: MockUsage
+      headers?: Record<string, string>
     }
   | {
       type: 'refusal'
       usage?: MockUsage
+      headers?: Record<string, string>
     }
   | {
       type: 'error'
       status: number
       errorType: string
       message: string
+      headers?: Record<string, string>
     }
 
 export type CapturedAnthropicRequest = {
@@ -146,7 +150,10 @@ export class MockAnthropicServer {
         }),
         {
           status: response.status,
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            ...response.headers,
+          },
         },
       )
     }
@@ -157,6 +164,7 @@ export class MockAnthropicServer {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
+        ...response.headers,
       },
     })
   }

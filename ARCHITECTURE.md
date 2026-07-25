@@ -16,7 +16,7 @@
 **@cortexkit/anthropic-auth-core (Shared Core):**
 - Purpose: Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic
 - Location: `packages/core/src/`
-- Contains: OAuth authorization/token exchange (`auth.ts`), account storage (`accounts.ts`), PKCE generation (`pkce.ts`), quota management (`quota-manager.ts`, `quotas.ts`), cache control (`cache1h.ts`, `cachekeep.ts`), relay protocol (`relay.ts`), dump capture (`dump.ts`), Claude Code identity and body signing (`claude-code.ts`, `cch.ts`), routing (`routing.ts`), killswitch thresholds (`killswitch.ts`), fast mode (`fast.ts`), model specs (`models.ts`), logging commands and config (`logging.ts`), provider HTTP error contracts (`provider.ts`), account command execution (`commands/account.ts`), shared structured logger (`logger.ts`), and constants (`constants.ts`)
+- Contains: OAuth authorization/token exchange (`auth.ts`), profile fetching (`oauth-profile.ts`), account storage (`accounts.ts`), PKCE generation (`pkce.ts`), token fingerprinting (`token-fingerprint.ts`), quota management (`quota-manager.ts`, `quotas.ts`, `quota-headers.ts`), cache control (`cache1h.ts`, `cachekeep.ts`, `cachekeep-registry.ts`), relay protocol (`relay.ts`), dump capture (`dump.ts`), Claude Code identity and body signing (`claude-code.ts`, `cch.ts`), routing (`routing.ts`, `sticky-routing.ts`), killswitch thresholds (`killswitch.ts`), fast mode (`fast.ts`), model specs (`models.ts`), logging commands and config (`logging.ts`), provider HTTP error contracts (`provider.ts`), account command execution (`commands/account.ts`), shared structured logger (`logger.ts`), and constants (`constants.ts`)
 - Depends on: `xxhash-wasm` (for cch body signing), Node.js built-ins (`crypto`, `fs`, `os`)
 - Used by: Both `@cortexkit/opencode-anthropic-auth` and `@cortexkit/pi-anthropic-auth`
 
@@ -37,41 +37,44 @@
 **End-to-End Tests:**
 - Purpose: Integration tests for the full OpenCode plugin flow with mock Anthropic and relay servers
 - Location: `packages/e2e-tests/`
-- Contains: Test harness (`harness.ts`), mock servers (`mock-anthropic.ts`, `mock-relay.ts`), OpenCode runner (`opencode-runner.ts`), test files (`tests/tool-prefix.test.ts`)
+- Contains: Test harness (`harness.ts`), mock servers (`mock-anthropic.ts`, `mock-relay.ts`), OpenCode runner (`opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`)
 
 ## Data Flow
 
 **OpenCode Request Lifecycle:**
 
-1. **Plugin load** — OpenCode loads `@cortexkit/opencode-anthropic-auth` plugin, which starts background refresh timers, creates `QuotaManager` and `FallbackAccountManager`, initializes RPC server, and registers `auth.loader` + `provider.models` hooks — `packages/opencode/src/index.ts`
+1. **Plugin load** — OpenCode loads `@cortexkit/opencode-anthropic-auth` plugin, which starts background refresh timers, creates `QuotaManager` and `FallbackAccountManager`, initializes RPC server, and registers `auth.loader` + `provider.models` hooks. The model hook publishes native adaptive `low` through `max` effort variants for Opus 5 instead of legacy manual-thinking budgets. On boot, the plugin resolves the initial sidebar routing only after the asynchronous account-storage load completes, ensuring a peer's concurrent routing-authoritative publish during the load is not overwritten by a stale pre-load snapshot. — `packages/opencode/src/index.ts`
 2. **Auth loader** — When OpenCode creates an Anthropic session, the plugin's `auth.loader` runs: captures the OAuth `getAuth` function, starts main token refresh background loop — `packages/opencode/src/index.ts` (AnthropicAuthPlugin → auth.loader)
 3. **Command registration** — Plugin registers `/claude-cache`, `/claude-cachekeep`, `/claude-quota`, `/claude-dump`, `/claude-fast`, `/claude-routing`, `/claude-killswitch`, `/claude-account`, `/claude-logging` — `packages/opencode/src/index.ts` (config hook)
 4. **Request interception** — OpenCode's fetch wrapper calls the plugin's hooks — `packages/opencode/src/index.ts` (experimental fetch wrapping)
 5. **URL rewrite** — `rewriteUrl()` adds `?beta=true` to `/v1/messages` and overrides base URL when `ANTHROPIC_BASE_URL` is set — `packages/opencode/src/transform.ts`
-6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos thinking and Sonnet 5 adaptive thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
-7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy, model-scoped quotas, and killswitch thresholds (including per-model scoped thresholds). If all accounts fail the killswitch policy, a 429 block response is returned immediately; this block is classified as scoped-driven (matching a specific model's weekly limit) or account-level (5h/7d limits) with a model-specific or generic retry hint — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`, `packages/opencode/src/index.ts`
-8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back — `packages/core/src/relay.ts`
-9. **SSE stream and Fable recovery** — Response body is wrapped in `createStrippedStream()`, which reverses the tool name prefix and detects Anthropic `refusal` finishes. For selected Fable sessions, a refusal activates a session-local 10-response Opus 4.8 downgrade; every successful downgraded response triggers a zero-output Fable prewarm through `CacheKeepManager` using the OAuth account that served the filtered Fable request. The last successful Opus tail anchor is retained per session and OAuth account; if Fable later refuses after that anchor has moved outside Anthropic's 20-block lookback, the retry spends the system cache slot on an explicit old-Opus-to-current-tail bridge rather than rewriting the intervening Opus cache. Recovery transitions are written per session to the TUI sidebar state; when no matching TUI is connected, OpenCode Desktop receives immediate ignored/no-reply `promptAsync` notices for the switch to Opus and return to Fable. Each notice is assigned a message ID immediately before the active assistant message: Desktop displays it immediately by creation time, while OpenCode's run loop sees it as older than the active assistant and cannot mistake it for pending user work or create an extra provider response — `packages/opencode/src/transform.ts`, `packages/opencode/src/fable-fallback.ts`, `packages/opencode/src/index.ts`
-10. **Sidebar update** — `writeSidebarState()` writes quota/routing/cache state plus bounded per-session Fable recovery status to a JSON file read by the TUI sidebar widget (separate process via RPC) — `packages/opencode/src/sidebar-state.ts`
+6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos, Sonnet 5, and Opus 5 adaptive thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
+7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in ordered modes, while `StickySessionRouter` assigns cold sessions by reset-normalized spendable OAuth quota and weighted initial-prompt deficit, then persists hashed session affinity across processes/restarts. Sticky routes retain transient failures, hold confirmed 5h exhaustion when reset is within 15 minutes, and migrate for longer confirmed exhaustion/permanent account failure. All modes respect model-scoped quotas and killswitch thresholds (including per-model scoped thresholds). If all accounts fail the killswitch policy, a 429 block response is returned immediately; this block is classified as scoped-driven (matching a specific model's weekly limit) or account-level (5h/7d limits) with a model-specific or generic retry hint — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`, `packages/opencode/src/index.ts`
+8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back. HTTP relay responses and WebSocket `response_start` control messages deliver genuine upstream headers to the OpenCode account-bound quota harvester; synthetic optimistic response headers are never harvest input, and relay-to-direct fallback stays owned by the direct path — `packages/core/src/relay.ts`, `packages/opencode/src/index.ts`
+9. **SSE stream and content-filter recovery** — Response body is wrapped in `createStrippedStream()`, which reverses the tool name prefix and detects Anthropic `refusal` finishes. For Fable or Opus 5, a refusal activates a 10-response Opus 4.8 downgrade keyed by session and source-model family; switching between Fable and Opus 5 cannot transfer recovery state or wait on the other family's pending cache warm. Every successful downgraded response triggers a zero-output source-model prewarm through `CacheKeepManager` using the OAuth account that served the filtered request. The last successful Opus 4.8 tail anchor is retained per source family and OAuth account; if the source model later refuses after that anchor has moved outside Anthropic's 20-block lookback, the retry spends the system cache slot on an explicit old-Opus-to-current-tail bridge rather than rewriting the intervening cache. Recovery transitions are written per session to the TUI sidebar state; when no matching TUI is connected, OpenCode Desktop receives immediate ignored/no-reply `promptAsync` notices for the switch to Opus 4.8 and return to the selected source model. Each notice is assigned a message ID immediately before the active assistant message: Desktop displays it immediately by creation time, while OpenCode's run loop sees it as older than the active assistant and cannot mistake it for pending user work or create an extra provider response — `packages/opencode/src/transform.ts`, `packages/opencode/src/fable-fallback.ts`, `packages/opencode/src/prompt-context.ts`, `packages/opencode/src/index.ts`
+10. **Sidebar update** — `writeSidebarState()` writes quota/routing/cache state plus bounded per-session Fable recovery status to a JSON file read by the TUI sidebar widget (separate process via RPC). Routing-authoritative writes (e.g. active routing decisions) are distinguished from display-only/metadata writes (e.g. quota refreshes or command paths). Display-only writes re-read the file and merge state to preserve any live routing session's `activeId` and route. Cross-process writes are synchronized using an atomic `mkdir` directory lock with jittered retries, rename-claim eviction, and lock-budget exhaustion skips. The write is fenced: ownership is verified before and after the rename, triggering one bounded locked repair of routing-authoritative fields on post-rename loss. — `packages/opencode/src/sidebar-state.ts`, `packages/opencode/src/index.ts`
 
 **Pi Request Lifecycle:**
 
 1. **Extension load** — Pi loads `@cortexkit/pi-anthropic-auth` package, which calls `registerCommands()` and `pi.registerProvider("anthropic", ...)` — `packages/pi/src/index.ts`
 2. **Provider registration** — Provider defines OAuth login/refresh functions (delegating to core's `authorize`/`exchange`/`refreshClaudeOAuthToken`) and a `streamSimple` function — `packages/pi/src/index.ts`
-3. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` builds the Anthropic request, sends via relay or direct, handles fallback routing (including model-scoped quota routing) and cache keepalive
+3. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` builds the Anthropic request, sends via relay or direct, handles ordered or persistent sticky-balanced routing (including model-scoped quota routing), and cache keepalive
 4. **Slash commands** — `/claude-*` commands registered in `packages/pi/src/commands.ts` reuse core command execution functions
 
-**Quota Refresh Flow:**
+**Quota Refresh & Header Harvest Flow:**
 1. Background timer fires at `checkIntervalMinutes` (default 5) — `packages/core/src/quota-manager.ts`
 2. `QuotaManager.refreshMain()` fetches `https://api.anthropic.com/api/oauth/usage` (including standard five-hour/seven-day windows and weekly scoped model limits) with the access token
 3. On success: persists quota snapshot (including a top-level `checkedAt` freshness timestamp to support merge resolution of windowless empty-scoped quotas) to sidecar state file, updates sidebar state — `packages/opencode/src/index.ts` (onMainQuotaFetched callback)
 4. On 429: records backoff with `nextRetryAt` timestamp — prevents further refreshes during backoff — `packages/core/src/accounts.ts`
 5. Fallback accounts: `FallbackAccountManager` refreshes per-account quotas in background, persists to state, notifies sidebar — `packages/opencode/src/index.ts`
+6. Passive header harvesting: Upstream response headers (`anthropic-ratelimit-unified-*`) on direct fetch and HTTP/WebSocket relay transports are passively harvested (`normalizeQuotaHeaders`), merged into the quota snapshot, and update sidebar state without extra API polling — `packages/core/src/quota-headers.ts`, `packages/opencode/src/index.ts`
+7. Account profile metadata: Organization tier metadata (`Max 5x`, `Team · Max 5x`) is fetched from `https://api.anthropic.com/api/oauth/profile` (`fetchOAuthAccountProfile`), bound via SHA-256 token fingerprint, cached with a 7-day TTL, and persisted fire-and-forget without blocking user command execution — `packages/core/src/oauth-profile.ts`, `packages/core/src/token-fingerprint.ts`
 
 **Cache Keepalive Flow:**
 1. `CacheKeepManager` tracks recently used hybrid-cache sessions and their associated `oauthAccountId` — `packages/core/src/cachekeep.ts`
 2. ~5 minutes before the 1-hour cache TTL expires, sends a `max_tokens: 0` pre-warm request (authenticated using the corresponding main or fallback account credentials) to extend the cache entry
 3. Removes response-only fields (streaming, thinking, structured output, forced tool choice) from the pre-warm body
+4. Each manager publishes session IDs and cache timing (never request bodies, headers, or tokens) to a host-scoped temporary lease registry; status commands aggregate live records across project/plugin processes, and stale process records age out after three minutes. Schedule mode can be a local hour window or `always`, which remains active across midnight while the process is open
 
 ## Key Abstractions
 
@@ -85,20 +88,35 @@
 - Location: `packages/core/src/accounts.ts`
 - Pattern: Created per-plugin-instance; iterates accounts and schedules per-account refresh timers
 
+**StickySessionRouter:**
+- Purpose: Quota-balance cold sessions without moving an established prompt cache between OAuth accounts
+- Location: `packages/core/src/sticky-routing.ts`
+- Pattern: Cross-process locked atomic registry keyed by SHA-256 session hashes. Candidate weights combine spendable 5h/7d/model-scoped quota, reset horizon, and bytes assigned since the candidate quota snapshot. Assignments survive transient errors, can be cleared for the current session with `/claude-routing reset`, and expire after seven inactive days. Direct Opus allocation first consumes usable accounts with exhausted Fable scope; OpenCode Fable recovery continues on the original sticky account.
+
 **CacheKeepManager:**
-- Purpose: Tracks hybrid-cache sessions and sends pre-warm requests before 1-hour TTL expiry; also exposes immediate zero-output prewarming for Fable content-filter recovery
+- Purpose: Tracks hybrid-cache sessions and sends pre-warm requests before 1-hour TTL expiry; also exposes immediate zero-output prewarming for Fable/Opus 5 content-filter recovery
 - Location: `packages/core/src/cachekeep.ts`
-- Pattern: In-memory target tracking with configurable time window; tracks the associated `oauthAccountId` to pre-warm using the correct credentials; supports up to 32 concurrent sessions
+- Pattern: In-memory target tracking with configurable local window or process-lifetime `always` schedule; tracks the associated `oauthAccountId` to pre-warm using the correct credentials; supports up to 32 concurrent sessions per manager and publishes sanitized tracking snapshots on changes/heartbeats
+
+**CacheKeepSessionRegistry:**
+- Purpose: Aggregates current CacheKeep session visibility across independently loaded OpenCode project plugins or Pi processes without sharing request payloads or credentials
+- Location: `packages/core/src/cachekeep-registry.ts`
+- Pattern: One atomic JSON lease record per manager under the system temporary directory; records contain only session IDs and cache timing, are separated into OpenCode/Pi scopes, deduplicate by session ID, and are ignored after a three-minute stale lease
 
 **FableFallbackManager:**
-- Purpose: Maintains session-local Fable content-filter recovery state, rewriting the next 10 successful model requests to Opus 4.8 before probing Fable again
+- Purpose: Maintains Fable and Opus 5 content-filter recovery state, rewriting the next 10 successful source-family requests to Opus 4.8 before probing the selected model again
 - Location: `packages/opencode/src/fable-fallback.ts`
-- Pattern: Bounded, expiring in-memory session map with cycle IDs so late responses cannot decrement a newer recovery cycle; preserves the OAuth account identity used for Fable cache prewarming and the newest account-bound Opus tail fingerprint for a later model-specific cache bridge
+- Pattern: Bounded, expiring in-memory map keyed by session and source-model family, with cycle IDs so late responses cannot decrement a newer recovery cycle; preserves each family's OAuth account identity and newest account-bound Opus 4.8 tail fingerprint for source-model prewarming and later cache bridges
+
+**PromptContextResolver:**
+- Purpose: Resolves the active agent, model, variant, and latest message IDs (assistant and user) from the OpenCode session message history
+- Location: `packages/opencode/src/prompt-context.ts`
+- Pattern: Traverses recent session messages via the client API to reconstruct the current model/variant context for synthetic/ignored notification turns. This prevents OpenCode from resetting to default model configurations or misattributing background prompt notices.
 
 **AccountStorage (sidecar file):**
 - Purpose: Persisted configuration and runtime state — fallback accounts, quotas, refresh backoff, killswitch settings, cache/relay config
 - Location: `packages/core/src/accounts.ts`
-- Pattern: JSON file on disk (`~/.config/opencode/anthropic-auth.json` for OpenCode, `~/.pi/agent/anthropic-auth.json` for Pi). Runtime state in separate `anthropic-auth-state.json` to avoid overwriting config. Atomic writes via temp + rename. Preserves empty scoped quota arrays `[]` on load/merge to distinguish explicit zero-carve-out from missing quota metadata.
+- Pattern: JSON file on disk (`~/.config/opencode/anthropic-auth.json` for OpenCode, `~/.pi/agent/anthropic-auth.json` for Pi). Runtime credentials/quota state lives in `anthropic-auth-state.json`; sticky routing affinity lives in `anthropic-auth-routing-state.json`. Atomic writes via temp + rename. Serializes all account-store and state writes via an in-process save mutex and acquires a cross-process write lock on the configuration file during save. Merges existing accounts on disk with incoming accounts on save to prevent fallback account loss under concurrent execution. Preserves empty scoped quota arrays `[]` on load/merge to distinguish explicit zero-carve-out from missing quota metadata.
 
 **rewriteRequestBody:**
 - Purpose: Full Anthropic request body transform — handle cache strategies (including model-specific standby bridges), system sanitization, tool name prefixing, billing headers, and body signing
@@ -108,7 +126,7 @@
 **SidebarState:**
 - Purpose: Shared state file between OpenCode server process and TUI widget process for live quota/routing/cache display and per-session Fable recovery status
 - Location: `packages/opencode/src/sidebar-state.ts`
-- Pattern: JSON file under `$TMPDIR`; server writes after each routing decision or quota refresh; TUI polls on interval. Supports displaying standard usage windows alongside scoped model quotas (e.g. Fable weekly limit), omitting standard five-hour and seven-day placeholders when only model-scoped limits are visible, preserving empty scoped arrays `[]` to distinguish explicit ownership from missing data, and carries a bounded set of session-keyed Opus/Fable recovery notices so concurrent sessions do not overwrite each other's sidebar state.
+- Pattern: JSON file under `$TMPDIR`; server writes after each routing decision or quota refresh; TUI polls on interval. Supports displaying standard usage windows alongside scoped model quotas (e.g. Fable weekly limit), omitting standard five-hour and seven-day placeholders when only model-scoped limits are visible, preserving empty scoped arrays `[]` to distinguish explicit ownership from missing data, and carries a bounded set of session-keyed Opus/Fable recovery notices so concurrent sessions do not overwrite each other's sidebar state. Non-authoritative updates re-read the file before merging to preserve active routing sessions (`activeId`). Cross-process writes are guarded by an `mkdir` directory lock with atomic rename-claim eviction of stale locks, jittered retries, and lock-budget exhaustion skips. Writes are fenced with pre- and post-rename ownership checks; if a post-rename lock loss is detected, a single bounded locked repair restores the routing-authoritative fields into the successor's fresh state.
 
 **RPC Server/Client:**
 - Purpose: Loopback HTTP server for TUI ↔ OpenCode server IPC — modal dialogs and notification delivery
@@ -140,7 +158,7 @@
 
 ## Error Handling
 
-**Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller; killswitch blocks requests before they hit the API when quota drops below configured thresholds (including per-model scoped thresholds evaluated against the requested model). Blocks are classified as scoped-driven (when a specific model's weekly limit is reached) or account-level (5h/7d limits), generating detailed user-facing error messages. Fallback routing triggers on confirmed standard quota exhaustion or model-scoped quota exhaustion (stale cached quota never triggers API-key fallback routes).
+**Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller. Sticky-balanced routing fails retryably instead of silently selecting a non-sticky account when its quota pool is unavailable; confirmed five-hour exhaustion with at most 15 minutes until reset returns a deterministic jittered `Retry-After` while retaining affinity. Killswitch blocks requests before they hit the API when quota drops below configured thresholds (including per-model scoped thresholds evaluated against the requested model). Blocks are classified as scoped-driven (when a specific model's weekly limit is reached) or account-level (5h/7d limits), generating detailed user-facing error messages. Fallback routing triggers on confirmed standard quota exhaustion or model-scoped quota exhaustion (stale cached quota never triggers API-key fallback routes).
 
 ## Cross-Cutting Concerns
 
@@ -148,6 +166,6 @@
 
 **Caching:** In-memory quota cache (`QuotaManager`) with staleness-based refresh logic; memoized system prompt sanitization (`sanitize-memo.ts`) with 8MB max; 1-hour Anthropic prompt cache managed via cache strategy (`cache1h.ts`, `cachekeep.ts`)
 
-**Storage:** Sidecar JSON files for config + state (separate files to avoid config overwrite), JSONC preferences file for TUI (`tui-preferences.jsonc`), JSON state file for TUI sidebar IPC at `$TMPDIR/opencode-anthropic-auth/`
+**Storage:** Sidecar JSON files for config + credential/quota state (separate files to avoid config overwrite), a cross-process locked `anthropic-auth-routing-state.json` containing hashed sticky session assignments, JSONC preferences for the TUI (`tui-preferences.jsonc`), JSON state for TUI sidebar IPC at `$TMPDIR/opencode-anthropic-auth/`, and an auto-sweeping dump directory for request payloads capped at 512MB by default.
 
-**Security:** OAuth tokens stored in sidecar state file (separate from config); relay uses shared secret token; RPC server uses bearer token; token refresh uses file locks to prevent races; no secrets stored in git
+**Security:** OAuth tokens are stored in the sidecar state file (separate from config); sticky routing stores only SHA-256 session hashes, account IDs, quota timestamps, and initial input byte counts; relay uses a shared secret token; RPC server uses a bearer token; token refresh and configuration/routing writes use file locks to prevent races and concurrent write loss; no secrets are stored in git

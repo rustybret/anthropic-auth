@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   acquireRefreshFileLock,
+  type OAuthQuotaSnapshot,
   QuotaManager,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -48,6 +49,49 @@ describe('QuotaManager', () => {
       now: () => now,
     })
   }
+
+  describe('model-scoped staleness', () => {
+    test('treats a stale matching Fable window as stale even when standard windows are fresh', () => {
+      const qm = createQM()
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'fallback-refresh',
+          expires: now + 60_000,
+          quota: {
+            checkedAt: now,
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+            seven_day: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: now - 6 * 60_000,
+              },
+            ],
+          },
+        },
+      ])
+
+      expect(qm.isFallbackStale('fallback-1', 'fallback-token')).toBe(false)
+      expect(
+        qm.isFallbackStale('fallback-1', 'fallback-token', 'claude-fable-5'),
+      ).toBe(true)
+    })
+  })
 
   describe('cross-process quota locks', () => {
     test('fallback quota refresh does not call the API while another process holds the account lock', async () => {
@@ -822,6 +866,292 @@ describe('QuotaManager', () => {
       expect(quotaA.five_hour?.usedPercent).not.toBe(
         quotaB.five_hour?.usedPercent,
       )
+    })
+  })
+
+  describe('header pushes', () => {
+    function headerSnapshot(checkedAt = now): OAuthQuotaSnapshot {
+      return {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt,
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt,
+        },
+        bindingWindow: 'five_hour',
+        bindingWindowSource: 'headers',
+        fallbackAdvised: true,
+        source: 'headers',
+        checkedAt,
+      }
+    }
+
+    test('header push always replaces main five_hour and seven_day regardless of cached checkedAt', () => {
+      const qm = createQM()
+      qm.setMain('token', {
+        quota: {
+          five_hour: {
+            usedPercent: 1,
+            remainingPercent: 99,
+            checkedAt: now + 10_000,
+          },
+          seven_day: {
+            usedPercent: 2,
+            remainingPercent: 98,
+            checkedAt: now + 10_000,
+          },
+          checkedAt: now + 10_000,
+        },
+        checkedAt: now + 10_000,
+        refreshAfter: now + 20_000,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect(pushed.quota.five_hour?.usedPercent).toBe(78)
+      expect(pushed.quota.seven_day?.usedPercent).toBe(40)
+    })
+
+    test('header push preserves a non-empty scoped poll snapshot', () => {
+      const qm = createQM()
+      const scoped = [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 15,
+          remainingPercent: 85,
+          checkedAt: 100,
+        },
+      ]
+      qm.setMain('token', {
+        quota: { scoped, checkedAt: 100, source: 'poll' },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      expect(
+        qm.pushMainFromHeaders('token', headerSnapshot()).quota.scoped,
+      ).toEqual(scoped)
+    })
+
+    test('header push preserves present empty scoped array', () => {
+      const qm = createQM()
+      qm.setMain('token', {
+        quota: { scoped: [], checkedAt: 100, source: 'poll' },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect('scoped' in pushed.quota).toBe(true)
+      expect(pushed.quota.scoped).toEqual([])
+    })
+
+    test('header push preserves extraUsage and poll bindingWindow', () => {
+      const qm = createQM()
+      const extraUsage = {
+        used: { amountMinor: 10035, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        exhausted: true,
+      }
+      qm.setMain('token', {
+        quota: {
+          extraUsage,
+          bindingWindow: 'claude-weekly-scoped-fable',
+          bindingWindowSource: 'poll',
+          checkedAt: 100,
+          source: 'poll',
+        },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect(pushed.quota.extraUsage).toEqual(extraUsage)
+      expect(pushed.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
+      expect(pushed.quota.bindingWindowSource).toBe('poll')
+    })
+
+    test('poll completion preserves newer header windows while adding scoped limits', async () => {
+      let resolvePoll!: (response: Response) => void
+      let markPollStarted!: () => void
+      const pollStarted = new Promise<void>((resolve) => {
+        markPollStarted = resolve
+      })
+      const fetchMock = mock(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolvePoll = resolve
+            markPollStarted()
+          }),
+      ) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      const refresh = qm.refreshMain('token')
+
+      await pollStarted
+      qm.pushMainFromHeaders('token', headerSnapshot(now + 1_000))
+      resolvePoll(
+        Response.json({
+          five_hour: { utilization: 25 },
+          seven_day: { utilization: 50 },
+          limits: [
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 15,
+              scope: { model: { id: null, display_name: 'Fable' } },
+            },
+          ],
+        }),
+      )
+      await refresh
+
+      const quota = qm.getMain('token')?.quota
+      expect(quota?.five_hour?.usedPercent).toBe(78)
+      expect(quota?.seven_day?.usedPercent).toBe(40)
+      expect(quota?.scoped?.[0]).toMatchObject({
+        modelName: 'Fable',
+        usedPercent: 15,
+      })
+    })
+
+    test('fallback header push updates only the named account', () => {
+      const qm = createQM()
+      qm.setFallback('other', {
+        quota: { checkedAt: 100 },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      qm.pushFallbackFromHeaders('target', 'target-token', headerSnapshot())
+
+      expect(qm.getFallback('target')?.quota.five_hour?.usedPercent).toBe(78)
+      expect(qm.getFallback('other')?.quota.checkedAt).toBe(100)
+    })
+
+    test('header push binds main and fallback entries to the supplied token fingerprint', () => {
+      const qm = createQM()
+
+      qm.pushMainFromHeaders('main-token', headerSnapshot())
+      qm.pushFallbackFromHeaders('fallback', 'fallback-token', headerSnapshot())
+
+      expect(qm.getMain('different-token')).toBeNull()
+      expect(qm.getFallback('fallback', 'different-token')).toBeNull()
+    })
+
+    test('header checkedAt moves refreshAfter through getQuotaNextRefreshAt', () => {
+      const qm = createQM()
+      const pushed = qm.pushMainFromHeaders(
+        'token',
+        headerSnapshot(now + 5_000),
+      )
+
+      expect(pushed.checkedAt).toBe(now + 5_000)
+      expect(pushed.refreshAfter).toBeGreaterThan(pushed.checkedAt)
+    })
+
+    test('partial header push stays due at the oldest preserved window staleness point', () => {
+      const intervalMs = 5 * 60_000
+      const qm = new QuotaManager({
+        storage: { version: 1, accounts: [], quota: { enabled: true } },
+        now: () => now,
+      })
+      qm.setMain('token', {
+        quota: {
+          seven_day: {
+            usedPercent: 40,
+            remainingPercent: 60,
+            checkedAt: now - intervalMs + 1_000,
+          },
+          source: 'poll',
+          checkedAt: now - intervalMs + 1_000,
+        },
+        checkedAt: now - intervalMs + 1_000,
+        refreshAfter: now + 1_000,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: now,
+        },
+        source: 'headers',
+        checkedAt: now,
+      })
+
+      expect(pushed.quota.seven_day?.checkedAt).toBe(now - intervalMs + 1_000)
+      expect(pushed.refreshAfter).toBe(now + 1_000)
+    })
+
+    test('header pushes stay due at the oldest preserved scoped window staleness point', () => {
+      const intervalMs = 5 * 60_000
+      const qm = new QuotaManager({
+        storage: { version: 1, accounts: [], quota: { enabled: true } },
+        now: () => now,
+      })
+      qm.setMain('token', {
+        quota: {
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 70,
+              remainingPercent: 30,
+              checkedAt: now - intervalMs + 1_000,
+            },
+          ],
+          source: 'poll',
+          checkedAt: now - intervalMs + 1_000,
+        },
+        checkedAt: now - intervalMs + 1_000,
+        refreshAfter: now + 1_000,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect(pushed.quota.scoped?.[0]?.checkedAt).toBe(now - intervalMs + 1_000)
+      expect(pushed.refreshAfter).toBe(now + 1_000)
+    })
+
+    test('legacy unbound main quota is not merged into a newly bound header push', () => {
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: {
+            mainQuota: {
+              scoped: [
+                {
+                  id: 'legacy-scope',
+                  title: 'Legacy scope',
+                  modelName: 'Legacy',
+                  usedPercent: 90,
+                  remainingPercent: 10,
+                  checkedAt: now - 1_000,
+                },
+              ],
+              source: 'poll',
+              checkedAt: now - 1_000,
+            },
+            mainQuotaCheckedAt: now - 1_000,
+          },
+        },
+        now: () => now,
+      })
+
+      const pushed = qm.pushMainFromHeaders('new-token', headerSnapshot())
+
+      expect(pushed.quota.scoped).toBeUndefined()
+      expect(pushed.quota.five_hour?.usedPercent).toBe(78)
     })
   })
 })

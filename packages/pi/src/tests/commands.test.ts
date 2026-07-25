@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { CacheKeepSessionRegistry } from '@cortexkit/anthropic-auth-core'
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -9,11 +11,14 @@ import type {
 import { registerCommands } from '../commands'
 
 const ENV_KEY = 'PI_ANTHROPIC_AUTH_FILE'
+const CACHEKEEP_REGISTRY_ENV_KEY = 'PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR'
+const ROUTING_STATE_ENV_KEY = 'PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE'
 
 function mockNotify(): { ctx: ExtensionCommandContext; notified: string[] } {
   const notified: string[] = []
   const ctx = {
     ui: { notify: (msg: string) => notified.push(msg) },
+    sessionManager: { getSessionId: () => 'pi-session-1' },
   } as unknown as ExtensionCommandContext
   return { ctx, notified }
 }
@@ -50,10 +55,14 @@ beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'pi-commands-test-'))
   accountPath = join(tempDir, 'anthropic-auth.json')
   process.env[ENV_KEY] = accountPath
+  process.env[CACHEKEEP_REGISTRY_ENV_KEY] = join(tempDir, 'cachekeep-registry')
+  process.env[ROUTING_STATE_ENV_KEY] = join(tempDir, 'routing-state.json')
 })
 
 afterEach(async () => {
   delete process.env[ENV_KEY]
+  delete process.env[CACHEKEEP_REGISTRY_ENV_KEY]
+  delete process.env[ROUTING_STATE_ENV_KEY]
   await rm(tempDir, { recursive: true, force: true })
 })
 
@@ -264,5 +273,109 @@ describe('claude-logging persistence', () => {
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.logging?.level).toBe('warn')
+  })
+})
+
+describe('claude-cachekeep status', () => {
+  test('lists tracked sessions from all live Pi instances', async () => {
+    const registryDirectory = process.env[CACHEKEEP_REGISTRY_ENV_KEY]
+    if (!registryDirectory)
+      throw new Error('missing cachekeep registry directory')
+    const registry = new CacheKeepSessionRegistry({
+      directory: registryDirectory,
+      instanceId: 'other-pi-instance',
+    })
+    const cacheExpiresAt = Date.now() + 60 * 60_000
+    await registry.publish([
+      {
+        id: 'pi-session-1',
+        cacheExpiresAt,
+        nextPrewarmAt: cacheExpiresAt - 5 * 60_000,
+      },
+    ])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, startHour: 0, endHour: 23 },
+      }),
+      'utf8',
+    )
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-cachekeep')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('', ctx)
+
+    expect(notified[0]).toContain('Tracked sessions: 1')
+    expect(notified[0]).toContain('Sessions:\n- pi-session-1')
+  })
+
+  test('persists and reports the always schedule', async () => {
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-cachekeep')?.handler
+    const { ctx, notified } = mockNotify()
+
+    await handler!('always', ctx)
+
+    expect(notified[0]).toContain(
+      'Schedule: always (while this process is running)',
+    )
+    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(storage.cacheKeep).toEqual({ enabled: true, always: true })
+  })
+})
+
+describe('claude-routing persistence', () => {
+  test('reset clears the current Pi session assignment without changing mode', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+      }),
+      'utf8',
+    )
+    const routingPath = process.env[ROUTING_STATE_ENV_KEY]
+    if (!routingPath) throw new Error('missing routing state path')
+    const key = createHash('sha256').update('pi-session-1').digest('hex')
+    const now = Date.now()
+    await writeFile(
+      routingPath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: now,
+        assignments: {
+          [key]: {
+            accountId: 'main',
+            family: 'general',
+            assignedAt: now,
+            lastSeenAt: now,
+            initialInputBytes: 1,
+            quotaCheckedAt: 1,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-routing')?.handler
+    const { ctx, notified } = mockNotify()
+    await handler!('reset', ctx)
+
+    expect(notified[0]).toContain('Claude Routing Assignment Reset')
+    const state = JSON.parse(await readFile(routingPath, 'utf8'))
+    expect(state.assignments).toEqual({})
+    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(storage.routing).toEqual({ mode: 'sticky-balanced' })
   })
 })

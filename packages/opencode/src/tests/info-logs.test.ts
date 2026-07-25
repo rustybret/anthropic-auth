@@ -283,9 +283,17 @@ describe('setting-change INFO logs', () => {
     expect(
       capturedRecords.filter((r) => r.channel === 'commands'),
     ).toHaveLength(1)
-    const rec = findCommandsLog('cachekeep enabled changed')
+    const rec = findCommandsLog('cachekeep schedule changed')
     expect(rec).toBeDefined()
-    expect(rec!.payload).toEqual({ enabled: true })
+    expect(rec!.payload).toEqual({ schedule: '9-17' })
+  })
+
+  test('cachekeep always emits info log', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-cachekeep', 'always')
+    const rec = findCommandsLog('cachekeep schedule changed')
+    expect(rec?.payload).toEqual({ schedule: 'always' })
   })
 
   test('cachekeep off emits info log', async () => {

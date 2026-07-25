@@ -9,6 +9,95 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 describe('quota summaries', () => {
+  test('malformed money metadata falls back without throwing', () => {
+    const summary = buildClaudeQuotaSummary({
+      accounts: [
+        {
+          name: 'malformed',
+          role: 'main',
+          quota: {
+            extraUsage: {
+              used: { amountMinor: 10035, currency: 'ZZZZ', exponent: 50 },
+              limit: { amountMinor: 10000, currency: 'ZZZZ', exponent: 50 },
+              exhausted: false,
+            },
+          },
+        },
+      ],
+    })
+
+    expect(summary).toContain('credits 10035 ZZZZ/10000 ZZZZ')
+  })
+
+  test('claude quota shows Team tier exhausted credits binding marker and fallback advice', () => {
+    const summary = buildClaudeQuotaSummary({
+      accounts: [
+        {
+          name: 'work',
+          role: 'fallback',
+          tierLabel: 'Team · Max 5x',
+          quota: {
+            five_hour: {
+              usedPercent: 78,
+              remainingPercent: 22,
+              checkedAt: 100,
+            },
+            seven_day: {
+              usedPercent: 40,
+              remainingPercent: 60,
+              checkedAt: 100,
+            },
+            extraUsage: {
+              used: { amountMinor: 10035, currency: 'USD', exponent: 2 },
+              limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+              exhausted: true,
+            },
+            bindingWindow: 'five_hour',
+            bindingWindowSource: 'poll',
+            fallbackAdvised: true,
+          },
+        },
+      ],
+      now: 100,
+    })
+
+    expect(summary).toContain('Team · Max 5x')
+    expect(summary).toContain('credits $100.35/$100.00 · exhausted')
+    expect(summary).toContain('5h:')
+    expect(summary).toContain('•')
+    expect(summary).toContain('→ fallback advised')
+  })
+
+  test('claude quota omits credits and advice for disabled personal capture', () => {
+    const summary = buildClaudeQuotaSummary({
+      accounts: [
+        {
+          name: 'personal',
+          role: 'main',
+          tierLabel: 'Max 20x',
+          quota: {
+            five_hour: {
+              usedPercent: 3,
+              remainingPercent: 97,
+              checkedAt: 100,
+            },
+            seven_day: {
+              usedPercent: 12,
+              remainingPercent: 88,
+              checkedAt: 100,
+            },
+            fallbackAdvised: false,
+          },
+        },
+      ],
+      now: 100,
+    })
+
+    expect(summary).toContain('Max 20x')
+    expect(summary).not.toContain('credits')
+    expect(summary).not.toContain('fallback advised')
+  })
+
   test('formats main and fallback quota windows', () => {
     const now = Date.parse('2026-04-28T12:00:00.000Z')
     const summary = buildClaudeQuotaSummary({

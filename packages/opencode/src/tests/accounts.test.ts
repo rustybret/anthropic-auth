@@ -19,7 +19,9 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
+  fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
+  formatOAuthAccountTier,
   getAccountStatePath,
   getCache1hPersistentMode,
   getLogLevel,
@@ -33,7 +35,10 @@ import {
   killswitchPassesPolicy,
   loadAccounts,
   type OAuthAccount,
+  type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
+  oauthProfileIsFresh,
+  PROFILE_TTL_MS,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -44,10 +49,12 @@ import {
   reorderAccountsPersistent,
   saveAccountState,
   saveAccounts,
+  saveOAuthProfileState,
   setAccountEnabled,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setCacheKeepPersistentAlways,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
@@ -55,6 +62,7 @@ import {
   setLogLevel,
   setLogLevelPersistent,
   shouldFallbackStatus,
+  tokenFingerprint,
   upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -146,6 +154,332 @@ afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })
   mock.restore()
+})
+
+describe('OAuth account profiles', () => {
+  const mainCapture = {
+    account: { has_claude_max: true },
+    organization: {
+      organization_type: 'claude_max',
+      rate_limit_tier: 'default_claude_max_20x',
+    },
+  }
+  const teamCapture = {
+    account: { has_claude_max: false },
+    organization: {
+      organization_type: 'claude_team',
+      rate_limit_tier: 'default_claude_max_5x',
+      seat_tier: 'team_tier_1',
+    },
+  }
+
+  async function fetchProfile(capture: unknown) {
+    return fetchOAuthAccountProfile({
+      accessToken: 'token',
+      now: () => 1234,
+      fetchImpl: (async () =>
+        Response.json(capture)) as unknown as typeof fetch,
+    })
+  }
+
+  test('fetchOAuthAccountProfile normalizes the personal Max 20x capture', async () => {
+    const profile = await fetchProfile(mainCapture)
+
+    expect(profile).toEqual({
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 1234,
+      tokenFingerprint: tokenFingerprint('token'),
+    })
+    expect(formatOAuthAccountTier(profile)).toBe('Max 20x')
+  })
+
+  test('fetchOAuthAccountProfile normalizes the Team Max-5x capture', async () => {
+    const profile = await fetchProfile(teamCapture)
+
+    expect(profile).toEqual({
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 1234,
+      tokenFingerprint: tokenFingerprint('token'),
+    })
+    expect(formatOAuthAccountTier(profile)).toBe('Team · Max 5x')
+  })
+
+  test('fetchOAuthAccountProfile rejects blank account metadata', async () => {
+    await expect(
+      fetchProfile({
+        organization: {
+          organization_type: '   ',
+          rate_limit_tier: '',
+        },
+      }),
+    ).rejects.toThrow('missing account metadata')
+  })
+
+  test('profile freshness expires at seven days', () => {
+    const profile: OAuthAccountProfile = {
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 100,
+    }
+
+    expect(
+      oauthProfileIsFresh(profile, profile.checkedAt + PROFILE_TTL_MS - 1),
+    ).toBe(true)
+    expect(
+      oauthProfileIsFresh(profile, profile.checkedAt + PROFILE_TTL_MS),
+    ).toBe(false)
+  })
+
+  test('dedicated main and scoped fallback profiles survive sidecar load', async () => {
+    const storage = baseStorage()
+    const mainProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 100,
+    }
+    const fallbackProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 200,
+    }
+    storage.main = { ...storage.main!, profile: mainProfile }
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      refresh: 'refresh',
+      profile: fallbackProfile,
+    })
+
+    await saveAccounts(storage, accountPath)
+    await saveAccountState(storage, accountPath, { mainProfile: true })
+    const loaded = await loadAccounts(accountPath)
+
+    expect(loaded?.main?.profile).toEqual(mainProfile)
+    expect(expectOAuthAccount(loaded?.accounts[0]).profile).toEqual(
+      fallbackProfile,
+    )
+  })
+
+  test('profile runtime fields are omitted from anthropic-auth.json', async () => {
+    const storage = baseStorage()
+    storage.main = {
+      ...storage.main!,
+      profile: { tier: 'tier', orgType: 'org', checkedAt: 100 },
+    }
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      refresh: 'refresh',
+      profile: { tier: 'tier', orgType: 'org', checkedAt: 100 },
+    })
+
+    await saveAccounts(storage, accountPath)
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+
+    expect(config.main.profile).toBeUndefined()
+    expect(config.accounts[0].profile).toBeUndefined()
+  })
+
+  test('re-login does not retain a previous account profile', () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      refresh: 'old',
+      profile: { tier: 'old', orgType: 'old', checkedAt: 100 },
+    })
+
+    upsertAccount(storage, { id: 'work', type: 'oauth', refresh: 'new' })
+
+    expect(expectOAuthAccount(storage.accounts[0]).profile).toBeUndefined()
+  })
+
+  test('runtime merge clears a fallback profile when OAuth credentials rotate', async () => {
+    const initial = baseStorage()
+    initial.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      profile: {
+        tier: 'old-tier',
+        orgType: 'claude_team',
+        checkedAt: 100,
+        tokenFingerprint: tokenFingerprint('old-access'),
+      },
+    })
+    await saveAccounts(initial, accountPath)
+
+    const rotated = baseStorage()
+    rotated.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'new-access',
+      refresh: 'new-refresh',
+    })
+    await saveAccounts(rotated, accountPath)
+
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
+        .profile,
+    ).toBeUndefined()
+  })
+
+  test('runtime merge keeps a fallback profile when OAuth credentials match', async () => {
+    const profile: OAuthAccountProfile = {
+      tier: 'same-tier',
+      orgType: 'claude_team',
+      checkedAt: 100,
+      tokenFingerprint: tokenFingerprint('same-access'),
+    }
+    const initial = baseStorage()
+    initial.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'same-access',
+      refresh: 'same-refresh',
+      profile,
+    })
+    await saveAccounts(initial, accountPath)
+
+    const sameCredentials = baseStorage()
+    sameCredentials.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'same-access',
+      refresh: 'same-refresh',
+    })
+    await saveAccounts(sameCredentials, accountPath)
+
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
+        .profile,
+    ).toEqual(profile)
+  })
+
+  test('delayed main profile clear preserves a newer profile for the same token', async () => {
+    const accessToken = 'main-access'
+    const expectedTokenFingerprint = tokenFingerprint(accessToken)
+    const staleProfile: OAuthAccountProfile = {
+      tier: 'old-tier',
+      orgType: 'old-org',
+      checkedAt: 100,
+      tokenFingerprint: tokenFingerprint('old-main-access'),
+    }
+    const freshProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 200,
+      tokenFingerprint: expectedTokenFingerprint,
+    }
+    const storage = baseStorage()
+    storage.main = { ...storage.main!, profile: staleProfile }
+    await saveAccounts(storage, accountPath)
+    await saveAccountState(storage, accountPath, { mainProfile: true })
+
+    const processAView = await loadAccounts(accountPath)
+    expect(processAView?.main?.profile).toEqual(staleProfile)
+    expect(
+      await saveOAuthProfileState(
+        {
+          accountId: 'main',
+          profile: undefined,
+          expectedTokenFingerprint,
+        },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect(
+      await saveOAuthProfileState(
+        {
+          accountId: 'main',
+          profile: freshProfile,
+          expectedTokenFingerprint,
+        },
+        accountPath,
+      ),
+    ).toBe(true)
+
+    const clearAccepted = await saveOAuthProfileState(
+      {
+        accountId: 'main',
+        profile: undefined,
+        expectedTokenFingerprint,
+      },
+      accountPath,
+    )
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual(
+      freshProfile,
+    )
+    expect(clearAccepted).toBe(false)
+  })
+
+  test('delayed fallback profile clear preserves a newer profile for the same token', async () => {
+    const accessToken = 'fallback-access'
+    const expectedTokenFingerprint = tokenFingerprint(accessToken)
+    const staleProfile: OAuthAccountProfile = {
+      tier: 'old-tier',
+      orgType: 'old-org',
+      checkedAt: 100,
+      tokenFingerprint: tokenFingerprint('old-fallback-access'),
+    }
+    const freshProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 200,
+      tokenFingerprint: expectedTokenFingerprint,
+    }
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: accessToken,
+      refresh: 'refresh',
+      profile: staleProfile,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const processAView = await loadAccounts(accountPath)
+    expect(expectOAuthAccount(processAView?.accounts[0]).profile).toEqual(
+      staleProfile,
+    )
+    expect(
+      await saveOAuthProfileState(
+        {
+          accountId: 'work',
+          profile: undefined,
+          expectedTokenFingerprint,
+        },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect(
+      await saveOAuthProfileState(
+        {
+          accountId: 'work',
+          profile: freshProfile,
+          expectedTokenFingerprint,
+        },
+        accountPath,
+      ),
+    ).toBe(true)
+
+    const clearAccepted = await saveOAuthProfileState(
+      {
+        accountId: 'work',
+        profile: undefined,
+        expectedTokenFingerprint,
+      },
+      accountPath,
+    )
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
+        .profile,
+    ).toEqual(freshProfile)
+    expect(clearAccepted).toBe(false)
+  })
 })
 
 describe('isCostZeroingEnabled', () => {
@@ -423,6 +757,33 @@ describe('account storage', () => {
     expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(22)
   })
 
+  test('generic saves preserve a newer persisted main profile', async () => {
+    const staleStorage = baseStorage()
+    await saveAccounts(staleStorage)
+
+    const hydratedStorage = await loadAccounts()
+    expect(hydratedStorage).not.toBeNull()
+    ;(hydratedStorage as AccountStorage).main = {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: {
+        tier: 'default_claude_max_20x',
+        orgType: 'claude_max',
+        checkedAt: 500,
+        tokenFingerprint: tokenFingerprint('main-access'),
+      },
+    }
+    await saveAccountState(hydratedStorage as AccountStorage, accountPath, {
+      mainProfile: true,
+    })
+
+    await saveAccounts(staleStorage)
+
+    expect((await loadAccounts())?.main?.profile).toEqual(
+      hydratedStorage?.main?.profile,
+    )
+  })
+
   test('runtime state saves do not overwrite newer quota snapshots', async () => {
     const storage = baseStorage()
     storage.quota = {
@@ -501,7 +862,387 @@ describe('account storage', () => {
     expect(account.lastQuotaRefreshError).toBeUndefined()
   })
 
-  test('runtime state saves can update refreshed tokens without downgrading quota', async () => {
+  test('equal-time stale saves do not overwrite a harvested header snapshot', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: 500,
+        },
+      },
+    })
+    await saveAccounts(storage)
+    const harvestedView = await loadAccounts()
+    const staleMarkUsedView = await loadAccounts()
+    expect(harvestedView).not.toBeNull()
+    expect(staleMarkUsedView).not.toBeNull()
+    const harvested = expectOAuthAccount(harvestedView?.accounts[0])
+    harvested.quota = {
+      five_hour: {
+        usedPercent: 78,
+        remainingPercent: 22,
+        checkedAt: 500,
+      },
+      source: 'headers',
+      checkedAt: 500,
+    }
+    expectOAuthAccount(staleMarkUsedView?.accounts[0]).lastUsed = 501
+
+    await saveAccountState(harvestedView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+    await saveAccountState(staleMarkUsedView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota?.source).toBe('headers')
+    expect(account.quota?.five_hour?.usedPercent).toBe(78)
+    expect(account.lastUsed).toBe(501)
+  })
+
+  test('equal-time poll replaces headers and keeps scoped quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: 500,
+        },
+        source: 'headers',
+        checkedAt: 500,
+      },
+    })
+    await saveAccounts(storage)
+    const pollView = await loadAccounts()
+    const pollAccount = expectOAuthAccount(pollView?.accounts[0])
+    pollAccount.quota = {
+      five_hour: {
+        usedPercent: 79,
+        remainingPercent: 21,
+        checkedAt: 500,
+      },
+      scoped: [
+        {
+          id: 'weekly-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 500,
+        },
+      ],
+      source: 'poll',
+      checkedAt: 500,
+    }
+
+    await saveAccountState(pollView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota?.source).toBe('poll')
+    expect(account.quota?.scoped?.[0]?.id).toBe('weekly-fable')
+  })
+
+  test('equal-time header snapshot can replace another header snapshot', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: 500,
+        },
+        source: 'headers',
+        checkedAt: 500,
+      },
+    })
+    await saveAccounts(storage)
+    const nextHeaderView = await loadAccounts()
+    const nextHeader = expectOAuthAccount(nextHeaderView?.accounts[0])
+    nextHeader.quota = {
+      five_hour: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        checkedAt: 500,
+      },
+      source: 'headers',
+      checkedAt: 500,
+    }
+
+    await saveAccountState(nextHeaderView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    expect(
+      expectOAuthAccount(loaded?.accounts[0]).quota?.five_hour?.usedPercent,
+    ).toBe(80)
+  })
+
+  test('main equal-time poll beats headers and source-less saves', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: 500,
+        },
+        source: 'headers',
+        checkedAt: 500,
+      },
+      mainQuotaCheckedAt: 500,
+      mainQuotaToken: 'token',
+    }
+    await saveAccounts(storage)
+    const pollView = await loadAccounts()
+    const sourceLessView = await loadAccounts()
+    expect(pollView).not.toBeNull()
+    expect(sourceLessView).not.toBeNull()
+    ;(pollView as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 79,
+        remainingPercent: 21,
+        checkedAt: 500,
+      },
+      scoped: [
+        {
+          id: 'weekly-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 500,
+        },
+      ],
+      source: 'poll',
+      checkedAt: 500,
+    }
+    ;(sourceLessView as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 1,
+        remainingPercent: 99,
+        checkedAt: 500,
+      },
+      checkedAt: 500,
+    }
+
+    await saveAccountState(pollView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+    await saveAccountState(sourceLessView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+
+    const loaded = await loadAccounts()
+    expect(loaded?.quota?.mainQuota?.source).toBe('poll')
+    expect(loaded?.quota?.mainQuota?.scoped?.[0]?.id).toBe('weekly-fable')
+  })
+
+  test('fallback header persistence preserves newer poll-owned fields from disk', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        scoped: [
+          {
+            id: 'weekly-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 40,
+            remainingPercent: 60,
+            checkedAt: 900,
+          },
+        ],
+        extraUsage: {
+          used: { amountMinor: 500, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 1000, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+        bindingWindow: 'weekly-fable',
+        bindingWindowSource: 'poll',
+        source: 'poll',
+        checkedAt: 600,
+      },
+    })
+    await saveAccounts(storage)
+    const staleHeaderView = await loadAccounts()
+    const account = expectOAuthAccount(staleHeaderView?.accounts[0])
+    account.quota = {
+      five_hour: {
+        usedPercent: 78,
+        remainingPercent: 22,
+        checkedAt: 700,
+      },
+      seven_day: {
+        usedPercent: 40,
+        remainingPercent: 60,
+        checkedAt: 700,
+      },
+      scoped: [],
+      fallbackAdvised: true,
+      bindingWindow: 'five_hour',
+      bindingWindowSource: 'headers',
+      source: 'headers',
+      checkedAt: 700,
+    }
+
+    await saveAccountState(staleHeaderView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const merged = expectOAuthAccount(loaded?.accounts[0]).quota
+    expect(merged?.five_hour?.usedPercent).toBe(78)
+    expect(merged?.seven_day?.usedPercent).toBe(40)
+    expect(merged?.scoped?.[0]?.id).toBe('weekly-fable')
+    expect(merged?.extraUsage?.used.amountMinor).toBe(500)
+    expect(merged?.bindingWindow).toBe('weekly-fable')
+    expect(merged?.bindingWindowSource).toBe('poll')
+  })
+
+  test('main header persistence preserves newer poll-owned fields from disk', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        scoped: [
+          {
+            id: 'weekly-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 40,
+            remainingPercent: 60,
+            checkedAt: 900,
+          },
+        ],
+        extraUsage: {
+          used: { amountMinor: 500, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 1000, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+        bindingWindow: 'weekly-fable',
+        bindingWindowSource: 'poll',
+        source: 'poll',
+        checkedAt: 600,
+      },
+      mainQuotaToken: 'same-token',
+    }
+    await saveAccounts(storage)
+    const staleHeaderView = await loadAccounts()
+    ;(staleHeaderView as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 78,
+        remainingPercent: 22,
+        checkedAt: 700,
+      },
+      seven_day: {
+        usedPercent: 40,
+        remainingPercent: 60,
+        checkedAt: 700,
+      },
+      scoped: [],
+      source: 'headers',
+      checkedAt: 700,
+    }
+    ;(staleHeaderView as AccountStorage).quota!.mainQuotaCheckedAt = 700
+
+    await saveAccountState(staleHeaderView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+
+    const loaded = await loadAccounts()
+    expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(78)
+    expect(loaded?.quota?.mainQuota?.scoped?.[0]?.id).toBe('weekly-fable')
+    expect(loaded?.quota?.mainQuota?.extraUsage?.used.amountMinor).toBe(500)
+    expect(loaded?.quota?.mainQuota?.bindingWindow).toBe('weekly-fable')
+  })
+
+  test('fallback token rotation never rebinds the previous token quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+      lastRefreshedAt: 100,
+      quota: {
+        five_hour: {
+          usedPercent: 80,
+          remainingPercent: 20,
+          checkedAt: 500,
+        },
+        source: 'poll',
+        checkedAt: 500,
+      },
+    })
+    await saveAccounts(storage)
+    const rotatedView = await loadAccounts()
+    const rotated = expectOAuthAccount(rotatedView?.accounts[0])
+    rotated.access = 'new-access'
+    rotated.refresh = 'new-refresh'
+    rotated.lastRefreshedAt = 600
+    rotated.quota = {
+      five_hour: {
+        usedPercent: 5,
+        remainingPercent: 95,
+        checkedAt: 100,
+      },
+      source: 'headers',
+      checkedAt: 100,
+    }
+    expect(rotated.access).not.toBe('old-access')
+
+    await saveAccountState(rotatedView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.access).toBe('new-access')
+    expect(account.quota?.five_hour?.usedPercent).toBe(5)
+    expect(account.quota?.source).toBe('headers')
+  })
+
+  test('runtime token updates drop source-less quota passthrough', async () => {
     const storage = baseStorage()
     storage.accounts.push({
       id: 'fallback-1',
@@ -536,6 +1277,10 @@ describe('account storage', () => {
         },
       },
     }
+    expect(
+      expectOAuthAccount((refreshedRuntimeView as AccountStorage).accounts[0])
+        .access,
+    ).not.toBe('old-access')
 
     await saveAccountState(
       refreshedRuntimeView as AccountStorage,
@@ -550,7 +1295,7 @@ describe('account storage', () => {
     expect(account.access).toBe('new-access')
     expect(account.refresh).toBe('new-refresh')
     expect(account.lastRefreshedAt).toBe(600)
-    expect(account.quota?.five_hour?.usedPercent).toBe(20)
+    expect(account.quota).toBeUndefined()
   })
 
   test('malformed config file throws a clear error', async () => {
@@ -889,14 +1634,33 @@ describe('account storage', () => {
     const storage = await setCacheKeepPersistentWindow(9, 23)
     expect(storage.cacheKeep).toEqual({
       enabled: true,
+      always: false,
       startHour: 9,
       endHour: 23,
     })
     const disabled = await setCacheKeepPersistentEnabled(false)
     expect(disabled.cacheKeep).toEqual({
       enabled: false,
+      always: false,
       startHour: 9,
       endHour: 23,
+    })
+  })
+
+  test('persists cacheKeep always mode, preserves subagents, and clears the old window', async () => {
+    await setCacheKeepSubagentsEnabled(true)
+    const windowed = await setCacheKeepPersistentWindow(9, 23)
+    expect(windowed.cacheKeep?.subagents).toBe(true)
+    const storage = await setCacheKeepPersistentAlways()
+    expect(storage.cacheKeep).toEqual({
+      enabled: true,
+      always: true,
+      subagents: true,
+    })
+    expect((await loadAccounts())?.cacheKeep).toEqual({
+      enabled: true,
+      always: true,
+      subagents: true,
     })
   })
 
@@ -3592,6 +4356,79 @@ describe('setAccountEnabled', () => {
 })
 
 // -- Persistent round-trip tests -----------------------------------------------
+
+describe('multi-account persistence', () => {
+  test('a stale full snapshot cannot delete a newer account from config or state', async () => {
+    const current = baseStorage()
+    current.accounts.push({
+      id: 'umut',
+      label: 'umut',
+      type: 'oauth',
+      access: 'umut-access',
+      refresh: 'umut-refresh',
+    })
+    await saveAccounts(current, accountPath)
+
+    const stale = baseStorage()
+    stale.accounts.push({
+      id: 'yiyi',
+      label: 'yiyi',
+      type: 'oauth',
+      access: 'yiyi-access',
+      refresh: 'yiyi-refresh',
+    })
+    await saveAccounts(stale, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts.map((account) => account.id)).toEqual([
+      'umut',
+      'yiyi',
+    ])
+    expect(
+      expectOAuthAccount(
+        loaded?.accounts.find((account) => account.id === 'umut'),
+      ).refresh,
+    ).toBe('umut-refresh')
+    expect(
+      expectOAuthAccount(
+        loaded?.accounts.find((account) => account.id === 'yiyi'),
+      ).refresh,
+    ).toBe('yiyi-refresh')
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(Object.keys(state.accounts)).toEqual(['umut', 'yiyi'])
+  })
+
+  test('concurrent account additions preserve both accounts', async () => {
+    await Promise.all([
+      addAccountPersistent(
+        {
+          id: 'first',
+          label: 'first',
+          type: 'oauth',
+          refresh: 'first-refresh',
+        },
+        accountPath,
+      ),
+      addAccountPersistent(
+        {
+          id: 'second',
+          label: 'second',
+          type: 'oauth',
+          refresh: 'second-refresh',
+        },
+        accountPath,
+      ),
+    ])
+
+    const loaded = await loadAccounts(accountPath)
+    expect(new Set(loaded?.accounts.map((account) => account.id))).toEqual(
+      new Set(['first', 'second']),
+    )
+  })
+})
 
 describe('removeAccountPersistent', () => {
   test('persists removal across load', async () => {

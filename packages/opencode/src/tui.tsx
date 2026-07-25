@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { formatQuotaMoney } from '@cortexkit/anthropic-auth-core'
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -237,6 +238,7 @@ function QuotaRow(props: {
   label: string
   window: { usedPercent: number; resetsAt?: string } | undefined
   pacing: QuotaPacing | null
+  binding?: boolean
 }) {
   const used = () => props.window?.usedPercent ?? 0
   const reset = () => formatResetIn(props.window?.resetsAt)
@@ -275,7 +277,7 @@ function QuotaRow(props: {
           <text
             fg={toneColor(props.theme, usageTone(used(), props.appearance))}
           >
-            {` ${String(Math.round(used())).padStart(3)}%`}
+            {` ${String(Math.round(used())).padStart(3)}%${props.binding ? ' •' : ''}`}
           </text>
         </box>
         <Show when={reset()}>
@@ -310,6 +312,7 @@ function AccountBlock(props: {
   active: boolean
   pacingEnabled: boolean
   needsReauth?: boolean
+  tierLabel?: string
   marginTop?: number
 }) {
   const statusWord = () =>
@@ -329,7 +332,7 @@ function AccountBlock(props: {
     <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <text fg={props.theme.text}>
-          <b>{props.name}</b>
+          <b>{`${props.name}${props.tierLabel ? ` · ${props.tierLabel}` : ''}`}</b>
         </text>
         <text fg={toneColor(props.theme, statusTone())}>
           <b>{statusWord()}</b>
@@ -345,6 +348,7 @@ function AccountBlock(props: {
           label='5h'
           window={props.quota?.five_hour}
           pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
+          binding={props.quota?.bindingWindow === 'five_hour'}
         />
         <QuotaRow
           theme={props.theme}
@@ -352,6 +356,7 @@ function AccountBlock(props: {
           label='7d'
           window={props.quota?.seven_day}
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
+          binding={props.quota?.bindingWindow === 'seven_day'}
         />
         <For each={props.quota?.scoped ?? []}>
           {(window) => (
@@ -361,13 +366,36 @@ function AccountBlock(props: {
               label={formatScopedQuotaLabel(window.title)}
               window={window}
               pacing={pacingFor(window, SEVEN_DAY_MS)}
+              binding={props.quota?.bindingWindow === window.id}
             />
           )}
         </For>
+        <Show when={props.quota?.extraUsage}>
+          {(extraUsage: () => NonNullable<AccountQuota['extraUsage']>) => (
+            <text
+              fg={toneColor(
+                props.theme,
+                extraUsage().severity === 'critical'
+                  ? 'err'
+                  : extraUsage().severity === 'warning' ||
+                      extraUsage().exhausted
+                    ? 'warn'
+                    : 'muted',
+              )}
+            >
+              {`credits ${formatQuotaMoney(extraUsage().used)}/${formatQuotaMoney(extraUsage().limit)}${extraUsage().exhausted ? ' · exhausted' : ''}`}
+            </text>
+          )}
+        </Show>
+        <Show when={props.quota?.fallbackAdvised === true}>
+          <text fg={props.theme.textMuted}>{'→ fallback advised'}</text>
+        </Show>
       </Show>
     </box>
   )
 }
+
+export { formatQuotaMoney }
 
 // --- Quota dialog content ---------------------------------------------------
 
@@ -410,6 +438,7 @@ function QuotaDialogContent(props: {
           quota={state().main?.quota}
           active={state().activeId === 'main'}
           pacingEnabled={prefs().sections.pacing}
+          tierLabel={state().main?.tierLabel}
         />
         <Show when={prefs().sections.fallbackAccounts}>
           <For each={enabledFallbacks()}>
@@ -421,6 +450,7 @@ function QuotaDialogContent(props: {
                 quota={fb.quota}
                 active={state().activeId === fb.id}
                 pacingEnabled={prefs().sections.pacing}
+                tierLabel={fb.tierLabel}
                 needsReauth={fb.needsReauth}
                 marginTop={1}
               />
@@ -724,6 +754,7 @@ function QuotaSidebar(props: {
               quota={state().main?.quota}
               active={state().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
+              tierLabel={state().main?.tierLabel}
             />
             <Show when={prefs().sections.fallbackAccounts}>
               <For each={enabledFallbacks()}>
@@ -735,6 +766,7 @@ function QuotaSidebar(props: {
                     quota={fb.quota}
                     active={state().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
+                    tierLabel={fb.tierLabel}
                     needsReauth={fb.needsReauth}
                     marginTop={1}
                   />

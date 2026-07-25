@@ -47,6 +47,35 @@ describe('OpenCode Anthropic auth e2e', () => {
     }
   }, 90_000)
 
+  it('publishes adaptive Opus 5 effort variants to OpenCode', async () => {
+    harness = await E2EHarness.create()
+    const response = await fetch(`${harness.opencode.url}/provider`)
+    expect(response.status).toBe(200)
+    const providers = (await response.json()) as {
+      all: Array<{
+        id: string
+        models: Record<
+          string,
+          { variants?: Record<string, Record<string, unknown>> }
+        >
+      }>
+    }
+    const opus5 = providers.all.find((provider) => provider.id === 'anthropic')
+      ?.models['claude-opus-5']
+
+    expect(Object.keys(opus5?.variants ?? {})).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    expect(opus5?.variants?.max).toEqual({
+      thinking: { type: 'adaptive', display: 'summarized' },
+      effort: 'max',
+    })
+  }, 90_000)
+
   it('strips mcp_ tool names even when Anthropic SSE chunks split the name field', async () => {
     harness = await E2EHarness.create()
     harness.script([

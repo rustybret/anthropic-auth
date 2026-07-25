@@ -1,4 +1,5 @@
 import type { AccountStorage } from './accounts.ts'
+import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
 import { signRequestBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { logger } from './logger.ts'
@@ -18,7 +19,7 @@ const ENABLED_TITLE = '## Claude Cache Keep Enabled'
 const DISABLED_TITLE = '## Claude Cache Keep Disabled'
 const USAGE_TITLE = '## Claude Cache Keep Usage'
 const USAGE =
-  'Usage: `/claude-cachekeep`, `/claude-cachekeep off`, or `/claude-cachekeep HH-HH`.'
+  'Usage: `/claude-cachekeep`, `/claude-cachekeep always`, `/claude-cachekeep off`, or `/claude-cachekeep HH-HH`.'
 
 export type CacheKeepWindow = {
   startHour: number
@@ -28,14 +29,17 @@ export type CacheKeepWindow = {
 export type CacheKeepCommandAction =
   | { type: 'status' }
   | { type: 'disable' }
+  | { type: 'always' }
   | { type: 'window'; startHour: number; endHour: number }
   | { type: 'usage' }
   | { type: 'subagents'; enabled: boolean }
 
 export type CacheKeepStatus = {
   enabled: boolean
+  always?: boolean
   window?: CacheKeepWindow
   trackedSessions?: number
+  trackedSessionDetails?: CacheKeepTrackedSession[]
   nextPrewarmAt?: number
   hybridActive?: boolean
 }
@@ -50,6 +54,7 @@ export function parseCacheKeepCommandAction(
   const trimmed = input.trim()
   if (!trimmed) return { type: 'status' }
   if (trimmed === 'off') return { type: 'disable' }
+  if (trimmed === 'always') return { type: 'always' }
   if (trimmed === 'subagents on') return { type: 'subagents', enabled: true }
   if (trimmed === 'subagents off') return { type: 'subagents', enabled: false }
 
@@ -91,8 +96,17 @@ export function getCacheKeepWindow(
   return { startHour, endHour }
 }
 
+export function isCacheKeepAlways(storage: AccountStorage | null) {
+  return (
+    storage?.cacheKeep?.enabled === true && storage.cacheKeep.always === true
+  )
+}
+
 export function isCacheKeepPersistentlyEnabled(storage: AccountStorage | null) {
-  return storage?.cacheKeep?.enabled === true && !!getCacheKeepWindow(storage)
+  return (
+    storage?.cacheKeep?.enabled === true &&
+    (isCacheKeepAlways(storage) || !!getCacheKeepWindow(storage))
+  )
 }
 
 export function isCacheKeepHybridActive(storage: AccountStorage | null) {
@@ -115,6 +129,17 @@ export function isWithinCacheKeepWindow(
   return hour >= window.startHour || hour < window.endHour
 }
 
+export function isCacheKeepActiveNow(
+  storage: AccountStorage | null,
+  now = new Date(),
+) {
+  if (storage?.cacheKeep?.enabled !== true) return false
+  return (
+    isCacheKeepAlways(storage) ||
+    isWithinCacheKeepWindow(getCacheKeepWindow(storage), now)
+  )
+}
+
 export function localDayKey(now = new Date()) {
   return `${now.getFullYear()}-${padHour(now.getMonth() + 1)}-${padHour(now.getDate())}`
 }
@@ -132,13 +157,23 @@ function localWindowKey(window: CacheKeepWindow | undefined, now = new Date()) {
   return localDayKey(now)
 }
 
+function cacheKeepPeriodKey(
+  storage: AccountStorage | null,
+  window: CacheKeepWindow | undefined,
+  now = new Date(),
+) {
+  return isCacheKeepAlways(storage) ? 'always' : localWindowKey(window, now)
+}
+
 export function buildCacheKeepStatusSummary(status: CacheKeepStatus) {
-  const window = status.window
-    ? `${padHour(status.window.startHour)}-${padHour(status.window.endHour)}`
-    : 'not configured'
+  const schedule = status.always
+    ? 'always (while this process is running)'
+    : status.window
+      ? `${padHour(status.window.startHour)}-${padHour(status.window.endHour)}`
+      : 'not configured'
   const lines = [
     `Cache keep: ${status.enabled ? 'enabled' : 'disabled'}`,
-    `Window: ${window}`,
+    `Schedule: ${schedule}`,
     'Mode requirement: `/claude-cache mode hybrid` must be active.',
   ]
   if (typeof status.hybridActive === 'boolean') {
@@ -146,6 +181,12 @@ export function buildCacheKeepStatusSummary(status: CacheKeepStatus) {
   }
   if (typeof status.trackedSessions === 'number') {
     lines.push(`Tracked sessions: ${status.trackedSessions}`)
+  }
+  if (status.trackedSessionDetails?.length) {
+    lines.push('Sessions:')
+    for (const session of status.trackedSessionDetails) {
+      lines.push(`- ${session.id}`)
+    }
   }
   if (status.nextPrewarmAt) {
     lines.push(
@@ -158,16 +199,20 @@ export function buildCacheKeepStatusSummary(status: CacheKeepStatus) {
 export function executeCacheKeepCommand(input: {
   argumentsText: string
   enabled?: boolean
+  always?: boolean
   window?: CacheKeepWindow
   trackedSessions?: number
+  trackedSessionDetails?: CacheKeepTrackedSession[]
   nextPrewarmAt?: number
   hybridActive?: boolean
 }) {
   const action = parseCacheKeepCommandAction(input.argumentsText)
   const status = {
     enabled: input.enabled ?? false,
+    always: input.always,
     window: input.window,
     trackedSessions: input.trackedSessions,
+    trackedSessionDetails: input.trackedSessionDetails,
     nextPrewarmAt: input.nextPrewarmAt,
     hybridActive: input.hybridActive,
   }
@@ -184,6 +229,19 @@ export function executeCacheKeepCommand(input: {
     ].join('\n')
   }
 
+  if (action.type === 'always') {
+    return [
+      ENABLED_TITLE,
+      '',
+      buildCacheKeepStatusSummary({
+        ...status,
+        enabled: true,
+        always: true,
+        window: undefined,
+      }),
+    ].join('\n')
+  }
+
   if (action.type === 'window') {
     return [
       ENABLED_TITLE,
@@ -191,6 +249,7 @@ export function executeCacheKeepCommand(input: {
       buildCacheKeepStatusSummary({
         ...status,
         enabled: true,
+        always: false,
         window: { startHour: action.startHour, endHour: action.endHour },
       }),
     ].join('\n')
@@ -296,6 +355,9 @@ export class CacheKeepManager {
         headers: Headers,
         target: CacheKeepTarget,
       ) => Promise<Headers> | Headers
+      onTrackedSessionsChanged?: (
+        sessions: readonly CacheKeepTrackedSession[],
+      ) => Promise<void> | void
     },
   ) {}
 
@@ -319,8 +381,12 @@ export class CacheKeepManager {
     this.timer = null
   }
 
-  stats(window?: CacheKeepWindow, now = this.options.now?.() ?? Date.now()) {
-    const today = localWindowKey(window, new Date(now))
+  stats(
+    window?: CacheKeepWindow,
+    now = this.options.now?.() ?? Date.now(),
+    always = false,
+  ) {
+    const today = always ? 'always' : localWindowKey(window, new Date(now))
     const targets = [...this.targets.values()].filter(
       (target) => target.dayKey === today,
     )
@@ -334,8 +400,41 @@ export class CacheKeepManager {
     return { trackedSessions: targets.length, nextPrewarmAt }
   }
 
+  trackedSessions(): CacheKeepTrackedSession[] {
+    return [...this.targets.values()]
+      .map((target) => ({
+        id: target.id,
+        cacheExpiresAt: target.cacheExpiresAt,
+        nextPrewarmAt: target.cacheExpiresAt - CACHE_KEEP_PREWARM_LEAD_MS,
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id))
+  }
+
+  trackedOAuthRoute(
+    sessionId: string,
+  ): { oauthAccountId?: string } | undefined {
+    const target = this.targets.get(sessionId)
+    return target ? { oauthAccountId: target.oauthAccountId } : undefined
+  }
+
   trackedCount(): number {
     return this.targets.size
+  }
+
+  private publishTrackedSessions() {
+    const callback = this.options.onTrackedSessionsChanged
+    if (!callback) return
+    try {
+      void Promise.resolve(callback(this.trackedSessions())).catch((error) => {
+        logger.warn('cachekeep', 'failed to publish tracked sessions', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    } catch (error) {
+      logger.warn('cachekeep', 'failed to publish tracked sessions', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 
   private totalBodyBytes() {
@@ -390,11 +489,11 @@ export class CacheKeepManager {
     }
     const now = this.options.now?.() ?? Date.now()
     const window = getCacheKeepWindow(input.storage)
-    if (!isWithinCacheKeepWindow(window, new Date(now))) {
-      return { tracked: false, reason: 'outside configured window' }
+    if (!isCacheKeepActiveNow(input.storage, new Date(now))) {
+      return { tracked: false, reason: 'outside configured schedule' }
     }
 
-    const today = localWindowKey(window, new Date(now))
+    const today = cacheKeepPeriodKey(input.storage, window, new Date(now))
     this.pruneTargets(now, today)
     if (this.targets.has(input.sessionId)) this.targets.delete(input.sessionId)
 
@@ -413,6 +512,7 @@ export class CacheKeepManager {
       oauthAccountId: input.oauthAccountId,
     })
     this.pruneTargets(now, today)
+    this.publishTrackedSessions()
     this.start()
     return { tracked: true }
   }
@@ -444,16 +544,26 @@ export class CacheKeepManager {
     const storage = await this.options.loadStorage()
     const window = getCacheKeepWindow(storage)
     const now = this.options.now?.() ?? Date.now()
-    const today = localWindowKey(window, new Date(now))
+    const today = cacheKeepPeriodKey(storage, window, new Date(now))
+    if (isCacheKeepAlways(storage)) {
+      for (const target of this.targets.values()) target.dayKey = 'always'
+    }
 
     this.pruneTargets(now, today)
     if (!this.targets.size) {
+      this.publishTrackedSessions()
       this.stop()
       return
     }
 
-    if (!isCacheKeepHybridActive(storage)) return
-    if (!isWithinCacheKeepWindow(window, new Date(now))) return
+    if (!isCacheKeepHybridActive(storage)) {
+      this.publishTrackedSessions()
+      return
+    }
+    if (!isCacheKeepActiveNow(storage, new Date(now))) {
+      this.publishTrackedSessions()
+      return
+    }
 
     logger.debug('cachekeep', 'fired', { targets: this.targets.size })
     const dueAt = now + CACHE_KEEP_PREWARM_LEAD_MS
@@ -461,6 +571,7 @@ export class CacheKeepManager {
       if (target.cacheExpiresAt > dueAt) continue
       await this.prewarm(target, now)
     }
+    this.publishTrackedSessions()
   }
 
   private async sendPrewarm(

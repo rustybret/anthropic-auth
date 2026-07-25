@@ -21,6 +21,7 @@ describe('claude-cachekeep command', () => {
   test('parses status, off, and hour ranges', () => {
     expect(parseCacheKeepCommandAction('')).toEqual({ type: 'status' })
     expect(parseCacheKeepCommandAction('off')).toEqual({ type: 'disable' })
+    expect(parseCacheKeepCommandAction('always')).toEqual({ type: 'always' })
     expect(parseCacheKeepCommandAction('09-23')).toEqual({
       type: 'window',
       startHour: 9,
@@ -50,12 +51,37 @@ describe('claude-cachekeep command', () => {
     const summary = executeCacheKeepCommand({
       argumentsText: '09-23',
       trackedSessions: 2,
+      trackedSessionDetails: [
+        {
+          id: 'ses_alpha',
+          cacheExpiresAt: 2_000,
+          nextPrewarmAt: 1_000,
+        },
+        {
+          id: 'ses_beta',
+          cacheExpiresAt: 3_000,
+          nextPrewarmAt: 2_000,
+        },
+      ],
       hybridActive: true,
     })
     expect(summary).toContain('Claude Cache Keep Enabled')
-    expect(summary).toContain('Window: 09-23')
+    expect(summary).toContain('Schedule: 09-23')
     expect(summary).toContain('Hybrid active: yes')
     expect(summary).toContain('Tracked sessions: 2')
+    expect(summary).toContain('Sessions:\n- ses_alpha\n- ses_beta')
+  })
+
+  test('renders the always schedule explicitly', () => {
+    const summary = executeCacheKeepCommand({
+      argumentsText: 'always',
+      always: true,
+      hybridActive: true,
+    })
+    expect(summary).toContain('Claude Cache Keep Enabled')
+    expect(summary).toContain(
+      'Schedule: always (while this process is running)',
+    )
   })
 })
 
@@ -105,6 +131,9 @@ describe('CacheKeepManager', () => {
   test('tracks hybrid sessions and prewarms five minutes before expiry', async () => {
     let now = new Date('2026-05-18T10:00:00').getTime()
     const calls: Array<{ url: string; body: string }> = []
+    const publishedSessions: Array<
+      Array<{ id: string; cacheExpiresAt: number; nextPrewarmAt: number }>
+    > = []
     const fetchImpl = mock(
       (input: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(input), body: String(init?.body) })
@@ -115,6 +144,9 @@ describe('CacheKeepManager', () => {
       loadStorage: () => Promise.resolve(hybridStorage()),
       fetchImpl,
       now: () => now,
+      onTrackedSessionsChanged: (sessions) => {
+        publishedSessions.push(sessions.map((session) => ({ ...session })))
+      },
     })
 
     const body = JSON.stringify({
@@ -141,6 +173,9 @@ describe('CacheKeepManager', () => {
         cacheMode: 'hybrid',
       }),
     ).toEqual({ tracked: true })
+    expect(publishedSessions.at(-1)?.map((session) => session.id)).toEqual([
+      'ses_1',
+    ])
 
     now += 54 * 60_000
     await manager.tick()
@@ -153,6 +188,58 @@ describe('CacheKeepManager', () => {
       'https://api.anthropic.com/v1/messages?beta=true',
     )
     expect(JSON.parse(calls[0]!.body).max_tokens).toBe(0)
+    expect(publishedSessions.at(-1)?.[0]?.cacheExpiresAt).toBe(
+      now + 60 * 60_000,
+    )
+    manager.stop()
+  })
+
+  test('always mode keeps targets alive and prewarms across local midnight', async () => {
+    let now = new Date('2026-05-18T23:58:00').getTime()
+    const windowStorage: AccountStorage = {
+      ...hybridStorage(),
+      cacheKeep: { enabled: true, startHour: 23, endHour: 1 },
+    }
+    const alwaysStorage: AccountStorage = {
+      ...hybridStorage(),
+      cacheKeep: { enabled: true, always: true },
+    }
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(alwaysStorage),
+      fetchImpl,
+      now: () => now,
+    })
+    const tracked = await manager.track({
+      sessionId: 'ses_midnight',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers({ authorization: 'Bearer token' }),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      storage: windowStorage,
+      cacheMode: 'hybrid',
+    })
+    expect(tracked).toEqual({ tracked: true })
+
+    now += 55 * 60_000
+    await manager.tick()
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(manager.trackedSessions().map((session) => session.id)).toEqual([
+      'ses_midnight',
+    ])
     manager.stop()
   })
 
@@ -280,6 +367,10 @@ describe('CacheKeepManager', () => {
       cacheMode: 'hybrid',
       oauthAccountId: 'fallback-account',
     })
+    expect(manager.trackedOAuthRoute('ses_1')).toEqual({
+      oauthAccountId: 'fallback-account',
+    })
+    expect(manager.trackedOAuthRoute('missing')).toBeUndefined()
 
     now += 55 * 60_000
     await manager.tick()

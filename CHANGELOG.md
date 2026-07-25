@@ -2,6 +2,50 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.18.0
+
+### Minor Changes
+
+- Add Claude Opus 5 request shaping to OpenCode and Pi's converter, including summarized adaptive thinking, effort-based reasoning, explicit disabled-thinking handling, and OpenCode fast mode.
+- Extend OpenCode content-filter recovery to Opus 5: temporarily downgrade refused requests to Opus 4.8 for 10 successful responses while preserving the selected model, prewarming the original Opus 5 cache, and reporting model-specific recovery transitions.
+
+### Patch Changes
+
+- Publish native OpenCode Opus 5 `low`, `medium`, `high`, `xhigh`, and `max` effort variants instead of inherited manual-thinking budgets.
+- Isolate Fable 5 and Opus 5 recovery state, cache warm chains, OAuth account binding, and standby anchors by session and source-model family.
+- Treat Darwin/Bun `EINVAL` during a contended eviction-marker create as a lost lock race, preventing high-contention refresh-lock failures.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the Opus 5 contribution.
+
+## 1.17.0
+
+### Minor Changes
+
+- Refresh OAuth 5h and 7d quota from genuine `anthropic-ratelimit-unified-*` response headers across direct, HTTP relay, and WebSocket relay transports while preserving poll-owned model-scoped quota data.
+- Show account plan/tier metadata, the binding quota window, extra-usage credit status, and Anthropic fallback hints in expanded OpenCode quota and account surfaces.
+
+### Patch Changes
+
+- Prevent startup, quota-refresh, metadata, and command writes from overwriting another process's active sidebar route by preserving routing-authoritative fields behind cross-process locked and fenced state writes.
+- Token-fence asynchronous account-profile persistence so delayed profile fetches or clears cannot restore stale credentials or remove a newer profile.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the quota surfaces, relay harvesting, and sidebar-state contributions.
+
+## 1.16.0
+
+### Minor Changes
+
+- Add `sticky-balanced` routing for OpenCode and Pi, assigning cold sessions by current quota headroom while preserving account affinity across processes, restarts, transient failures, short reset holds, model-scoped limits, and Fable recovery.
+- Add `/claude-cachekeep always` and aggregate live tracked-session status across OpenCode project plugin instances and Pi processes without sharing request bodies, credentials, or headers.
+
+### Patch Changes
+
+- Prevent concurrent fallback-account additions and configuration saves from dropping accounts by serializing cross-process writes, merging current disk state, and using explicit removal semantics.
+- Preserve fresh empty model-scoped quota snapshots and evaluate scoped quota freshness independently during sticky routing.
+- Bound request-dump storage to 512 MB by default and harden end-to-end process and temporary-directory cleanup.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the dump-storage and end-to-end cleanup contribution.
+
 ## 1.15.1
 
 ### Patch Changes

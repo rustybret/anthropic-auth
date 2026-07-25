@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getAccountStatePath } from '@cortexkit/anthropic-auth-core'
+import {
+  addAccountPersistent,
+  getAccountStatePath,
+} from '@cortexkit/anthropic-auth-core'
 
 import { addApiRoute, login, relaySetup } from '../cli'
 
@@ -192,6 +195,56 @@ describe('CLI login', () => {
       access: 'cli-access',
       refresh: 'cli-refresh',
     })
+  })
+
+  test('preserves an account committed while the interactive OAuth flow is open', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const now = Date.now()
+    const exchange = async (): Promise<{
+      type: 'success'
+      access: string
+      refresh: string
+      expires: number
+    }> => {
+      await addAccountPersistent(
+        {
+          id: 'umut',
+          label: 'umut',
+          type: 'oauth',
+          access: 'umut-access',
+          refresh: 'umut-refresh',
+          expires: now + 3600 * 1000,
+          enabled: true,
+          addedAt: now,
+        },
+        accountPath,
+      )
+      return {
+        type: 'success',
+        access: 'yiyi-access',
+        refresh: 'yiyi-refresh',
+        expires: now + 3600 * 1000,
+      }
+    }
+
+    await withAccountEnv(accountPath, {}, () =>
+      login('yiyi', {
+        prompt: async () =>
+          'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
+        exchange,
+      }),
+    )
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(
+      config.accounts.map((account: { id: string }) => account.id),
+    ).toEqual(['umut', 'yiyi'])
+    const runtimeState = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(Object.keys(runtimeState.accounts)).toEqual(['umut', 'yiyi'])
+    expect(runtimeState.accounts.umut.refresh).toBe('umut-refresh')
+    expect(runtimeState.accounts.yiyi.refresh).toBe('yiyi-refresh')
   })
 
   test('re-login with same label clears stale errors and quota', async () => {
@@ -398,6 +451,7 @@ describe('CLI relay setup', () => {
   test('deploys worker resources and saves relay config', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const calls: Array<{ url: string; method?: string }> = []
+    let accountAddedDuringProvisioning = false
 
     const fetchImpl = async (
       input: string | URL | Request,
@@ -405,6 +459,18 @@ describe('CLI relay setup', () => {
     ): Promise<Response> => {
       const url = input.toString()
       calls.push({ url, method: init?.method })
+      if (!accountAddedDuringProvisioning) {
+        accountAddedDuringProvisioning = true
+        await addAccountPersistent(
+          {
+            id: 'added-during-relay',
+            label: 'added-during-relay',
+            type: 'oauth',
+            refresh: 'relay-race-refresh',
+          },
+          accountPath,
+        )
+      }
       if (url.includes('/storage/kv/namespaces'))
         return Response.json({ success: true, result: { id: 'kv-id' } })
       if (url.includes('/workers/scripts/opencode-anthropic-relay/subdomain'))
@@ -462,6 +528,9 @@ describe('CLI relay setup', () => {
       transport: 'http',
     })
     expect(storage.relay.token).toBeString()
+    expect(
+      storage.accounts.map((account: { id: string }) => account.id),
+    ).toEqual(['added-during-relay'])
 
     expect(calls).toHaveLength(4)
     expect(calls.map((c) => `${c.method ?? 'GET'} ${c.url}`)).toEqual([

@@ -15,6 +15,15 @@ export interface AccountQuota {
   five_hour?: QuotaWindow
   seven_day?: QuotaWindow
   scoped?: ScopedQuotaWindow[]
+  extraUsage?: {
+    used: { amountMinor: number; currency: string; exponent: number }
+    limit: { amountMinor: number; currency: string; exponent: number }
+    utilizationPercent?: number
+    severity?: string
+    exhausted: boolean
+  }
+  bindingWindow?: string
+  fallbackAdvised?: boolean
 }
 
 export interface SidebarAccountState {
@@ -25,6 +34,7 @@ export interface SidebarAccountState {
   // True when the account's refresh token is permanently dead (400
   // invalid_grant) and it needs a re-login — distinct from a transient backoff.
   needsReauth: boolean
+  tierLabel?: string
 }
 
 export interface FableRecoverySidebarState {
@@ -32,11 +42,18 @@ export interface FableRecoverySidebarState {
   mode: 'opus' | 'fable'
   remaining: number
   changedAt: number
+  /**
+   * The model id the user originally requested (e.g. 'claude-fable-5' or
+   * 'claude-opus-5'). Optional for backward compatibility with pre-Opus-5
+   * state files; older recoveries default to Fable 5 in the summary.
+   */
+  requestedModelId?: string
 }
 
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    tierLabel?: string
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
     refreshBackedOff?: boolean
@@ -56,9 +73,20 @@ export interface SidebarState {
   lastUpdated: number
 }
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import {
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { logger } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
@@ -136,7 +164,51 @@ function normalizeAccountQuota(value: unknown): AccountQuota | null {
     quota.scoped = scoped
   }
 
+  if (isRecord(value.extraUsage)) {
+    const used = normalizeQuotaMoney(value.extraUsage.used)
+    const limit = normalizeQuotaMoney(value.extraUsage.limit)
+    if (used && limit && typeof value.extraUsage.exhausted === 'boolean') {
+      quota.extraUsage = {
+        used,
+        limit,
+        ...(typeof value.extraUsage.utilizationPercent === 'number' &&
+          Number.isFinite(value.extraUsage.utilizationPercent) && {
+            utilizationPercent: value.extraUsage.utilizationPercent,
+          }),
+        ...(typeof value.extraUsage.severity === 'string' && {
+          severity: value.extraUsage.severity,
+        }),
+        exhausted: value.extraUsage.exhausted,
+      }
+    }
+  }
+  if (typeof value.bindingWindow === 'string' && value.bindingWindow.trim()) {
+    quota.bindingWindow = value.bindingWindow.trim()
+  }
+  if (typeof value.fallbackAdvised === 'boolean') {
+    quota.fallbackAdvised = value.fallbackAdvised
+  }
+
   return Object.keys(quota).length ? quota : null
+}
+
+function normalizeQuotaMoney(value: unknown) {
+  if (!isRecord(value)) return undefined
+  if (
+    !Number.isInteger(value.amountMinor) ||
+    typeof value.currency !== 'string' ||
+    !/^[A-Za-z]{3}$/.test(value.currency.trim()) ||
+    !Number.isInteger(value.exponent) ||
+    (value.exponent as number) < 0 ||
+    (value.exponent as number) > 20
+  ) {
+    return undefined
+  }
+  return {
+    amountMinor: value.amountMinor as number,
+    currency: value.currency.trim(),
+    exponent: value.exponent as number,
+  }
 }
 
 export function normalizeSidebarState(raw: unknown): SidebarState {
@@ -146,6 +218,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   if (isRecord(raw.main)) {
     const m = raw.main
     main.quota = normalizeAccountQuota(m.quota)
+    if (typeof m.tierLabel === 'string' && m.tierLabel.trim()) {
+      main.tierLabel = m.tierLabel.trim()
+    }
     if (typeof m.quotaBackedOff === 'boolean')
       main.quotaBackedOff = m.quotaBackedOff
     if (typeof m.quotaBackoffUntil === 'number')
@@ -167,6 +242,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
+          tierLabel:
+            typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
+              ? entry.tierLabel.trim()
+              : undefined,
         }))
     : []
 
@@ -214,6 +293,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
               mode: recovery.mode,
               remaining: Math.max(0, Math.floor(recovery.remaining)),
               changedAt: recovery.changedAt,
+              requestedModelId:
+                typeof recovery.requestedModelId === 'string'
+                  ? recovery.requestedModelId
+                  : undefined,
             },
           ]
         })
@@ -238,23 +321,327 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
 
 let writeChain: Promise<void> = Promise.resolve()
 
-export async function getSidebarState(): Promise<SidebarState> {
+// Wait through ordinary contention while staying below the 2s stale-eviction window.
+const SIDEBAR_LOCK_BUDGET_MS = 1_000
+const SIDEBAR_LOCK_STALE_MS = 2_000
+const SIDEBAR_LOCK_RETRY_MIN_MS = 5
+const SIDEBAR_LOCK_RETRY_MAX_MS = 15
+
+interface SidebarStateWriteTestHooks {
+  afterMergeRead?: (stateFile: string) => void | Promise<void>
+  beforeRename?: (stateFile: string, tempFile: string) => void | Promise<void>
+  afterRename?: (stateFile: string) => void | Promise<void>
+  afterStaleLockStat?: (lockDir: string) => void | Promise<void>
+  onStaleLockClaimed?: (lockDir: string) => void | Promise<void>
+  onLockAcquired?: (lockDir: string) => void | Promise<void>
+  beforeReleaseDirectoryRemoval?: (lockDir: string) => void | Promise<void>
+  lockBudgetMs?: number
+  lockRetryMinMs?: number
+  lockRetryMaxMs?: number
+}
+
+let sidebarStateWriteTestHooks: SidebarStateWriteTestHooks | null = null
+
+export function __setSidebarStateWriteTestHooks(
+  hooks: SidebarStateWriteTestHooks | null,
+): void {
+  sidebarStateWriteTestHooks = hooks
+}
+
+// Boot-routing test hooks live here rather than in index.ts: the plugin entry
+// module must export nothing beyond the plugin factory — opencode's plugin
+// loader treats extra entry-point exports as plugin candidates and fails to
+// load the plugin (same incident class as the removed
+// __setBootProfileHydrationForTest export).
+export interface InitialSidebarRoutingTestHooks {
+  beforeSidebarRead?: () => void | Promise<void>
+  beforeStorageLoad?: () => void | Promise<void>
+  afterStorageLoad?: () => void | Promise<void>
+}
+
+let initialSidebarRoutingTestHooks: InitialSidebarRoutingTestHooks | null = null
+
+export function __setInitialSidebarRoutingTestHooks(
+  hooks: InitialSidebarRoutingTestHooks | null,
+): void {
+  initialSidebarRoutingTestHooks = hooks
+}
+
+export function getInitialSidebarRoutingTestHooks(): InitialSidebarRoutingTestHooks | null {
+  return initialSidebarRoutingTestHooks
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function acquireSidebarStateLock(stateFile: string): Promise<{
+  release: () => Promise<void>
+  ownsLock: () => Promise<boolean>
+} | null> {
+  const lockDir = `${stateFile}.lock`
+  const budgetMs =
+    sidebarStateWriteTestHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
+  const retryMinMs =
+    sidebarStateWriteTestHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    sidebarStateWriteTestHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
+  const deadline = Date.now() + budgetMs
+
+  while (true) {
+    try {
+      await mkdir(lockDir)
+      const ownerId = randomUUID()
+      const ownerFile = join(lockDir, ownerId)
+      await writeFile(ownerFile, '', {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx',
+      })
+      await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
+      return {
+        ownsLock: async () => {
+          try {
+            await stat(ownerFile)
+            return true
+          } catch {
+            return false
+          }
+        },
+        release: async () => {
+          // Unlinking this acquisition's unique file makes the filesystem reject
+          // a stale release after eviction handed the path to a successor.
+          try {
+            await unlink(ownerFile)
+          } catch {
+            return
+          }
+          await sidebarStateWriteTestHooks?.beforeReleaseDirectoryRemoval?.(
+            lockDir,
+          )
+          await rmdir(lockDir).catch(() => {})
+        },
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        logger.trace('sidebar', 'state lock unavailable; write skipped', {
+          stateFile,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return null
+      }
+    }
+
+    try {
+      const lockStat = await stat(lockDir)
+      if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
+        await sidebarStateWriteTestHooks?.afterStaleLockStat?.(lockDir)
+        const evictedLockDir = `${lockDir}.evict-${process.pid}-${randomUUID()}`
+        try {
+          await rename(lockDir, evictedLockDir)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          throw error
+        }
+        await sidebarStateWriteTestHooks?.onStaleLockClaimed?.(lockDir)
+        await rm(evictedLockDir, { recursive: true, force: true }).catch(
+          () => {},
+        )
+        continue
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      logger.trace('sidebar', 'state lock inspection failed; write skipped', {
+        stateFile,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return null
+    }
+
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      logger.warn('sidebar', 'lock budget exhausted, write skipped', {
+        stateFile,
+        budgetMs,
+      })
+      return null
+    }
+    const jitterMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await sleep(Math.min(jitterMs, remainingMs))
+  }
+}
+
+export async function __acquireSidebarStateLockForTest(
+  stateFile: string,
+): Promise<(() => Promise<void>) | null> {
+  return (await acquireSidebarStateLock(stateFile))?.release ?? null
+}
+
+async function writeSidebarStateAtomic(
+  stateFile: string,
+  state: SidebarState,
+  ownsLock: () => Promise<boolean>,
+): Promise<'written' | 'lock-lost-before-rename' | 'lock-lost-after-rename'> {
+  const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(tempFile, JSON.stringify(state), {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
   try {
-    const raw = await readFile(getSidebarStateFile(), 'utf8')
+    if (!(await ownsLock())) {
+      logger.trace('sidebar', 'state lock lost before rename; write aborted', {
+        stateFile,
+      })
+      await rm(tempFile, { force: true }).catch(() => {})
+      return 'lock-lost-before-rename'
+    }
+    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    // No production await separates this ownership fence from rename. A process
+    // freeze between the adjacent syscalls remains possible, so rename is also
+    // fenced from the other side below.
+    if (!(await ownsLock())) {
+      logger.trace('sidebar', 'state lock lost before rename; write aborted', {
+        stateFile,
+      })
+      await rm(tempFile, { force: true }).catch(() => {})
+      return 'lock-lost-before-rename'
+    }
+    await rename(tempFile, stateFile)
+    await sidebarStateWriteTestHooks?.afterRename?.(stateFile)
+    if (!(await ownsLock())) return 'lock-lost-after-rename'
+    return 'written'
+  } catch (error) {
+    await rm(tempFile, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+export async function getSidebarState(
+  stateFile = getSidebarStateFile(),
+): Promise<SidebarState> {
+  try {
+    const raw = await readFile(stateFile, 'utf8')
     return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
   }
 }
 
+export interface SidebarStateWriteOptions {
+  routingAuthoritative?: boolean
+  resolvePreservedRouting?: (current: SidebarState) =>
+    | (Pick<SidebarState, 'activeId' | 'route'> & {
+        state?: SidebarState
+      })
+    | undefined
+    | Promise<
+        | (Pick<SidebarState, 'activeId' | 'route'> & {
+            state?: SidebarState
+          })
+        | undefined
+      >
+  onRoutingResolved?: (
+    routing: Pick<SidebarState, 'activeId' | 'route'>,
+  ) => void
+}
+
 export async function setSidebarState(
   state: SidebarState,
   stateFile = getSidebarStateFile(),
+  options: SidebarStateWriteOptions = {},
 ): Promise<void> {
   writeChain = writeChain
     .then(async () => {
       await mkdir(dirname(stateFile), { recursive: true })
-      await writeFile(stateFile, JSON.stringify(state), 'utf8')
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const repairingPostRenameLoss = attempt === 1
+        const lock = await acquireSidebarStateLock(stateFile)
+        // Sidebar frames are display-only and refresh within seconds; dropping one
+        // is safer than clobbering routing state that may stay authoritative until
+        // another process handles its next request.
+        if (!lock) {
+          if (repairingPostRenameLoss) {
+            logger.warn(
+              'sidebar',
+              'post-rename repair lock unavailable; write skipped',
+              { stateFile },
+            )
+          }
+          return
+        }
+
+        let stateToWrite = state
+        let result:
+          | 'written'
+          | 'lock-lost-before-rename'
+          | 'lock-lost-after-rename'
+        try {
+          if (options.routingAuthoritative === false) {
+            const current = await getSidebarState(stateFile)
+            const preservedRouting =
+              await options.resolvePreservedRouting?.(current)
+            if (preservedRouting) {
+              const preservedState = preservedRouting.state ?? state
+              stateToWrite = {
+                ...preservedState,
+                activeId: preservedRouting.activeId,
+                route: preservedRouting.route,
+                lastUpdated: Math.max(
+                  preservedState.lastUpdated,
+                  current.lastUpdated,
+                ),
+              }
+            }
+            await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+          } else if (repairingPostRenameLoss) {
+            const current = await getSidebarState(stateFile)
+            // A successor owns its fresh account/quota and recovery snapshots;
+            // this routing frame may only republish its decision and shared UI state.
+            stateToWrite = {
+              ...current,
+              activeId: state.activeId,
+              route: state.route,
+              relay: state.relay,
+              fastMode: state.fastMode,
+              cacheKeep: state.cacheKeep,
+              lastUpdated: Math.max(current.lastUpdated, state.lastUpdated),
+            }
+          }
+          result = await writeSidebarStateAtomic(
+            stateFile,
+            stateToWrite,
+            lock.ownsLock,
+          )
+        } finally {
+          await lock.release()
+        }
+
+        if (result === 'lock-lost-after-rename') {
+          if (repairingPostRenameLoss) {
+            logger.warn(
+              'sidebar',
+              'post-rename repair lost lock; write skipped',
+              { stateFile },
+            )
+            return
+          }
+          logger.warn(
+            'sidebar',
+            'state lock lost after rename; repairing write',
+            {
+              stateFile,
+            },
+          )
+          continue
+        }
+        if (result === 'lock-lost-before-rename') return
+        options.onRoutingResolved?.({
+          activeId: stateToWrite.activeId,
+          route: stateToWrite.route,
+        })
+        return
+      }
     })
     .catch(() => {
       // Best-effort — sidebar is non-critical
@@ -300,6 +687,19 @@ export function formatScopedQuotaLabel(title: string) {
   return /^fable$/i.test(label) ? 'Fa' : label
 }
 
+/**
+ * Pretty label for a recoverable-refusal source model (Fable 5 or Opus 5).
+ * Falls back to the raw id for unrecognized ids so the sidebar never goes
+ * blank on a future model that has not yet been cataloged here.
+ */
+export function formatFallbackModelLabel(modelId: string | undefined): string {
+  if (modelId === 'claude-fable-5' || modelId?.startsWith('claude-fable-5-'))
+    return 'Fable 5'
+  if (modelId === 'claude-opus-5' || modelId?.startsWith('claude-opus-5-'))
+    return 'Opus 5'
+  return modelId ?? 'Fable 5'
+}
+
 export function getFableRecoverySummary(
   state: SidebarState,
   sessionId: string,
@@ -308,7 +708,9 @@ export function getFableRecoverySummary(
     (candidate) => candidate.sessionId === sessionId,
   )
   if (!recovery) return undefined
-  if (recovery.mode === 'fable') return 'Fable 5 · restored'
+  if (recovery.mode === 'fable') {
+    return `${formatFallbackModelLabel(recovery.requestedModelId)} · restored`
+  }
   return `Opus 4.8 · ${recovery.remaining} left`
 }
 

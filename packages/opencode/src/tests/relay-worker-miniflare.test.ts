@@ -13,6 +13,7 @@ type ControlMessage = {
   id?: string
   status?: number
   message?: string
+  headers?: Record<string, string>
   state?: { hash: string; revision: number } | null
   hash?: string
   revision?: number
@@ -35,7 +36,14 @@ function startUpstream() {
       bodies.push(await request.text())
       return new Response('upstream-ok', {
         status: 200,
-        headers: { 'content-type': 'text/plain' },
+        headers: {
+          'content-type': 'text/plain',
+          'anthropic-ratelimit-unified-5h-utilization': '0.78',
+          'anthropic-ratelimit-unified-5h-reset': '1784246400',
+          'anthropic-ratelimit-unified-7d-utilization': '0.4',
+          'anthropic-ratelimit-unified-7d-reset': '1784628000',
+          'anthropic-ratelimit-unified-fallback': 'available',
+        },
       })
     },
   })
@@ -142,6 +150,43 @@ function sendPayload(socket: WebSocket, payload: Record<string, unknown>) {
 }
 
 describe('relay Worker under Miniflare', () => {
+  test('HTTP relay forwards upstream unified quota headers', async () => {
+    const upstream = startUpstream()
+    const mf = await startWorker()
+
+    try {
+      const response = await sendViaRelay({
+        config: {
+          enabled: true,
+          url: (await mf.ready).toString(),
+          token: RELAY_TOKEN,
+          fallbackToDirect: false,
+          transport: 'http',
+        },
+        input: upstream.url,
+        init: { method: 'POST' },
+        headers: new Headers({
+          authorization: 'Bearer test-token',
+          'x-session-affinity': 'miniflare-http-session',
+        }),
+        body: '{}',
+        fallback: async () => new Response('direct'),
+      })
+
+      expect(
+        response.headers.get('anthropic-ratelimit-unified-5h-utilization'),
+      ).toBe('0.78')
+      expect(response.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
+        'available',
+      )
+      expect(await response.text()).toBe('upstream-ok')
+      expect(upstream.bodies).toEqual(['{}'])
+    } finally {
+      await mf.dispose()
+      upstream.server.stop(true)
+    }
+  }, 30_000)
+
   test('client websocket transport reaches Miniflare Worker with byte-exact patch reconstruction', async () => {
     const upstream = startUpstream()
     const mf = await startWorker()
@@ -173,6 +218,12 @@ describe('relay Worker under Miniflare', () => {
         fallback: async () => new Response('direct'),
       })
       expect(await first.text()).toBe('upstream-ok')
+      expect(
+        first.headers.get('anthropic-ratelimit-unified-5h-utilization'),
+      ).toBe('0.78')
+      expect(first.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
+        'available',
+      )
 
       const second = await sendViaRelay({
         config: relayConfig,
@@ -214,6 +265,16 @@ describe('relay Worker under Miniflare', () => {
         revision: 1,
         body: firstBody,
       })
+      const responseStart = await workerSocket.waitForControl(
+        (message) =>
+          message.type === 'response_start' && message.id === 'req_full_sync',
+      )
+      expect(
+        responseStart.headers?.['anthropic-ratelimit-unified-5h-utilization'],
+      ).toBe('0.78')
+      expect(
+        responseStart.headers?.['anthropic-ratelimit-unified-fallback'],
+      ).toBe('available')
       await workerSocket.waitForControl(
         (message) => message.type === 'done' && message.id === 'req_full_sync',
       )

@@ -7,7 +7,9 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 function parseMode(summary: string) {
-  const modeMatch = summary.match(/- Mode: `(main-first|fallback-first)`/)
+  const modeMatch = summary.match(
+    /- Mode: `(main-first|fallback-first|sticky-balanced)`/,
+  )
   if (!modeMatch)
     throw new Error(`Malformed /claude-routing summary:\n${summary}`)
   return modeMatch[1]
@@ -38,7 +40,7 @@ describe('claude-routing command state', () => {
 
     expect(reply).toContain('## Claude Routing Usage')
     expect(reply).toContain(
-      'Usage: `/claude-routing`, `/claude-routing main-first`, or `/claude-routing fallback-first`.',
+      'Usage: `/claude-routing`, `/claude-routing main-first`, `/claude-routing fallback-first`, `/claude-routing sticky-balanced`, or `/claude-routing reset`.',
     )
     expect(parseMode(reply)).toBe('fallback-first')
   })
@@ -57,6 +59,17 @@ describe('claude-routing command state', () => {
       type: 'mode',
       mode: 'fallback-first',
     })
+    expect(parseRoutingCommandAction('sticky-balanced')).toEqual({
+      type: 'mode',
+      mode: 'sticky-balanced',
+    })
+    expect(parseRoutingCommandAction('reset')).toEqual({ type: 'reset' })
+    expect(
+      executeRoutingCommand({
+        argumentsText: 'reset',
+        mode: 'sticky-balanced',
+      }),
+    ).toContain('current session will be assigned again')
     expect(parseRoutingCommandAction('fallback')).toEqual({ type: 'usage' })
   })
 })

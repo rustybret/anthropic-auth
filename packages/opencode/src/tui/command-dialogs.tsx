@@ -32,6 +32,26 @@ export function buildKillswitchThresholdSeed(
   return seedParts.join(' ')
 }
 
+export function buildAccountDialogOption(account: {
+  id: string
+  label: string
+  role: string
+  enabled: boolean
+  quotaPercent: number | null
+  tierLabel?: string
+}) {
+  const pct =
+    account.quotaPercent != null
+      ? ` ${Math.round(account.quotaPercent)}%`
+      : ' \u2013%'
+  const status = !account.enabled ? ' (disabled)' : ''
+  return {
+    title: `${account.label} [${account.role}]${status}${pct}`,
+    value: account.id,
+    ...(account.tierLabel && { description: account.tierLabel }),
+  }
+}
+
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
@@ -64,6 +84,17 @@ export function openCommandDialog(
             title: 'Fallback first',
             value: 'fallback-first',
             description: 'Prefer fallback accounts, preserve main',
+          },
+          {
+            title: 'Sticky balanced',
+            value: 'sticky-balanced',
+            description:
+              'Balance new sessions by quota and keep each account sticky',
+          },
+          {
+            title: 'Reset this session',
+            value: 'reset',
+            description: 'Reassign this session on its next request',
           },
         ]}
         onSelect={(option) => {
@@ -158,9 +189,9 @@ export function openCommandDialog(
     api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogPrompt
-        title='Claude cachekeep window'
+        title='Claude cachekeep schedule'
         description={() => <text>{payload.text}</text>}
-        placeholder="HH-HH (e.g. 08-20) or 'off'"
+        placeholder="'always', HH-HH (e.g. 08-20), or 'off'"
         value={seed}
         onConfirm={(value: string) => {
           void apply('claude-cachekeep', value.trim()).then((r) => {
@@ -242,6 +273,7 @@ export function openCommandDialog(
         role: string
         enabled: boolean
         quotaPercent: number | null
+        tierLabel?: string
       }>) ?? []
 
     const updateAccounts = (r: {
@@ -267,17 +299,7 @@ export function openCommandDialog(
           value: '__add__',
           description: 'Add an API key or OAuth fallback account',
         },
-        ...accounts.map((a) => {
-          const pct =
-            a.quotaPercent != null
-              ? ` ${Math.round(a.quotaPercent)}%`
-              : ' \u2013%'
-          const status = !a.enabled ? ' (disabled)' : ''
-          return {
-            title: `${a.label} [${a.role}]${status}${pct}`,
-            value: a.id,
-          }
-        }),
+        ...accounts.map(buildAccountDialogOption),
       ]
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (

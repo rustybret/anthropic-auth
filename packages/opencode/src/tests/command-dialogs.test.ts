@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { buildKillswitchThresholdSeed } from '../tui/command-dialogs'
+import {
+  buildAccountDialogOption,
+  buildKillswitchThresholdSeed,
+} from '../tui/command-dialogs'
 
 describe('buildKillswitchThresholdSeed', () => {
   test('preserves scoped killswitch thresholds in the TUI edit seed', () => {
@@ -22,5 +25,24 @@ describe('buildKillswitchThresholdSeed', () => {
         'umut',
       ]),
     ).toBe('main:5,10,0 umut:5,10,0')
+  })
+})
+
+describe('buildAccountDialogOption', () => {
+  test('threads the tier label into the account row detail', () => {
+    expect(
+      buildAccountDialogOption({
+        id: 'work',
+        label: 'Work',
+        role: 'fallback',
+        enabled: true,
+        quotaPercent: 22,
+        tierLabel: 'Team · Max 5x',
+      }),
+    ).toEqual({
+      title: 'Work [fallback] 22%',
+      value: 'work',
+      description: 'Team · Max 5x',
+    })
   })
 })

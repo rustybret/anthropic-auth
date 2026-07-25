@@ -11,6 +11,7 @@ import {
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
 import { type LogLevel, log, logger } from './logger.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -39,6 +40,7 @@ export type OAuthAccount = AccountBase & {
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
   quota?: OAuthQuotaSnapshot
+  profile?: OAuthAccountProfile
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -115,10 +117,36 @@ export type AccountScopedQuotaWindow = AccountQuotaWindow & {
   modelName: string
 }
 
+export type QuotaMoney = {
+  amountMinor: number
+  currency: string
+  exponent: number
+}
+
+export type OAuthExtraUsageSnapshot = {
+  used: QuotaMoney
+  limit: QuotaMoney
+  utilizationPercent?: number
+  severity?: string
+  exhausted: boolean
+}
+
+export type OAuthAccountProfile = {
+  tier: string
+  orgType: string
+  checkedAt: number
+  tokenFingerprint?: string
+}
+
 export type OAuthQuotaSnapshot = Partial<
   Record<QuotaWindowName, AccountQuotaWindow>
 > & {
   scoped?: AccountScopedQuotaWindow[]
+  extraUsage?: OAuthExtraUsageSnapshot
+  bindingWindow?: string
+  bindingWindowSource?: 'poll' | 'headers'
+  fallbackAdvised?: boolean
+  source?: 'poll' | 'headers'
   // Top-level freshness stamp for the whole snapshot. mergeAccountRuntimeState
   // uses this when the snapshot has no per-window checkedAt (e.g. a windowless
   // empty-scoped snapshot) — without it, a windowless refresh gets read as
@@ -127,7 +155,7 @@ export type OAuthQuotaSnapshot = Partial<
   checkedAt?: number
 }
 
-export type RoutingMode = 'main-first' | 'fallback-first'
+export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
   Record<QuotaWindowName | '5h' | '1w' | 'scoped', number>
@@ -146,6 +174,7 @@ export type AccountStorage = {
   main?: {
     type: 'opencode'
     provider: 'anthropic'
+    profile?: OAuthAccountProfile
   }
   routing?: {
     mode?: RoutingMode
@@ -198,6 +227,7 @@ export type AccountStorage = {
   }
   cacheKeep?: {
     enabled?: boolean
+    always?: boolean
     startHour?: number
     endHour?: number
     subagents?: boolean
@@ -235,6 +265,7 @@ export type AccountRuntimeEntry = Partial<
     | 'lastRefreshError'
     | 'lastQuotaRefreshError'
     | 'quota'
+    | 'profile'
   > &
     Pick<ApiKeyAccount, 'apiKey' | 'lastUsed'>
 >
@@ -242,6 +273,8 @@ export type AccountRuntimeEntry = Partial<
 export type AccountRuntimeState = {
   version: 1
   main?: {
+    profile?: OAuthAccountProfile
+    profileToken?: string
     quota?: OAuthQuotaSnapshot
     quotaCheckedAt?: number
     quotaToken?: string
@@ -255,6 +288,7 @@ export type AccountRuntimeState = {
 }
 
 export type AccountStateSaveScope = {
+  mainProfile?: boolean
   mainQuota?: boolean
   mainRefresh?: boolean
   accounts?: true | string[]
@@ -270,6 +304,7 @@ type OAuthUsageLimit = {
   group?: string
   percent?: number
   resets_at?: string
+  is_active?: boolean
   scope?: {
     model?: {
       id?: string | null
@@ -283,6 +318,20 @@ type OAuthUsageResponse = {
   five_hour?: OAuthUsageWindow
   seven_day?: OAuthUsageWindow
   limits?: OAuthUsageLimit[]
+  extra_usage?: {
+    is_enabled?: boolean
+    monthly_limit?: number | null
+    used_credits?: number | null
+    utilization?: number | null
+  } | null
+  spend?: {
+    severity?: string | null
+    limit?: {
+      amount_minor?: number
+      currency?: string
+      exponent?: number
+    } | null
+  } | null
 }
 
 export type AccountManagerOptions = {
@@ -400,6 +449,32 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     lastRefreshError: normalizeOperationError(value.lastRefreshError),
     lastQuotaRefreshError: normalizeOperationError(value.lastQuotaRefreshError),
     quota: normalizeQuota(value.quota),
+    profile: normalizeOAuthAccountProfile(value.profile),
+  }
+}
+
+function normalizeOAuthAccountProfile(
+  value: unknown,
+): OAuthAccountProfile | undefined {
+  if (!isRecord(value)) return undefined
+  if (
+    typeof value.tier !== 'string' ||
+    !value.tier.trim() ||
+    typeof value.orgType !== 'string' ||
+    !value.orgType.trim() ||
+    typeof value.checkedAt !== 'number' ||
+    !Number.isFinite(value.checkedAt)
+  ) {
+    return undefined
+  }
+  return {
+    tier: value.tier.trim(),
+    orgType: value.orgType.trim(),
+    checkedAt: value.checkedAt,
+    ...(typeof value.tokenFingerprint === 'string' &&
+      value.tokenFingerprint.trim() && {
+        tokenFingerprint: value.tokenFingerprint.trim(),
+      }),
   }
 }
 
@@ -500,7 +575,61 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     quota.scoped = scoped
   }
 
+  if (isRecord(value.extraUsage)) {
+    const used = normalizeQuotaMoney(value.extraUsage.used)
+    const limit = normalizeQuotaMoney(value.extraUsage.limit)
+    if (used && limit && typeof value.extraUsage.exhausted === 'boolean') {
+      quota.extraUsage = {
+        used,
+        limit,
+        ...(typeof value.extraUsage.utilizationPercent === 'number' &&
+          Number.isFinite(value.extraUsage.utilizationPercent) && {
+            utilizationPercent: value.extraUsage.utilizationPercent,
+          }),
+        ...(typeof value.extraUsage.severity === 'string' && {
+          severity: value.extraUsage.severity,
+        }),
+        exhausted: value.extraUsage.exhausted,
+      }
+    }
+  }
+
+  if (typeof value.bindingWindow === 'string' && value.bindingWindow.trim()) {
+    quota.bindingWindow = value.bindingWindow.trim()
+  }
+  if (
+    value.bindingWindowSource === 'poll' ||
+    value.bindingWindowSource === 'headers'
+  ) {
+    quota.bindingWindowSource = value.bindingWindowSource
+  }
+  if (typeof value.fallbackAdvised === 'boolean') {
+    quota.fallbackAdvised = value.fallbackAdvised
+  }
+  if (value.source === 'poll' || value.source === 'headers') {
+    quota.source = value.source
+  }
+
   return Object.keys(quota).length ? quota : undefined
+}
+
+function normalizeQuotaMoney(value: unknown): QuotaMoney | undefined {
+  if (!isRecord(value)) return undefined
+  if (
+    typeof value.amountMinor !== 'number' ||
+    !Number.isFinite(value.amountMinor) ||
+    typeof value.currency !== 'string' ||
+    !value.currency.trim() ||
+    typeof value.exponent !== 'number' ||
+    !Number.isFinite(value.exponent)
+  ) {
+    return undefined
+  }
+  return {
+    amountMinor: value.amountMinor,
+    currency: value.currency.trim(),
+    exponent: value.exponent,
+  }
 }
 
 // Fresh empty storage shell — main OpenCode OAuth account, no fallback
@@ -517,7 +646,13 @@ function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   return {
     version: 1,
-    main: { type: 'opencode', provider: 'anthropic' },
+    main: {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: normalizeOAuthAccountProfile(
+        isRecord(value.main) ? value.main.profile : undefined,
+      ),
+    },
     routing: isRecord(value.routing) ? value.routing : undefined,
     fallbackOn: Array.isArray(value.fallbackOn)
       ? value.fallbackOn.filter((status) => Number.isInteger(status))
@@ -641,6 +776,11 @@ function mergeConfigAndState(
 
   return {
     ...configValue,
+    main: {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: normalizeOAuthAccountProfile(mainState?.profile),
+    },
     refresh: objectWithDefinedEntries({
       ...refreshConfig,
       mainLastRefreshError: mainRefreshSource.lastRefreshError,
@@ -709,6 +849,7 @@ function accountRuntimeState(account: FallbackAccount) {
     lastRefreshError: account.lastRefreshError,
     lastQuotaRefreshError: account.lastQuotaRefreshError,
     quota: account.quota,
+    profile: account.profile,
   })
 }
 
@@ -721,14 +862,78 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   )
 }
 
+function quotaSourcePrecedence(quota: OAuthQuotaSnapshot | undefined) {
+  if (quota?.source === 'poll') return 2
+  if (quota?.source === 'headers') return 1
+  return 0
+}
+
+function mergeHeaderScopedQuota(
+  existing: OAuthQuotaSnapshot,
+  incoming: OAuthQuotaSnapshot,
+) {
+  if (!('scoped' in existing)) return incoming.scoped
+  if (!Array.isArray(existing.scoped) || existing.scoped.length === 0) {
+    return existing.scoped
+  }
+  if (!Array.isArray(incoming.scoped) || incoming.scoped.length === 0) {
+    return existing.scoped
+  }
+  const merged = new Map(incoming.scoped.map((window) => [window.id, window]))
+  for (const window of existing.scoped) {
+    const candidate = merged.get(window.id)
+    if (!candidate || window.checkedAt >= candidate.checkedAt) {
+      merged.set(window.id, window)
+    }
+  }
+  return [...merged.values()]
+}
+
+function mergeHeaderOwnedWindow(
+  existingSnapshot: OAuthQuotaSnapshot,
+  incomingSnapshot: OAuthQuotaSnapshot,
+  key: QuotaWindowName,
+) {
+  const existing = existingSnapshot[key]
+  const incoming = incomingSnapshot[key]
+  if (!incoming) return existing
+  if (!existing) return incoming
+  if (incoming.checkedAt > existing.checkedAt) return incoming
+  if (incoming.checkedAt < existing.checkedAt) return existing
+  return quotaSourcePrecedence(existingSnapshot) >
+    quotaSourcePrecedence(incomingSnapshot)
+    ? existing
+    : incoming
+}
+
+function mergeHeaderQuotaForPersistence(
+  existing: OAuthQuotaSnapshot | undefined,
+  incoming: OAuthQuotaSnapshot,
+) {
+  if (!existing || incoming.source !== 'headers') return incoming
+  const preservePollBinding = existing.bindingWindowSource === 'poll'
+  return {
+    ...existing,
+    ...incoming,
+    five_hour: mergeHeaderOwnedWindow(existing, incoming, 'five_hour'),
+    seven_day: mergeHeaderOwnedWindow(existing, incoming, 'seven_day'),
+    scoped: mergeHeaderScopedQuota(existing, incoming),
+    extraUsage: existing.extraUsage ?? incoming.extraUsage,
+    bindingWindow: preservePollBinding
+      ? existing.bindingWindow
+      : (incoming.bindingWindow ?? existing.bindingWindow),
+    bindingWindowSource: preservePollBinding
+      ? 'poll'
+      : (incoming.bindingWindowSource ?? existing.bindingWindowSource),
+  } satisfies OAuthQuotaSnapshot
+}
+
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
 ): AccountRuntimeEntry {
   if (!isRecord(existing)) return incoming
   const existingEntry = existing as AccountRuntimeEntry
-  const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
-  const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
   const tokenChanged = Boolean(
     (existingEntry.access &&
       incoming.access &&
@@ -737,36 +942,63 @@ function mergeAccountRuntimeState(
         incoming.refresh &&
         existingEntry.refresh !== incoming.refresh),
   )
+  const mergesHeaderQuota = Boolean(
+    !tokenChanged && incoming.quota?.source === 'headers',
+  )
+  const effectiveIncoming =
+    mergesHeaderQuota && incoming.quota
+      ? {
+          ...incoming,
+          quota: mergeHeaderQuotaForPersistence(
+            existingEntry.quota,
+            incoming.quota,
+          ),
+        }
+      : incoming
+  const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
+  const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(effectiveIncoming.quota)
+  const existingQuotaWinsEqualTimestamp = Boolean(
+    existingQuotaCheckedAt === incomingQuotaCheckedAt &&
+      quotaSourcePrecedence(existingEntry.quota) >
+        quotaSourcePrecedence(effectiveIncoming.quota),
+  )
 
-  if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
+  if (
+    !mergesHeaderQuota &&
+    (existingQuotaCheckedAt > incomingQuotaCheckedAt ||
+      existingQuotaWinsEqualTimestamp)
+  ) {
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
-    const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
+    const incomingRefreshAt = effectiveIncoming.lastRefreshedAt ?? 0
     if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
       const merged: AccountRuntimeEntry = { ...existingEntry }
       if (
-        typeof incoming.lastUsed === 'number' &&
+        typeof effectiveIncoming.lastUsed === 'number' &&
         (!(typeof existingEntry.lastUsed === 'number') ||
-          incoming.lastUsed > existingEntry.lastUsed)
+          effectiveIncoming.lastUsed > existingEntry.lastUsed)
       ) {
-        merged.lastUsed = incoming.lastUsed
+        merged.lastUsed = effectiveIncoming.lastUsed
       }
       return merged
     }
 
-    const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
+    const merged: AccountRuntimeEntry = {
+      ...existingEntry,
+      ...effectiveIncoming,
+    }
     if (tokenChanged) {
-      if ('quota' in incoming) {
-        merged.quota = existingEntry.quota
-        if ('lastQuotaRefreshError' in existingEntry) {
-          merged.lastQuotaRefreshError = existingEntry.lastQuotaRefreshError
-        } else {
-          delete merged.lastQuotaRefreshError
-        }
+      if (!('profile' in effectiveIncoming)) delete merged.profile
+      if (effectiveIncoming.quota?.source) {
+        merged.quota = effectiveIncoming.quota
       } else {
         delete merged.quota
+      }
+      if (!('lastQuotaRefreshError' in effectiveIncoming)) {
         delete merged.lastQuotaRefreshError
       }
-      if (!('lastRefreshError' in incoming)) delete merged.lastRefreshError
+      if (!('lastRefreshError' in effectiveIncoming)) {
+        delete merged.lastRefreshError
+      }
       return merged
     }
 
@@ -776,11 +1008,18 @@ function mergeAccountRuntimeState(
       lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
     }
   }
-  const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
-  if (!('lastQuotaRefreshError' in incoming)) {
+  const merged: AccountRuntimeEntry = {
+    ...existingEntry,
+    ...effectiveIncoming,
+  }
+  if (tokenChanged) {
+    if (!('profile' in effectiveIncoming)) delete merged.profile
+    if (!effectiveIncoming.quota?.source) delete merged.quota
+  }
+  if (!('lastQuotaRefreshError' in effectiveIncoming)) {
     delete merged.lastQuotaRefreshError
   }
-  if (!('lastRefreshError' in incoming)) {
+  if (!('lastRefreshError' in effectiveIncoming)) {
     delete merged.lastRefreshError
   }
   return merged
@@ -807,7 +1046,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
 
   return omitUndefinedTopLevel({
     version: 1,
-    main: storage.main,
+    main: { type: 'opencode', provider: 'anthropic' },
     routing: storage.routing,
     fallbackOn: storage.fallbackOn,
     refresh,
@@ -855,23 +1094,160 @@ async function writeJsonAtomic(path: string, value: unknown) {
   }
 }
 
+export interface SaveAccountsOptions {
+  /** Account ids intentionally removed by this mutation. */
+  removedAccountIds?: readonly string[]
+  /** Preserve disk order when a stale snapshot is missing newer accounts. */
+  preserveExistingAccountOrder?: boolean
+}
+
+function sameAccountIdentity(
+  left: FallbackAccount,
+  right: FallbackAccount,
+): boolean {
+  return (
+    left.id === right.id ||
+    Boolean(left.label && right.label && left.label === right.label)
+  )
+}
+
+function mergeAccountsForSave(
+  existing: readonly FallbackAccount[],
+  incoming: readonly FallbackAccount[],
+  options: SaveAccountsOptions,
+): FallbackAccount[] {
+  const removedIds = new Set(options.removedAccountIds ?? [])
+  const current = existing.filter((account) => !removedIds.has(account.id))
+  const next = incoming.filter((account) => !removedIds.has(account.id))
+  const missing = current.filter(
+    (account) =>
+      !next.some((candidate) => sameAccountIdentity(candidate, account)),
+  )
+  if (!missing.length) return [...next]
+  if (options.preserveExistingAccountOrder === false) {
+    return [...next, ...missing]
+  }
+
+  const usedIncoming = new Set<number>()
+  const merged = current.map((account) => {
+    const index = next.findIndex(
+      (candidate, candidateIndex) =>
+        !usedIncoming.has(candidateIndex) &&
+        sameAccountIdentity(candidate, account),
+    )
+    const candidate = next[index]
+    if (!candidate) return account
+    usedIncoming.add(index)
+    return candidate
+  })
+  for (let index = 0; index < next.length; index++) {
+    const candidate = next[index]
+    if (!usedIncoming.has(index) && candidate) merged.push(candidate)
+  }
+  return merged
+}
+
+const ACCOUNT_CONFIG_LOCK_TTL_MS = 10_000
+const ACCOUNT_CONFIG_LOCK_WAIT_MS = 12_000
+const ACCOUNT_STATE_LOCK_TTL_MS = 10_000
+const ACCOUNT_STATE_LOCK_WAIT_MS = 12_000
+
+async function acquireAccountWriteLock(input: {
+  path: string
+  name: string
+  ttlMs: number
+  waitMs: number
+  description: string
+}) {
+  const { path, name, ttlMs, waitMs, description } = input
+  await mkdir(dirname(path), { recursive: true })
+  const deadline = Date.now() + waitMs
+  while (true) {
+    const lock = await acquireRefreshFileLock({
+      name,
+      ttlMs,
+      path,
+      renew: true,
+    })
+    if (lock) return lock
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for the account ${description} lock`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+function acquireAccountConfigWriteLock(path: string) {
+  return acquireAccountWriteLock({
+    path,
+    name: 'config-write',
+    ttlMs: ACCOUNT_CONFIG_LOCK_TTL_MS,
+    waitMs: ACCOUNT_CONFIG_LOCK_WAIT_MS,
+    description: 'configuration write',
+  })
+}
+
+function acquireAccountStateWriteLock(path: string) {
+  return acquireAccountWriteLock({
+    path,
+    name: 'state-write',
+    ttlMs: ACCOUNT_STATE_LOCK_TTL_MS,
+    waitMs: ACCOUNT_STATE_LOCK_WAIT_MS,
+    description: 'state write',
+  })
+}
+
 export function saveAccounts(
   storage: AccountStorage,
   path = getAccountStoragePath(),
+  options: SaveAccountsOptions = {},
 ): Promise<void> {
   const resolvedPath = path
-  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath))
+  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath, options))
 }
 
-async function saveAccountsLocked(storage: AccountStorage, path: string) {
-  const existing = await loadExistingTopLevelFields(path)
-  const nextConfig = { ...existing, ...configFromStorage(storage) }
-  await writeJsonAtomic(path, nextConfig)
-  await saveAccountStateUnlocked(storage, path, {
-    mainQuota: true,
-    mainRefresh: true,
-    accounts: true,
-  })
+async function saveAccountsLocked(
+  storage: AccountStorage,
+  path: string,
+  options: SaveAccountsOptions,
+) {
+  const lock = await acquireAccountConfigWriteLock(path)
+  try {
+    const current = await loadAccounts(path)
+    const nextStorage: AccountStorage = {
+      ...storage,
+      accounts: mergeAccountsForSave(
+        current?.accounts ?? [],
+        storage.accounts,
+        options,
+      ),
+    }
+    const existing = await loadExistingTopLevelFields(path)
+    const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+    await writeJsonAtomic(path, nextConfig)
+    // Config precedes state everywhere both locks are needed; reversing this
+    // order can deadlock profile mutations against full account saves.
+    const stateLock = await acquireAccountStateWriteLock(path)
+    try {
+      await saveAccountStateUnlocked(nextStorage, path, {
+        mainQuota: true,
+        mainRefresh: true,
+        accounts: true,
+      })
+    } finally {
+      await stateLock.release()
+    }
+  } finally {
+    await lock.release()
+  }
+}
+
+function applyMainProfileStatePatch(
+  state: AccountRuntimeState,
+  storage: AccountStorage,
+) {
+  state.main = state.main ?? {}
+  state.main.profile = storage.main?.profile
 }
 
 function applyMainQuotaStatePatch(
@@ -879,6 +1255,19 @@ function applyMainQuotaStatePatch(
   storage: AccountStorage,
 ) {
   state.main = state.main ?? {}
+  const incomingQuota = storage.quota?.mainQuota
+  const sameToken = Boolean(
+    state.main.quotaToken &&
+      storage.quota?.mainQuotaToken &&
+      state.main.quotaToken === storage.quota.mainQuotaToken,
+  )
+  const effectiveIncomingQuota =
+    sameToken && incomingQuota?.source === 'headers'
+      ? mergeHeaderQuotaForPersistence(state.main.quota, incomingQuota)
+      : incomingQuota
+  const mergesHeaderQuota = Boolean(
+    sameToken && incomingQuota?.source === 'headers',
+  )
   const existingCheckedAt =
     typeof state.main.quotaCheckedAt === 'number'
       ? state.main.quotaCheckedAt
@@ -886,11 +1275,21 @@ function applyMainQuotaStatePatch(
   const incomingCheckedAt =
     typeof storage.quota?.mainQuotaCheckedAt === 'number'
       ? storage.quota.mainQuotaCheckedAt
-      : quotaSnapshotCheckedAt(storage.quota?.mainQuota)
-  if (existingCheckedAt > incomingCheckedAt) return
+      : quotaSnapshotCheckedAt(effectiveIncomingQuota)
+  if (
+    !mergesHeaderQuota &&
+    (existingCheckedAt > incomingCheckedAt ||
+      (existingCheckedAt === incomingCheckedAt &&
+        quotaSourcePrecedence(state.main.quota) >
+          quotaSourcePrecedence(effectiveIncomingQuota)))
+  ) {
+    return
+  }
 
-  state.main.quota = storage.quota?.mainQuota
-  state.main.quotaCheckedAt = storage.quota?.mainQuotaCheckedAt
+  state.main.quota = effectiveIncomingQuota
+  state.main.quotaCheckedAt = mergesHeaderQuota
+    ? Math.max(existingCheckedAt, incomingCheckedAt)
+    : storage.quota?.mainQuotaCheckedAt
   state.main.quotaToken = storage.quota?.mainQuotaToken
   state.main.lastQuotaApiError = storage.quota?.mainLastQuotaApiError
 }
@@ -920,15 +1319,124 @@ export function saveAccountState(
   storage: AccountStorage,
   path = getAccountStoragePath(),
   scope: AccountStateSaveScope = {
+    mainProfile: true,
     mainQuota: true,
     mainRefresh: true,
     accounts: true,
   },
 ): Promise<void> {
   const resolvedPath = path
-  return enqueueSave(() =>
-    saveAccountStateUnlocked(storage, resolvedPath, scope),
-  )
+  return enqueueSave(async () => {
+    const lock = await acquireAccountStateWriteLock(resolvedPath)
+    try {
+      await saveAccountStateUnlocked(storage, resolvedPath, scope)
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
+export function saveOAuthProfileState(
+  input: {
+    accountId: 'main' | string
+    profile: OAuthAccountProfile | undefined
+    expectedTokenFingerprint: string
+  },
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  const resolvedPath = path
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(resolvedPath)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(resolvedPath)
+      try {
+        const current = await loadAccounts(resolvedPath)
+        const statePath = getAccountStatePath(resolvedPath)
+        const existing = (await readJsonIfPresent(statePath)).value
+        const next: AccountRuntimeState = isRecord(existing)
+          ? ({ ...existing, version: 1 } as AccountRuntimeState)
+          : { version: 1 }
+        const { accountId, expectedTokenFingerprint, profile } = input
+        if (
+          profile?.tokenFingerprint &&
+          profile.tokenFingerprint !== expectedTokenFingerprint
+        ) {
+          return false
+        }
+
+        if (accountId === 'main') {
+          next.main = { ...(next.main ?? {}) }
+          const existingProfile = normalizeOAuthAccountProfile(
+            next.main.profile,
+          )
+          const persistedToken =
+            next.main.profileToken ?? existingProfile?.tokenFingerprint
+          if (
+            !profile &&
+            existingProfile &&
+            persistedToken === expectedTokenFingerprint
+          ) {
+            return false
+          }
+          if (profile) {
+            if (persistedToken && persistedToken !== expectedTokenFingerprint) {
+              return false
+            }
+            if (
+              existingProfile &&
+              existingProfile.checkedAt > profile.checkedAt
+            ) {
+              return false
+            }
+          }
+          next.main.profile = profile
+          next.main.profileToken = expectedTokenFingerprint
+        } else {
+          const account = current?.accounts.find(
+            (candidate): candidate is OAuthAccount =>
+              candidate.id === accountId && isOAuthAccount(candidate),
+          )
+          if (
+            !account?.access ||
+            tokenFingerprint(account.access) !== expectedTokenFingerprint
+          ) {
+            return false
+          }
+          next.accounts = {
+            ...(isRecord(next.accounts) ? next.accounts : {}),
+          }
+          const existingEntry = isRecord(next.accounts[accountId])
+            ? { ...next.accounts[accountId] }
+            : {}
+          const existingProfile = normalizeOAuthAccountProfile(
+            existingEntry.profile,
+          )
+          if (
+            !profile &&
+            existingProfile?.tokenFingerprint === expectedTokenFingerprint
+          ) {
+            return false
+          }
+          if (
+            profile &&
+            existingProfile &&
+            existingProfile.checkedAt > profile.checkedAt
+          ) {
+            return false
+          }
+          existingEntry.profile = profile
+          next.accounts[accountId] = existingEntry
+        }
+
+        await writeJsonAtomic(statePath, pruneUndefined(next))
+        return true
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
 }
 
 async function saveAccountStateUnlocked(
@@ -942,6 +1450,7 @@ async function saveAccountStateUnlocked(
     ? ({ ...existing, version: 1 } as AccountRuntimeState)
     : { version: 1 }
 
+  if (scope.mainProfile) applyMainProfileStatePatch(next, storage)
   if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
   if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
 
@@ -1107,7 +1616,11 @@ export async function acquireRefreshFileLock(options: {
           { encoding: 'utf8', mode: 0o600, flag: 'wx' },
         )
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        const code = (error as NodeJS.ErrnoException).code
+        // Another contender can rename the marker directory between mkdir and
+        // this exclusive create. Darwin/Bun reports that lost-parent race as
+        // either ENOENT or EINVAL; both mean this contender lost the marker.
+        if (code === 'ENOENT' || code === 'EINVAL') return false
         await releaseEvictionMarker()
         throw error
       }
@@ -1294,10 +1807,27 @@ export async function setCacheKeepPersistentWindow(
 ) {
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
     enabled: true,
+    always: false,
     startHour,
     endHour,
   }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export async function setCacheKeepPersistentAlways(
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
+    enabled: true,
+    always: true,
+  }
+  delete storage.cacheKeep.startHour
+  delete storage.cacheKeep.endHour
   await saveAccounts(storage, path)
   return storage
 }
@@ -1343,7 +1873,9 @@ export function shouldFallbackStatus(
   return getFallbackStatuses(storage).includes(status)
 }
 
-function normalizeThresholds(storage: AccountStorage | null) {
+export function getQuotaMinimumRemainingThresholds(
+  storage: AccountStorage | null,
+) {
   const configured = storage?.quota?.minimumRemaining || {}
   return {
     five_hour:
@@ -1660,7 +2192,7 @@ export function quotaSnapshotPassesPolicy(
   storage: AccountStorage | null,
 ) {
   if (!quotaEnabled(storage)) return true
-  const thresholds = normalizeThresholds(storage)
+  const thresholds = getQuotaMinimumRemainingThresholds(storage)
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
     if (!window) return !failClosedOnUnknownQuota(storage)
@@ -1842,7 +2374,9 @@ export async function removeAccountPersistent(
   const storage = await loadAccounts(path)
   if (!storage) return false
   const existed = removeAccount(storage, id)
-  if (existed) await saveAccounts(storage, path)
+  if (existed) {
+    await saveAccounts(storage, path, { removedAccountIds: [id] })
+  }
   return existed
 }
 
@@ -1853,7 +2387,7 @@ export async function reorderAccountsPersistent(
   const storage = await loadAccounts(path)
   if (!storage) return
   reorderAccounts(storage, orderedIds)
-  await saveAccounts(storage, path)
+  await saveAccounts(storage, path, { preserveExistingAccountOrder: false })
 }
 
 export async function setAccountEnabledPersistent(
@@ -1882,23 +2416,39 @@ export function getQuotaNextRefreshAt(
   storage: AccountStorage | null,
   now: number,
 ) {
-  if (!quotaEnabled(storage)) return now + getQuotaCheckIntervalMs(storage)
+  const intervalMs = getQuotaCheckIntervalMs(storage)
+  if (!quotaEnabled(storage)) return now + intervalMs
 
-  const thresholds = normalizeThresholds(storage)
+  const windowFreshnessDeadline = Math.min(
+    ...[
+      ...(['five_hour', 'seven_day'] as const).map(
+        (key) => quota?.[key]?.checkedAt,
+      ),
+      ...(quota?.scoped ?? []).map((window) => window.checkedAt),
+    ]
+      .filter((checkedAt): checkedAt is number => Number.isFinite(checkedAt))
+      .map((checkedAt) => checkedAt + intervalMs),
+  )
+  const capAtOldestWindow = (candidate: number) =>
+    Number.isFinite(windowFreshnessDeadline)
+      ? Math.min(candidate, windowFreshnessDeadline)
+      : candidate
+
+  const thresholds = getQuotaMinimumRemainingThresholds(storage)
   const blockedResetTimes: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
-    if (!window) return now + getQuotaCheckIntervalMs(storage)
+    if (!window) return capAtOldestWindow(now + intervalMs)
     if (window.remainingPercent >= thresholds[key]) continue
     const resetTime = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN
     if (!Number.isFinite(resetTime) || resetTime <= now) {
-      return now + getQuotaCheckIntervalMs(storage)
+      return capAtOldestWindow(now + intervalMs)
     }
     blockedResetTimes.push(resetTime)
   }
 
-  if (!blockedResetTimes.length) return now + getQuotaCheckIntervalMs(storage)
-  return Math.min(...blockedResetTimes) + 60_000
+  if (!blockedResetTimes.length) return capAtOldestWindow(now + intervalMs)
+  return capAtOldestWindow(Math.min(...blockedResetTimes) + 60_000)
 }
 
 function tokenNeedsRefresh(
@@ -1930,8 +2480,13 @@ function quotaIsStale(
   account: OAuthAccount,
   storage: AccountStorage | null,
   now: number,
+  modelId?: string,
 ) {
-  return !quotaSnapshotIsFresh(account.quota, storage, now)
+  if (!quotaSnapshotIsFresh(account.quota, storage, now)) return true
+  const scoped = getScopedQuotaWindowForModel(account.quota, modelId)
+  return Boolean(
+    scoped && now - scoped.checkedAt >= getQuotaCheckIntervalMs(storage),
+  )
 }
 
 function cachedQuotaWindowStillRelevant(
@@ -2050,6 +2605,63 @@ function mapScopedWeeklyLimits(
   return scoped
 }
 
+function mapExtraUsage(
+  usage: OAuthUsageResponse,
+): OAuthExtraUsageSnapshot | undefined {
+  if (usage.extra_usage?.is_enabled !== true) return undefined
+  const usedAmount = usage.extra_usage.used_credits
+  const limitAmount = usage.extra_usage.monthly_limit
+  if (
+    typeof usedAmount !== 'number' ||
+    !Number.isFinite(usedAmount) ||
+    typeof limitAmount !== 'number' ||
+    !Number.isFinite(limitAmount)
+  ) {
+    return undefined
+  }
+  const rawCurrency = usage.spend?.limit?.currency
+  const currency = rawCurrency == null ? 'USD' : nonEmptyString(rawCurrency)
+  const rawExponent = usage.spend?.limit?.exponent
+  const moneyExponent = rawExponent == null ? 2 : rawExponent
+  if (
+    !currency ||
+    !/^[A-Za-z]{3}$/.test(currency) ||
+    !Number.isInteger(moneyExponent) ||
+    moneyExponent < 0 ||
+    moneyExponent > 20
+  ) {
+    return undefined
+  }
+  return {
+    used: { amountMinor: usedAmount, currency, exponent: moneyExponent },
+    limit: { amountMinor: limitAmount, currency, exponent: moneyExponent },
+    ...(typeof usage.extra_usage.utilization === 'number' &&
+      Number.isFinite(usage.extra_usage.utilization) && {
+        utilizationPercent: usage.extra_usage.utilization,
+      }),
+    ...(nonEmptyString(usage.spend?.severity) && {
+      severity: nonEmptyString(usage.spend?.severity),
+    }),
+    exhausted: usedAmount >= limitAmount,
+  }
+}
+
+function mapBindingWindow(limits: OAuthUsageLimit[] | undefined) {
+  if (!Array.isArray(limits)) return undefined
+  const active = limits.find((limit) => limit?.is_active === true)
+  if (!active) return undefined
+  if (active.kind === 'session') return 'five_hour'
+  if (active.kind === 'weekly_all') return 'seven_day'
+  if (active.kind !== 'weekly_scoped' || active.group !== 'weekly') {
+    return undefined
+  }
+  const modelName = nonEmptyString(active.scope?.model?.display_name)
+  if (!modelName) return undefined
+  const identity = nonEmptyString(active.scope?.model?.id) ?? modelName
+  const slug = slugForQuotaIdentity(identity)
+  return slug ? `claude-weekly-scoped-${slug}` : undefined
+}
+
 function mapUsageWindow(
   window: OAuthUsageWindow | undefined,
   checkedAt: number,
@@ -2098,10 +2710,17 @@ export async function fetchOAuthQuotaSnapshot(input: {
 
   const checkedAt = input.now?.() ?? Date.now()
   const usage = (await response.json()) as OAuthUsageResponse
+  const bindingWindow = mapBindingWindow(usage.limits)
   return {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),
     seven_day: mapUsageWindow(usage.seven_day, checkedAt),
     scoped: mapScopedWeeklyLimits(usage.limits, checkedAt),
+    extraUsage: mapExtraUsage(usage),
+    ...(bindingWindow && {
+      bindingWindow,
+      bindingWindowSource: 'poll' as const,
+    }),
+    source: 'poll',
     checkedAt,
   } satisfies OAuthQuotaSnapshot
 }
@@ -2132,6 +2751,7 @@ export function upsertAccount(
       addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
       ...(account.type === 'oauth' && {
         quota: account.quota,
+        profile: account.profile,
         lastRefreshedAt: account.lastRefreshedAt,
         lastRefreshError: account.lastRefreshError,
         lastQuotaRefreshError: account.lastQuotaRefreshError,
@@ -2315,8 +2935,12 @@ export class FallbackAccountManager {
         }
         this.seedFallbackQuota(next, storage)
         const stale = this.quotaManager
-          ? this.quotaManager.isFallbackStale(next.id, next.access)
-          : quotaIsStale(next, storage, this.now())
+          ? this.quotaManager.isFallbackStale(
+              next.id,
+              next.access,
+              options.modelId,
+            )
+          : quotaIsStale(next, storage, this.now(), options.modelId)
         // Skip the request-time refresh when this account's quota API is
         // backed off (recent 429/5xx). Hitting it again would extend the
         // backoff; evaluate policy on the cached/seeded quota instead. Mirrors

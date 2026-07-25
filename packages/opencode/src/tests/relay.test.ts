@@ -139,6 +139,73 @@ describe('relay client', () => {
     )
   })
 
+  test('delivers genuine HTTP relay response headers to the caller', async () => {
+    const originalFetch = globalThis.fetch
+    const receivedHeaders: Headers[] = []
+    globalThis.fetch = mock(
+      async () =>
+        new Response('relay', {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.78',
+          },
+        }),
+    ) as unknown as typeof fetch
+    try {
+      const response = await sendViaRelay({
+        config,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-http-headers'),
+        body: 'body',
+        fallback: async () => new Response('direct'),
+        onResponseHeaders: (value) => {
+          receivedHeaders.push(value)
+          throw new Error('observer failure')
+        },
+      })
+
+      expect(await response.text()).toBe('relay')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(receivedHeaders).toHaveLength(1)
+    expect(
+      receivedHeaders[0]?.get('anthropic-ratelimit-unified-5h-utilization'),
+    ).toBe('0.78')
+  })
+
+  test('does not deliver headers when HTTP relay falls back to direct', async () => {
+    const originalFetch = globalThis.fetch
+    const receivedHeaders: Headers[] = []
+    globalThis.fetch = mock(
+      async () => new Response('relay unavailable', { status: 503 }),
+    ) as unknown as typeof fetch
+    try {
+      const response = await sendViaRelay({
+        config,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-http-direct-fallback'),
+        body: 'body',
+        fallback: async () =>
+          new Response('direct', {
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.42',
+            },
+          }),
+        onResponseHeaders: (value) => receivedHeaders.push(value),
+      })
+
+      expect(await response.text()).toBe('direct')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(receivedHeaders).toHaveLength(0)
+  })
+
   test('dumps final body and redacted relay payload when enabled', async () => {
     const originalFetch = globalThis.fetch
     const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
@@ -256,6 +323,7 @@ describe('relay client', () => {
 
   test('falls back to direct fetch on relay transport failure', async () => {
     const originalFetch = globalThis.fetch
+    const receivedHeaders: Headers[] = []
     globalThis.fetch = mock(async () => {
       throw new Error('relay offline')
     }) as unknown as typeof fetch
@@ -267,11 +335,13 @@ describe('relay client', () => {
         headers: headers('session-relay-c'),
         body: 'body',
         fallback: async () => new Response('direct'),
+        onResponseHeaders: (value) => receivedHeaders.push(value),
       })
       expect(await response.text()).toBe('direct')
     } finally {
       globalThis.fetch = originalFetch
     }
+    expect(receivedHeaders).toHaveLength(0)
   })
 
   test('can stream a response over websocket transport', async () => {
@@ -370,8 +440,9 @@ describe('relay client', () => {
     expect(sentPayloads[0]).toMatchObject({ mode: 'full_sync' })
   })
 
-  test('websocket optimistic response resolves immediately after local send', async () => {
+  test('websocket optimistic response resolves immediately and delivers headers once for duplicate response_start', async () => {
     const originalWebSocket = globalThis.WebSocket
+    const receivedHeaders: Headers[] = []
     let socket: OptimisticWebSocket | undefined
     let payloadId = ''
     let acceptedSent = false
@@ -412,6 +483,7 @@ describe('relay client', () => {
         body: 'body',
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
+        onResponseHeaders: (value) => receivedHeaders.push(value),
       })
       expect(response.status).toBe(200)
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
@@ -437,6 +509,22 @@ describe('relay client', () => {
             type: 'response_start',
             id: payloadId,
             status: 200,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.78',
+            },
+          }),
+        }),
+      )
+      socket?.dispatchEvent(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            protocol: 2,
+            type: 'response_start',
+            id: payloadId,
+            status: 200,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.78',
+            },
           }),
         }),
       )
@@ -451,14 +539,86 @@ describe('relay client', () => {
         }),
       )
       expect(await textPromise).toBe('event: message_stop\n\n')
+      expect(receivedHeaders).toHaveLength(1)
+      expect(
+        receivedHeaders[0]?.get('anthropic-ratelimit-unified-5h-utilization'),
+      ).toBe('0.78')
     } finally {
       globalThis.WebSocket = originalWebSocket
     }
   })
 
+  test('does not deliver headers for websocket errors before response_start', async () => {
+    const originalWebSocket = globalThis.WebSocket
+    const originalFetch = globalThis.fetch
+    const receivedHeaders: Headers[] = []
+
+    class ErrorWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+
+      constructor() {
+        super()
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        queueMicrotask(() => {
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'error',
+                id: payload.id,
+                status: 502,
+                message: 'upstream failed',
+              }),
+            }),
+          )
+        })
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket = ErrorWebSocket as unknown as typeof WebSocket
+    globalThis.fetch = mock(async () => {
+      throw new Error('http relay unavailable')
+    }) as unknown as typeof fetch
+    try {
+      await expect(
+        sendViaRelay({
+          config: { ...websocketConfig, fallbackToDirect: false },
+          input: 'https://api.anthropic.com/v1/messages?beta=true',
+          init: { method: 'POST' },
+          headers: headers('session-relay-ws-error'),
+          body: 'body',
+          fallback: async () => new Response('direct'),
+          optimisticResponse: false,
+          onResponseHeaders: (value) => receivedHeaders.push(value),
+        }),
+      ).rejects.toThrow('http relay unavailable')
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+      globalThis.fetch = originalFetch
+    }
+
+    expect(receivedHeaders).toHaveLength(0)
+  })
+
   test('websocket optimistic response reconnects and retries when socket closes before upstream response', async () => {
     const originalWebSocket = globalThis.WebSocket
     const sentPayloads: Array<{ id: string; mode: string }> = []
+    const receivedHeaders: Headers[] = []
     let socketCount = 0
 
     class ClosingBeforeResponseWebSocket extends EventTarget {
@@ -505,6 +665,9 @@ describe('relay client', () => {
                 type: 'response_start',
                 id: payload.id,
                 status: 200,
+                headers: {
+                  'anthropic-ratelimit-unified-5h-utilization': '0.64',
+                },
               }),
             }),
           )
@@ -541,6 +704,7 @@ describe('relay client', () => {
         body: 'body',
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
+        onResponseHeaders: (value) => receivedHeaders.push(value),
       })
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
       expect(await response.text()).toBe('event: message_stop\n\n')
@@ -554,11 +718,16 @@ describe('relay client', () => {
       'full_sync',
     ])
     expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+    expect(receivedHeaders).toHaveLength(1)
+    expect(
+      receivedHeaders[0]?.get('anthropic-ratelimit-unified-5h-utilization'),
+    ).toBe('0.64')
   })
 
   test('websocket optimistic response retries when socket closes after response_start before stream bytes', async () => {
     const originalWebSocket = globalThis.WebSocket
     const sentPayloads: Array<{ id: string; mode: string }> = []
+    const receivedHeaders: Headers[] = []
     let socketCount = 0
 
     class ClosingBeforeStreamBytesWebSocket extends EventTarget {
@@ -601,6 +770,10 @@ describe('relay client', () => {
                 type: 'response_start',
                 id: payload.id,
                 status: 200,
+                headers: {
+                  'anthropic-ratelimit-unified-5h-utilization':
+                    this.socketNumber === 1 ? '0.91' : '0.42',
+                },
               }),
             }),
           )
@@ -643,6 +816,7 @@ describe('relay client', () => {
         body: 'body',
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
+        onResponseHeaders: (value) => receivedHeaders.push(value),
       })
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
       expect(await response.text()).toBe('event: message_stop\n\n')
@@ -656,6 +830,11 @@ describe('relay client', () => {
       'full_sync',
     ])
     expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+    expect(
+      receivedHeaders.map((value) =>
+        value.get('anthropic-ratelimit-unified-5h-utilization'),
+      ),
+    ).toEqual(['0.42'])
   })
 
   test('websocket optimistic response reports stream close after bytes without retry', async () => {

@@ -337,6 +337,21 @@ production-only regression (env-override bypass) — first-hand DIFF review caug
 
 ---
 
+## 8. Relay response eligibility for quota harvest — DONE
+
+OpenCode harvests genuine upstream headers from both relay transports without a quota side channel.
+HTTP delivery is gated on `usedRelay`; WebSocket delivery comes from `response_start` before the
+optimistic-response early return. Relay-to-direct fallback invokes only the direct-path harvester,
+and synthetic optimistic headers remain ineligible.
+
+## 9. Pi quota-header harvest parity — FOLLOW-UP
+
+Pi uses the distinct `packages/pi/src/stream.ts` response path. Header harvest, served-account
+attribution, sidecar persistence, and quota display parity remain out of scope for v1. Port the
+OpenCode direct-path behavior without sharing request-path state implicitly, then gate Pi's own
+streaming response headers and malformed-header handling.
+Relay-header callback wiring is also OpenCode-only; Pi parity remains outstanding.
+
 ## Implementation phase (operator directive)
 
 When implementation begins, create a **fresh parity branch off `upstream/main`** — NOT off `dev`,

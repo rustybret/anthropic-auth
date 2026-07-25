@@ -10,3 +10,7 @@ process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
   testDir,
   'sidebar-state.json',
 )
+process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
+  testDir,
+  'cachekeep-registry',
+)
