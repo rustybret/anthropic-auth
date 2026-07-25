@@ -56,6 +56,7 @@ export type ClaudeOAuthRefreshResult = {
   refresh: string
   expires: number
   expiresIn: number
+  authLineageId?: string
 }
 
 export const TOKEN_REFRESH_TIMEOUT_MS = 30_000
@@ -76,6 +77,7 @@ function isTransientNetworkError(error: unknown) {
 
 export async function refreshClaudeOAuthToken(input: {
   refreshToken: string
+  authLineageId?: string
   fetchImpl?: typeof fetch
   now?: () => number
   maxRetries?: number
@@ -135,6 +137,7 @@ export async function refreshClaudeOAuthToken(input: {
         refresh: json.refresh_token ?? input.refreshToken,
         expires: refreshedAt + json.expires_in * 1000,
         expiresIn: json.expires_in,
+        authLineageId: input.authLineageId,
       }
     } catch (error) {
       if (error instanceof ClaudeOAuthRefreshError) throw error
