@@ -8,6 +8,7 @@ packages/opencode/src/tui-compiled/
 # Local agent/dev state
 .opencode/
 .claude/
+.cortexkit/
 
 # Editor and OS metadata
 .DS_Store
