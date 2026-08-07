@@ -9,6 +9,7 @@ packages/opencode/src/tui-compiled/
 .opencode/
 .claude/
 .cortexkit/
+coordination_notes/
 
 # Editor and OS metadata
 .DS_Store
