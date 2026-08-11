@@ -33,6 +33,10 @@ import {
   resetNotificationsForTest,
 } from '../rpc/notifications'
 import {
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
+} from '../server-fallback'
+import {
   __setInitialSidebarRoutingTestHooks,
   __setSidebarStateWriteTestHooks,
   drainSidebarWrites,
@@ -59,7 +63,10 @@ async function freshPrimeQuotaResponse(
 }
 
 // Minimal mock of the OpenCode plugin client
-function createMockClient(messages?: unknown[]) {
+function createMockClient(
+  messages?: unknown[],
+  getSessionStatuses?: () => Record<string, { type: string }>,
+) {
   return {
     auth: {
       set: mock(() => Promise.resolve()),
@@ -67,6 +74,9 @@ function createMockClient(messages?: unknown[]) {
     session: {
       messages: messages
         ? mock(() => Promise.resolve({ data: messages }))
+        : undefined,
+      status: getSessionStatuses
+        ? mock(() => Promise.resolve({ data: getSessionStatuses() }))
         : undefined,
       promptAsync: mock((_input: unknown) => Promise.resolve()),
     },
@@ -704,6 +714,7 @@ describe('auth.loader', () => {
     __setInitialSidebarRoutingTestHooks(null)
     __setSidebarStateWriteTestHooks(null)
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = 'legacy'
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -718,6 +729,7 @@ describe('auth.loader', () => {
     __setInitialSidebarRoutingTestHooks(null)
     __setSidebarStateWriteTestHooks(null)
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -2510,7 +2522,8 @@ describe('auth.loader', () => {
     })
   })
 
-  test('routes to API-key fallback after main OAuth returns 429 and quota confirms exhaustion', async () => {
+  test('routes to API-key fallback after main OAuth returns 429 and strips server fallback fields from the custom provider request', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(
       createFallbackStorage({
         quota: {
@@ -2532,11 +2545,17 @@ describe('auth.loader', () => {
       }),
     )
 
-    const requests: Array<{ url: string; authorization: string | null }> = []
+    const requests: Array<{
+      url: string
+      authorization: string | null
+      beta: string | null
+      body: Record<string, unknown>
+    }> = []
     let quotaCalls = 0
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
-      const authorization = new Headers(init?.headers).get('authorization')
+      const headers = new Headers(init?.headers)
+      const authorization = headers.get('authorization')
       if (url.includes('/api/oauth/usage')) {
         quotaCalls++
         expect(authorization).toBe('Bearer main-access')
@@ -2550,7 +2569,12 @@ describe('auth.loader', () => {
           ),
         )
       }
-      requests.push({ url, authorization })
+      requests.push({
+        url,
+        authorization,
+        beta: headers.get('anthropic-beta'),
+        body: JSON.parse(String(init?.body)),
+      })
       if (requests.length === 1) {
         return Promise.resolve(new Response('main exhausted', { status: 429 }))
       }
@@ -2572,7 +2596,7 @@ describe('auth.loader', () => {
     const response = await result.fetch(MESSAGES_URL, {
       method: 'POST',
       body: JSON.stringify({
-        model: 'claude-opus-4-8',
+        model: 'claude-fable-5',
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
@@ -2583,11 +2607,17 @@ describe('auth.loader', () => {
     expect(requests[0]).toMatchObject({
       url: 'https://api.anthropic.com/v1/messages?beta=true',
       authorization: 'Bearer main-access',
+      body: expect.objectContaining({ fallbacks: 'default' }),
     })
+    expect(requests[0]?.beta?.split(',')).toContain(SERVER_SIDE_FALLBACK_BETA)
     expect(requests[1]).toMatchObject({
       url: 'https://api.kie.ai/claude/v1/messages?beta=true',
       authorization: 'Bearer kie-key',
     })
+    expect(requests[1]?.body).not.toHaveProperty('fallbacks')
+    expect(requests[1]?.beta?.split(',')).not.toContain(
+      SERVER_SIDE_FALLBACK_BETA,
+    )
   })
 
   test('does not route to API-key fallback after main 429 when quota does not confirm exhaustion', async () => {
@@ -7232,6 +7262,356 @@ describe('auth.loader', () => {
     ])
   })
 
+  test('normalizes a server fallback response even when no session-affinity header is available', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const frame = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    const fallbackSse = [
+      frame('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_fallback', model: 'claude-opus-5' },
+      }),
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      frame('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: 1,
+          iterations: [
+            {
+              type: 'message',
+              model: 'claude-fable-5',
+              input_tokens: 1,
+              output_tokens: 0,
+            },
+            {
+              type: 'fallback_message',
+              model: 'claude-opus-5',
+              input_tokens: 1,
+              output_tokens: 1,
+            },
+          ],
+        },
+      }),
+      frame('message_stop', { type: 'message_stop' }),
+    ].join('')
+    let sentBody: Record<string, unknown> | undefined
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (!extractUrl(input).includes('/v1/messages')) {
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        sentBody = JSON.parse(String(init?.body))
+        return Promise.resolve(new Response(fallbackSse, { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    const responseText = await response.text()
+
+    expect(sentBody?.fallbacks).toBe('default')
+    expect(responseText).not.toContain('"type":"fallback","from"')
+    expect(responseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+  })
+
+  test('uses Anthropic server-side fallback by default and reports fallback and restoration transitions', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false } as AccountStorage['quota'],
+      }),
+    )
+    const requestBodies: Array<Record<string, unknown>> = []
+    const requestBetas: string[] = []
+    let modelRequest = 0
+    const frame = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    const fallbackSse = [
+      frame('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_fallback', model: 'claude-opus-5' },
+      }),
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'text', text: '' },
+      }),
+      frame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'text_delta', text: 'fallback answer' },
+      }),
+      frame('content_block_stop', { type: 'content_block_stop', index: 1 }),
+      frame('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: 2,
+          iterations: [
+            {
+              type: 'message',
+              model: 'claude-fable-5',
+              input_tokens: 100,
+              output_tokens: 0,
+            },
+            {
+              type: 'fallback_message',
+              model: 'claude-opus-5',
+              input_tokens: 100,
+              output_tokens: 2,
+            },
+          ],
+        },
+      }),
+      frame('message_stop', { type: 'message_stop' }),
+    ].join('')
+    const restoredSse = [
+      frame('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_restored', model: 'claude-fable-5' },
+      }),
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      }),
+      frame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'source answer' },
+      }),
+      frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      frame('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: 2,
+          iterations: [
+            {
+              type: 'message',
+              model: 'claude-fable-5',
+              input_tokens: 100,
+              output_tokens: 2,
+            },
+          ],
+        },
+      }),
+      frame('message_stop', { type: 'message_stop' }),
+    ].join('')
+
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (!extractUrl(input).includes('/v1/messages')) {
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        requestBodies.push(JSON.parse(String(init?.body)))
+        requestBetas.push(
+          new Headers(init?.headers).get('anthropic-beta') ?? '',
+        )
+        modelRequest++
+        return Promise.resolve(
+          new Response(modelRequest === 1 ? fallbackSse : restoredSse, {
+            status: 200,
+          }),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
+    const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
+    const mockClient = createMockClient([
+      {
+        info: {
+          id: latestUserMessageId,
+          role: 'user',
+          agent: 'Alfonso - CTO',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5',
+            variant: 'xhigh',
+          },
+        },
+      },
+      {
+        info: {
+          id: latestAssistantMessageId,
+          role: 'assistant',
+          agent: 'Alfonso - CTO',
+          providerID: 'anthropic',
+          modelID: 'claude-fable-5',
+          variant: 'xhigh',
+        },
+      },
+    ])
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_server_fallback' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    const fallbackResponse = await result.fetch(MESSAGES_URL, request)
+    const fallbackResponseText = await fallbackResponse.text()
+    expect(fallbackResponseText).toContain('fallback answer')
+    expect(fallbackResponseText).not.toContain('"type":"fallback","from"')
+    expect(fallbackResponseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(requestBodies).toHaveLength(1)
+    expect(requestBodies[0]?.fallbacks).toBe('default')
+    expect(requestBetas[0]?.split(',')).toContain(SERVER_SIDE_FALLBACK_BETA)
+    const switched = await waitForSidebarState((state) =>
+      Boolean(
+        state.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_server_fallback' &&
+            recovery.mode === 'server',
+        ),
+      ),
+    )
+    expect(switched.fableRecoveries?.[0]).toMatchObject({
+      requestedModelId: 'claude-fable-5',
+      targetModelId: 'claude-opus-5',
+      remaining: 0,
+    })
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestAssistantMessageId,
+            sessionID: 'ses_server_fallback',
+            role: 'assistant',
+            time: { completed: Date.now() },
+          },
+        },
+      },
+    })
+    await waitForMockCall(mockClient.session.promptAsync)
+    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        path: { id: 'ses_server_fallback' },
+        body: expect.objectContaining({
+          noReply: true,
+          parts: [
+            expect.objectContaining({
+              text: expect.stringContaining('Anthropic safety fallback'),
+            }),
+          ],
+        }),
+      }),
+    )
+
+    const restoredResponse = await result.fetch(MESSAGES_URL, request)
+    // OpenCode can publish the assistant-completed event before the wrapped
+    // response emits its final fallback outcome. The later idle event must flush
+    // a notice queued after that completion event without starting another turn.
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestAssistantMessageId,
+            sessionID: 'ses_server_fallback',
+            role: 'assistant',
+            time: { completed: Date.now() },
+          },
+        },
+      },
+    })
+    await expect(restoredResponse.text()).resolves.toContain('source answer')
+    const restored = await waitForSidebarState((state) =>
+      Boolean(
+        state.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_server_fallback' &&
+            recovery.mode === 'fable',
+        ),
+      ),
+    )
+    expect(restored.fableRecoveries?.[0]?.requestedModelId).toBe(
+      'claude-fable-5',
+    )
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_server_fallback',
+          status: { type: 'idle' },
+        },
+      },
+    })
+    await waitForMockCall({
+      mock: {
+        get calls() {
+          return mockClient.session.promptAsync.mock.calls.slice(1)
+        },
+      },
+    })
+    expect(mockClient.session.promptAsync.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              text: expect.stringContaining('Returning to Fable 5'),
+            }),
+          ],
+        }),
+      }),
+    )
+  })
+
   test('downgrades a filtered Fable session for ten successful Opus turns and warms Fable after each', async () => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -7294,30 +7674,35 @@ describe('auth.loader', () => {
 
     const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
     const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
-    const mockClient = createMockClient([
-      {
-        info: {
-          id: latestUserMessageId,
-          role: 'user',
-          agent: 'Alfonso - CTO',
-          model: {
+    let sessionIdle = false
+    const mockClient = createMockClient(
+      [
+        {
+          info: {
+            id: latestUserMessageId,
+            role: 'user',
+            agent: 'Alfonso - CTO',
+            model: {
+              providerID: 'anthropic',
+              modelID: 'claude-fable-5',
+              variant: 'xhigh',
+            },
+          },
+        },
+        {
+          info: {
+            id: latestAssistantMessageId,
+            role: 'assistant',
+            agent: 'Alfonso - CTO',
             providerID: 'anthropic',
             modelID: 'claude-fable-5',
             variant: 'xhigh',
           },
         },
-      },
-      {
-        info: {
-          id: latestAssistantMessageId,
-          role: 'assistant',
-          agent: 'Alfonso - CTO',
-          providerID: 'anthropic',
-          modelID: 'claude-fable-5',
-          variant: 'xhigh',
-        },
-      },
-    ])
+      ],
+      (): Record<string, { type: string }> =>
+        sessionIdle ? {} : { ses_fable_filter: { type: 'busy' } },
+    )
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
       () =>
@@ -7350,8 +7735,7 @@ describe('auth.loader', () => {
       caught = error
     }
     expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    await waitForMockCall(mockClient.session.promptAsync)
-    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
     const switchedState = await waitForSidebarState((state) =>
       Boolean(
         state.fableRecoveries?.some(
@@ -7369,6 +7753,19 @@ describe('auth.loader', () => {
 
     const firstOpus = await result.fetch(MESSAGES_URL, request)
     await firstOpus.text()
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestAssistantMessageId,
+            sessionID: 'ses_fable_filter',
+            role: 'assistant',
+            time: { completed: Date.now() },
+          },
+        },
+      },
+    })
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
     expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
@@ -7476,6 +7873,21 @@ describe('auth.loader', () => {
         (recovery) => recovery.sessionId === 'ses_fable_filter',
       )?.mode,
     ).toBe('opus')
+
+    // Reproduce the host race: OpenCode can publish idle while the final cache
+    // warm is still pending, before the restoration notice has been queued.
+    sessionIdle = true
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_fable_filter',
+          status: { type: 'idle' },
+        },
+      },
+    })
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
+
     releaseFinalWarm?.()
     const restored = await restoredPromise
     await restored.text()

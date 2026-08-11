@@ -271,6 +271,36 @@ describe('getFableRecoverySummary', () => {
     expect(getFableRecoverySummary(state, 'ses_unknown')).toBeUndefined()
   })
 
+  test('shows Anthropic server-side fallback without a turn countdown', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'server',
+          remaining: 0,
+          changedAt: 321,
+          requestedModelId: 'claude-fable-5',
+          targetModelId: 'claude-opus-5',
+        },
+        {
+          sessionId: 'ses_opus',
+          mode: 'server',
+          remaining: 0,
+          changedAt: 322,
+          requestedModelId: 'claude-opus-5',
+          targetModelId: 'claude-opus-4-8',
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_fable')).toBe(
+      'Fable 5→Opus 5 · safety',
+    )
+    expect(getFableRecoverySummary(state, 'ses_opus')).toBe(
+      'Opus 5→Opus 4.8 · safety',
+    )
+  })
+
   test('shows the transition back to Fable', () => {
     const state = make({
       fableRecoveries: [
@@ -347,9 +377,9 @@ describe('formatFallbackModelLabel', () => {
     expect(formatFallbackModelLabel('claude-opus-5-20260701')).toBe('Opus 5')
   })
 
-  test('falls back to the raw id for unrecognized models', () => {
+  test('formats Opus 4.8 and falls back to raw unknown ids', () => {
+    expect(formatFallbackModelLabel('claude-opus-4-8')).toBe('Opus 4.8')
     expect(formatFallbackModelLabel('claude-fable-99')).toBe('claude-fable-99')
-    expect(formatFallbackModelLabel('claude-opus-4-8')).toBe('claude-opus-4-8')
   })
 
   test('defaults to Fable 5 when the id is missing', () => {

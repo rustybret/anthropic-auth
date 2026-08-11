@@ -34,7 +34,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
-- **Fable/Opus 5 content-filter recovery (OpenCode)**: when Fable or Opus 5 ends a session response with Anthropic's `refusal` content-filter reason, transparently retry that source-model family with Opus 4.8 for 10 successful model responses. Recovery state and pending cache warms remain independent when a session switches between Fable and Opus 5. After each downgraded response, a zero-output prewarm advances the source model's prompt cache using the OAuth account that served the filtered request. The latest Opus cache boundary is retained so a later refusal can bridge back even after more than 20 content blocks. The TUI sidebar and OpenCode Desktop report both transitions while preserving the selected model.
+- **Fable/Opus 5 safety fallback (OpenCode)**: eligible OAuth requests opt into Anthropic's server-side safety fallback by default. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history, and the TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to restore the previous deterministic 10-response Opus 4.8 recovery with source-model prewarming.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **Quota sidebar widget**: register the OpenCode TUI plugin in `tui.json` to render a live sidebar with per-account quota, routing, cache, and health state.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
@@ -293,6 +293,20 @@ Show current quota state:
 In OpenCode, this includes the main Anthropic account and sidecar fallback accounts. In Pi, the command reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`.
 
 Reset times are rendered as relative durations, such as `resets in 10m` or `resets in 1h 15m`.
+
+## Safety fallback (OpenCode)
+
+Eligible Fable 5 and Opus 5 OAuth requests use Anthropic's server-side safety fallback by default. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
+
+Custom API-key routes do not receive the server-side fallback beta or request field.
+
+To return to CortexKit's previous deterministic recovery mechanism, start OpenCode with:
+
+```bash
+OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy opencode
+```
+
+Legacy mode routes a refused Fable 5 or Opus 5 session through Opus 4.8 for 10 successful responses, prewarms the selected source model's cache, and then restores that model. Unset the variable and restart OpenCode to use Anthropic's server-side fallback again.
 
 ## Quota sidebar (OpenCode TUI)
 
@@ -631,6 +645,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to use the previous deterministic 10-response client-side refusal recovery. The default is Anthropic server-side safety fallback. |
 | `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE` | Override the persistent sticky-balanced session assignment file. |
 | `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Override the temporary OpenCode CacheKeep session lease directory. |
 | `OPENCODE_ANTHROPIC_AUTH_RPC_DIR` | Override the directory for the OpenCode TUI command-modal RPC bridge (port file + token). Defaults to a per-project path under the OpenCode state directory. |
@@ -651,7 +666,8 @@ For Claude Pro/Max OAuth requests, the plugin works at the final Anthropic wire-
 4. Prepends Claude Code identity and billing-header blocks.
 5. Rewrites cache controls according to `/claude-cache` mode.
 6. Renames MCP tool names into Claude-compatible PascalCase form.
-7. Computes final-body `cch` over the fully serialized request body.
+7. Opts eligible Fable 5 and Opus 5 OAuth requests into Anthropic's server-side safety fallback and restores stored fallback boundary markers.
+8. Computes final-body `cch` over the fully serialized request body.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation or source anchors, performs a small set of inline replacements, and preserves the rest of the prompt including user/project instructions, tool policy, environment context, and file paths.
 

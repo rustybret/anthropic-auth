@@ -172,6 +172,7 @@ export type SpawnedOpencode = {
 export type SpawnOptions = {
   anthropicBaseURL: string
   hybridCache?: boolean
+  fallbackMode?: 'server' | 'legacy'
   relay?: {
     url: string
     token: string
@@ -405,6 +406,11 @@ export async function spawnOpencode(
       'opencode-anthropic-auth.log',
     )
     childEnv.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    if (options.fallbackMode) {
+      childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
+    } else {
+      delete childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    }
     childEnv.XDG_CONFIG_HOME = env.configDir
     childEnv.XDG_DATA_HOME = env.dataDir
     childEnv.XDG_CACHE_HOME = env.cacheDir

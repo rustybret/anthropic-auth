@@ -46,8 +46,11 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   `rewriteRequestBody()` pipeline: strip trailing assistant msgs → normalize Fable/Mythos thinking →
   inject billing header → sanitize system prompt (remove OpenCode identity, prepend Claude Code
   identity; `sanitize-memo.ts` memoized + `prompt-context.ts`) → apply cache strategy → add fast mode
-  → prefix tool names `mcp_` → sign body with `cch` (xxhash). `createStrippedStream()` reverses the
-  tool prefix in SSE events. Fail-closed: returns original body on parse failure.
+  → prefix tool names `mcp_` → opt eligible Fable 5/Opus 5 OAuth calls into server-side safety fallback
+  → restore fallback boundary markers → sign body with `cch` (xxhash). `createStrippedStream()` reverses
+  the tool prefix in SSE events and rewrites Anthropic `fallback` blocks into hidden signed markers that
+  OpenCode can persist. `server-fallback.ts` classifies handoff/sticky/restored outcomes; `legacy` mode
+  retains the deterministic 10-response Opus 4.8 path. Fail-closed: returns original body on parse failure.
 - **Coupling:** almost entirely **[A]** (Claude headers, betas, identity, cch, Anthropic SSE shape).
   The pipeline *structure* (buffer body → transform → re-serialize → sign) is the [G] graft pattern
   openai-auth reuses with a Codex core.

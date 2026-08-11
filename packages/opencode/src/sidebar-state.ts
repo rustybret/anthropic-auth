@@ -39,7 +39,7 @@ export interface SidebarAccountState {
 
 export interface FableRecoverySidebarState {
   sessionId: string
-  mode: 'opus' | 'fable'
+  mode: 'opus' | 'fable' | 'server'
   remaining: number
   changedAt: number
   /**
@@ -48,6 +48,8 @@ export interface FableRecoverySidebarState {
    * state files; older recoveries default to Fable 5 in the summary.
    */
   requestedModelId?: string
+  /** Anthropic-selected target while server-side safety fallback is active. */
+  targetModelId?: string
 }
 
 export interface PrimeSidebarAccountState {
@@ -371,7 +373,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         .flatMap((recovery): FableRecoverySidebarState[] => {
           if (
             typeof recovery.sessionId !== 'string' ||
-            (recovery.mode !== 'opus' && recovery.mode !== 'fable') ||
+            (recovery.mode !== 'opus' &&
+              recovery.mode !== 'fable' &&
+              recovery.mode !== 'server') ||
             typeof recovery.remaining !== 'number' ||
             !Number.isFinite(recovery.remaining) ||
             typeof recovery.changedAt !== 'number' ||
@@ -387,6 +391,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
               requestedModelId:
                 typeof recovery.requestedModelId === 'string'
                   ? recovery.requestedModelId
+                  : undefined,
+              targetModelId:
+                typeof recovery.targetModelId === 'string'
+                  ? recovery.targetModelId
                   : undefined,
             },
           ]
@@ -789,6 +797,8 @@ export function formatFallbackModelLabel(modelId: string | undefined): string {
     return 'Fable 5'
   if (modelId === 'claude-opus-5' || modelId?.startsWith('claude-opus-5-'))
     return 'Opus 5'
+  if (modelId === 'claude-opus-4-8' || modelId?.startsWith('claude-opus-4-8-'))
+    return 'Opus 4.8'
   return modelId ?? 'Fable 5'
 }
 
@@ -840,6 +850,9 @@ export function getFableRecoverySummary(
   if (!recovery) return undefined
   if (recovery.mode === 'fable') {
     return `${formatFallbackModelLabel(recovery.requestedModelId)} · restored`
+  }
+  if (recovery.mode === 'server') {
+    return `${formatFallbackModelLabel(recovery.requestedModelId)}→${formatFallbackModelLabel(recovery.targetModelId)} · safety`
   }
   return `Opus 4.8 · ${recovery.remaining} left`
 }

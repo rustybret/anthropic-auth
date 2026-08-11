@@ -2,6 +2,18 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.19.0
+
+### Minor Changes
+
+- Default eligible Fable 5 and Opus 5 OAuth requests to Anthropic's server-side safety fallback, preserve fallback conversation boundaries across stored history, and report active/restored model transitions in the TUI sidebar and OpenCode Desktop.
+- Keep the previous deterministic 10-response Opus 4.8 recovery available through `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`, including source-model cache prewarming and standby cache bridges.
+
+### Patch Changes
+
+- Reconcile Desktop fallback notices against live OpenCode session status when a delayed cache warm completes after the normal completion/idle events.
+- Strip trailing whitespace-only text blocks after the latest assistant tool call before Anthropic replay, preventing valid tool-result continuations from being rejected as unsupported assistant prefills.
+
 ## 1.18.0
 
 ### Minor Changes

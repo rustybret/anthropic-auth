@@ -28,6 +28,17 @@ export type MockResponse =
       headers?: Record<string, string>
     }
   | {
+      type: 'server_fallback'
+      fromModel: string
+      toModel: string
+      text: string
+      partialText?: string
+      thinkingText?: string
+      handoff?: boolean
+      usage?: MockUsage
+      headers?: Record<string, string>
+    }
+  | {
       type: 'error'
       status: number
       errorType: string
@@ -177,8 +188,10 @@ function createSseStream(
   const encoder = new TextEncoder()
   const usage = response.usage ?? DEFAULT_USAGE
   const messageId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`
-  const model =
+  const requestedModel =
     typeof requestBody.model === 'string' ? requestBody.model : 'mock-model'
+  const model =
+    response.type === 'server_fallback' ? response.toModel : requestedModel
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -216,6 +229,108 @@ function createSseStream(
           type: 'message_delta',
           delta: { stop_reason: 'refusal', stop_sequence: null },
           usage: { output_tokens: usage.output_tokens },
+        })
+      } else if (response.type === 'server_fallback') {
+        let blockIndex = 0
+        if (response.partialText) {
+          send('content_block_start', {
+            type: 'content_block_start',
+            index: blockIndex,
+            content_block: { type: 'text', text: '' },
+          })
+          send('content_block_delta', {
+            type: 'content_block_delta',
+            index: blockIndex,
+            delta: { type: 'text_delta', text: response.partialText },
+          })
+          send('content_block_stop', {
+            type: 'content_block_stop',
+            index: blockIndex,
+          })
+          blockIndex++
+        }
+        if (response.handoff !== false) {
+          send('content_block_start', {
+            type: 'content_block_start',
+            index: blockIndex,
+            content_block: {
+              type: 'fallback',
+              from: { model: response.fromModel },
+              to: { model: response.toModel },
+            },
+          })
+          send('content_block_stop', {
+            type: 'content_block_stop',
+            index: blockIndex,
+          })
+          blockIndex++
+        }
+        if (response.thinkingText != null) {
+          send('content_block_start', {
+            type: 'content_block_start',
+            index: blockIndex,
+            content_block: { type: 'thinking', thinking: '' },
+          })
+          send('content_block_delta', {
+            type: 'content_block_delta',
+            index: blockIndex,
+            delta: {
+              type: 'thinking_delta',
+              thinking: response.thinkingText,
+            },
+          })
+          send('content_block_delta', {
+            type: 'content_block_delta',
+            index: blockIndex,
+            delta: {
+              type: 'signature_delta',
+              signature: 'mock-target-thinking-signature',
+            },
+          })
+          send('content_block_stop', {
+            type: 'content_block_stop',
+            index: blockIndex,
+          })
+          blockIndex++
+        }
+        send('content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: { type: 'text', text: '' },
+        })
+        send('content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: { type: 'text_delta', text: response.text },
+        })
+        send('content_block_stop', {
+          type: 'content_block_stop',
+          index: blockIndex,
+        })
+        send('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          usage: {
+            output_tokens: usage.output_tokens,
+            iterations: [
+              ...(response.handoff === false
+                ? []
+                : [
+                    {
+                      type: 'message',
+                      model: response.fromModel,
+                      input_tokens: usage.input_tokens,
+                      output_tokens: 0,
+                    },
+                  ]),
+              {
+                type: 'fallback_message',
+                model: response.toModel,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+              },
+            ],
+          },
         })
       } else if (response.type === 'tool_use') {
         const startFrame = `event: content_block_start\ndata: ${JSON.stringify({

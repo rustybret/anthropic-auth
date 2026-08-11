@@ -50,9 +50,9 @@ type FableFallbackState = {
  * gate. The single shared fallback id matches Anthropic's default for both
  * source models, so the recovery period is uniform.
  */
-type RecoverableRefusalFamily = 'fable-5' | 'opus-5'
+export type RecoverableRefusalFamily = 'fable-5' | 'opus-5'
 
-function recoverableRefusalFamily(
+export function recoverableRefusalFamily(
   model: unknown,
 ): RecoverableRefusalFamily | null {
   if (typeof model !== 'string') return null
@@ -66,7 +66,7 @@ function recoverableRefusalFamily(
   return null
 }
 
-function isRecoverableRefusalModel(model: unknown): model is string {
+export function isRecoverableRefusalModel(model: unknown): model is string {
   return recoverableRefusalFamily(model) !== null
 }
 

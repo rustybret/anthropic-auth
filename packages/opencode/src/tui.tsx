@@ -645,9 +645,9 @@ function QuotaSidebar(props: {
   const fableRecoveryTone = (): Tone =>
     state().fableRecoveries?.find(
       (recovery) => recovery.sessionId === props.sessionId,
-    )?.mode === 'opus'
-      ? 'warn'
-      : 'ok'
+    )?.mode === 'fable'
+      ? 'ok'
+      : 'warn'
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
     prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null

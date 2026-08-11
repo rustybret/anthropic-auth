@@ -40,7 +40,7 @@ anthropic-auth/
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `fable-fallback.ts` (session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, and outcome detection), `fable-fallback.ts` (legacy session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -58,7 +58,7 @@ anthropic-auth/
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers
-- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, tool prefix tests
+- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene)
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
@@ -88,7 +88,7 @@ anthropic-auth/
 - `packages/core/src/oauth-profile.ts`: OAuth profile metadata fetch, tier formatting (`Max 5x`, `Team · Max 5x`), and 7-day TTL validation
 - `packages/core/src/quota-headers.ts`: Normalization of `anthropic-ratelimit-unified-*` headers from direct fetch and relay transports into shared quota snapshots
 - `packages/core/src/token-fingerprint.ts`: Non-reversible SHA-256 token fingerprinting for profile-to-token binding
-- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling)
 - `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
 - `packages/core/src/cch.ts`: XXH64-based request body signing
@@ -108,9 +108,10 @@ anthropic-auth/
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting, system sanitization, cache strategy and model-specific cache bridges, tool prefix, SSE stripping
-- `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 downgrade state and standby cache-anchor identity for Fable/Opus 5 content-filter recovery
-- `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed Fable recovery state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, tool prefix, SSE stripping
+- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, and streamed handoff/sticky/restoration classification
+- `packages/opencode/src/fable-fallback.ts`: Legacy per-session and source-model-family 10-response Opus 4.8 downgrade state and standby cache-anchor identity, enabled by `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
+- `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
@@ -147,6 +148,6 @@ anthropic-auth/
 
 **New CLI command:** `packages/opencode/src/cli.ts` — add the subcommand handler following the `login`/`list`/`api add`/`relay setup` pattern.
 
-**New model spec:** `packages/core/src/models.ts` — add model ID, pricing, context window, and max output tokens constants. If it needs special request handling, update `packages/opencode/src/transform.ts` (e.g., Fable/Mythos thinking normalization or Sonnet 5 adaptive thinking normalization).
+**New model spec:** `packages/core/src/models.ts` — add model ID, pricing, context window, and max output tokens constants. If it needs special request handling, update `packages/opencode/src/transform.ts` (e.g., Fable/Mythos, Sonnet 5, or Opus 5 adaptive thinking normalization).
 
 **Shared utilities used across packages:** Extend `packages/core/src/` rather than duplicating between opencode and pi packages.

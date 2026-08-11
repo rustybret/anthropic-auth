@@ -7,6 +7,12 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
+  SERVER_FALLBACK_MARKER_TEXT,
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
+  type ServerSideFallbackOutcome,
+} from '../server-fallback'
+import {
   addFastModeBetaHeader,
   createStrippedStream,
   extractLatestHybridMessageCacheAnchor,
@@ -23,6 +29,9 @@ import {
   setOAuthHeaders,
   stripToolPrefix,
 } from '../transform'
+
+const sse = (event: string, data: unknown) =>
+  `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 
 describe('mergeHeaders', () => {
   test('copies headers from a Request object', () => {
@@ -151,6 +160,24 @@ describe('setOAuthHeaders', () => {
     for (const beta of REQUIRED_BETAS) {
       expect(headers.get('anthropic-beta')).toContain(beta)
     }
+  })
+
+  test('adds the server-side fallback beta only for opted-in bodies', () => {
+    const enabled = new Headers()
+    setOAuthHeaders(enabled, 'token', {
+      body: { model: 'claude-fable-5', fallbacks: 'default' },
+    })
+    expect(enabled.get('anthropic-beta')?.split(',')).toContain(
+      SERVER_SIDE_FALLBACK_BETA,
+    )
+
+    const disabled = new Headers()
+    setOAuthHeaders(disabled, 'token', {
+      body: { model: 'claude-fable-5' },
+    })
+    expect(disabled.get('anthropic-beta')?.split(',')).not.toContain(
+      SERVER_SIDE_FALLBACK_BETA,
+    )
   })
 })
 
@@ -636,6 +663,100 @@ describe('createStrippedStream', () => {
         (entry) => entry.stage === 'stream_tool_prefix_retryable_error',
       ),
     ).toBe(true)
+  })
+
+  test('reports server-side fallback outcomes without turning them into retryable errors', async () => {
+    const encoder = new TextEncoder()
+    const outcomes: ServerSideFallbackOutcome[] = []
+    const payload = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_1', model: 'claude-opus-5' },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: 1,
+          iterations: [
+            { type: 'message', model: 'claude-fable-5' },
+            { type: 'fallback_message', model: 'claude-opus-5' },
+          ],
+        },
+      }),
+    ].join('')
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(payload.slice(0, 77)))
+            controller.enqueue(encoder.encode(payload.slice(77)))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        serverSideFallbackModel: 'claude-fable-5',
+        onServerSideFallbackOutcome: (outcome) => outcomes.push(outcome),
+      },
+    )
+
+    const text = await response.text()
+    expect(text).toContain(
+      `"signature":"${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5"`,
+    )
+    expect(text).not.toContain('"content_block":{"type":"fallback"')
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        requestedModel: 'claude-fable-5',
+        servedModel: 'claude-opus-5',
+        targetModel: 'claude-opus-5',
+        fallback: true,
+        handoff: true,
+      }),
+    ])
+  })
+
+  test('preserves a mid-output fallback boundary as a replayable hidden marker', async () => {
+    const payload = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_1', model: 'claude-opus-5' },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 1 }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: 1 },
+      }),
+    ].join('')
+    const response = createStrippedStream(new Response(payload), {
+      serverSideFallbackModel: 'claude-fable-5',
+    })
+
+    const text = await response.text()
+    expect(text).not.toContain('"type":"fallback","from"')
+    expect(text).toContain(JSON.stringify(SERVER_FALLBACK_MARKER_TEXT))
+    expect(text).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
   })
 
   test('turns Fable refusal finishes into retryable errors and signals once', async () => {
@@ -1197,6 +1318,53 @@ describe('rewriteRequestBody', () => {
     const result = JSON.parse(await rewriteRequestBody(body))
 
     expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 5_000 })
+  })
+
+  test('opts recoverable OAuth models into Anthropic server-side fallback', async () => {
+    for (const model of ['claude-fable-5', 'claude-opus-5']) {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+          { serverSideFallbackEnabled: true },
+        ),
+      )
+      expect(result.fallbacks).toBe('default')
+    }
+  })
+
+  test('restores hidden fallback boundaries before signing replay requests', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5',
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                { type: 'text', text: 'partial' },
+                {
+                  type: 'thinking',
+                  thinking: SERVER_FALLBACK_MARKER_TEXT,
+                  signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
+                },
+                { type: 'text', text: 'continued' },
+              ],
+            },
+            { role: 'user', content: 'continue' },
+          ],
+        }),
+        { serverSideFallbackEnabled: true },
+      ),
+    )
+
+    expect(result.messages[0].content[1]).toEqual({
+      type: 'fallback',
+      from: { model: 'claude-fable-5' },
+      to: { model: 'claude-opus-5' },
+    })
   })
 
   test('requests summarized adaptive thinking for Opus 5 without thinking', async () => {
@@ -2361,6 +2529,84 @@ describe('rewriteRequestBody', () => {
     expect(result.messages.length).toBe(3)
     expect(result.messages[1].role).toBe('assistant')
     expect(result.messages[2].role).toBe('user')
+  })
+
+  test('strips trailing whitespace after the latest assistant tool_use turn', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'start' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+            { type: 'text', text: ' ' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'one' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_2', name: 'Bash', input: {} },
+            { type: 'text', text: 'Checking another result.' },
+            { type: 'tool_use', id: 'tool_3', name: 'Bash', input: {} },
+            { type: 'text', text: ' \n' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_2', content: 'two' },
+            { type: 'tool_result', tool_use_id: 'tool_3', content: 'three' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.messages[1].content.at(-1)).toEqual({
+      type: 'text',
+      text: ' ',
+    })
+    expect(result.messages[3].content).toEqual([
+      { type: 'tool_use', id: 'tool_2', name: 'mcp_Bash', input: {} },
+      { type: 'text', text: 'Checking another result.' },
+      { type: 'tool_use', id: 'tool_3', name: 'mcp_Bash', input: {} },
+    ])
+  })
+
+  test('preserves meaningful text after the latest assistant tool_use turn', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'start' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+            { type: 'text', text: 'Waiting for this result.' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.messages[1].content.at(-1)).toEqual({
+      type: 'text',
+      text: 'Waiting for this result.',
+    })
   })
 
   test('strips trailing assistant after tool_result + assistant', async () => {

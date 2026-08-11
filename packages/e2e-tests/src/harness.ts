@@ -25,6 +25,7 @@ type SdkClient = {
 export type E2EHarnessOptions = {
   relay?: 'websocket'
   hybridCache?: boolean
+  fallbackMode?: 'server' | 'legacy'
   childTmpDir?: string
 }
 
@@ -67,6 +68,7 @@ export class E2EHarness {
       anthropicBaseURL: baseURL,
       relay: relayConfig,
       hybridCache: options.hybridCache,
+      fallbackMode: options.fallbackMode,
       childTmpDir: options.childTmpDir,
     })
     const sdk = await import('@opencode-ai/sdk')

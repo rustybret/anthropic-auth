@@ -27,6 +27,12 @@ import {
   TOOL_PREFIX,
 } from '@cortexkit/anthropic-auth-core'
 import { makeByteBoundedMemo } from './sanitize-memo'
+import {
+  applyServerSideFallbackToBody,
+  createServerSideFallbackStreamRewriter,
+  SERVER_SIDE_FALLBACK_BETA,
+  type ServerSideFallbackOutcome,
+} from './server-fallback'
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -144,7 +150,13 @@ export function setOAuthHeaders(
     identity?: ClaudeCodeIdentity
   } = {},
 ): Headers {
-  return applyClaudeCodeHeaders(headers, accessToken, options)
+  return applyClaudeCodeHeaders(headers, accessToken, {
+    ...options,
+    extraBetas:
+      options.body?.fallbacks === 'default'
+        ? [SERVER_SIDE_FALLBACK_BETA]
+        : undefined,
+  })
 }
 
 /**
@@ -1064,6 +1076,49 @@ function stripTrailingAssistantMessages(parsed: Record<string, unknown>) {
 }
 
 /**
+ * Anthropic can classify whitespace-only text after the latest assistant
+ * tool_use as assistant prefill on a later tool continuation, even when the
+ * request ends with a user tool_result message. Preserve older turns and
+ * meaningful text to avoid unnecessary prompt-cache churn.
+ */
+function stripLatestAssistantToolUseTrailingWhitespace(
+  parsed: Record<string, unknown>,
+) {
+  if (!Array.isArray(parsed.messages)) return 0
+
+  for (let index = parsed.messages.length - 1; index >= 0; index--) {
+    const message = parsed.messages[index]
+    if (!isRecord(message) || message.role !== 'assistant') continue
+    if (!Array.isArray(message.content)) return 0
+    if (
+      !message.content.some(
+        (block) => isRecord(block) && block.type === 'tool_use',
+      )
+    ) {
+      return 0
+    }
+
+    let removedBlocks = 0
+    while (message.content.length) {
+      const block = message.content[message.content.length - 1]
+      if (
+        !isRecord(block) ||
+        block.type !== 'text' ||
+        typeof block.text !== 'string' ||
+        block.text.trim()
+      ) {
+        break
+      }
+      message.content.pop()
+      removedBlocks++
+    }
+    return removedBlocks
+  }
+
+  return 0
+}
+
+/**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
 type RewritePerfCallback = (
@@ -1118,6 +1173,7 @@ export async function rewriteRequestBody(
     identity?: ClaudeCodeIdentity
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
+    serverSideFallbackEnabled?: boolean
   } = {},
 ): Promise<string> {
   try {
@@ -1134,6 +1190,8 @@ export async function rewriteRequestBody(
       ? parsed.messages.length
       : undefined
     stripTrailingAssistantMessages(parsed)
+    const removedWhitespaceBlocks =
+      stripLatestAssistantToolUseTrailingWhitespace(parsed)
     const messagesAfterStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
       : undefined
@@ -1144,10 +1202,15 @@ export async function rewriteRequestBody(
         typeof messagesAfterStrip === 'number'
           ? messagesBeforeStrip - messagesAfterStrip
           : undefined,
+      removedWhitespaceBlocks,
     })
 
     const modelNormalizeStart = rewriteNowMs()
     const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
+    const serverSideFallback = applyServerSideFallbackToBody(
+      parsed,
+      options.serverSideFallbackEnabled === true,
+    )
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
     const sonnet5Thinking = normalizeSonnet5Request(parsed)
     const opus5Thinking = normalizeOpus5Request(parsed)
@@ -1164,6 +1227,9 @@ export async function rewriteRequestBody(
       opus5ThinkingDisplay: opus5Thinking?.display,
       replacedOpus5Thinking: opus5Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
+      serverSideFallbackEnabled: serverSideFallback.enabled,
+      serverFallbackMarkersRestored: serverSideFallback.restoredMarkers,
+      serverFallbackMarkersDropped: serverSideFallback.droppedMarkers,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
 
@@ -1630,6 +1696,8 @@ export function createStrippedStream(
     onContentFilter?: () => boolean | undefined
     onComplete?: (finishReason: string) => void
     contentFilterModel?: unknown
+    serverSideFallbackModel?: string
+    onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
   } = {},
 ): Response {
   if (!response.body) return response
@@ -1653,6 +1721,12 @@ export function createStrippedStream(
     options.onContentFilter || options.onComplete
       ? createSseFinishState()
       : undefined
+  const serverSideFallback = options.serverSideFallbackModel
+    ? createServerSideFallbackStreamRewriter({
+        requestedModel: options.serverSideFallbackModel,
+        onOutcome: options.onServerSideFallbackOutcome,
+      })
+    : undefined
 
   const updateFinish = (text: string) => {
     if (!sseFinish) return null
@@ -1709,86 +1783,97 @@ export function createStrippedStream(
         logProgress('stream_tool_prefix_first_pull')
       }
 
-      const readStart = rewriteNowMs()
-      try {
-        const { done, value } = await reader.read()
-        const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
-        if (done) {
-          const finalDecoded = decoder.decode()
-          if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, finalDecoded)
+      while (true) {
+        const readStart = rewriteNowMs()
+        try {
+          const { done, value } = await reader.read()
+          const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
+          if (done) {
+            const finalDecoded = decoder.decode()
+            if (sseDiagnostics)
+              updateSseDiagnostics(sseDiagnostics, finalDecoded)
+            const retryableStreamError =
+              updateSseErrorState(sseErrors, finalDecoded) ??
+              updateFinish(finalDecoded)
+            if (retryableStreamError) {
+              logProgress('stream_tool_prefix_retryable_error', {
+                error: retryableStreamError.message,
+                providerErrorType: retryableStreamError.providerErrorType,
+              })
+              await cancelReader(retryableStreamError)
+              throw retryableStreamError
+            }
+            const rewriteStart = rewriteNowMs()
+            const serverRewritten = serverSideFallback
+              ? serverSideFallback.push(finalDecoded) +
+                serverSideFallback.flush()
+              : finalDecoded
+            const flushed = splitToolPrefixRewriteBuffer(
+              `${pending}${serverRewritten}`,
+              true,
+            )
+            rewriteMs += rewriteNowMs() - rewriteStart
+            if (flushed.ready) {
+              const encoded = encoder.encode(flushed.ready)
+              outputBytes += encoded.byteLength
+              controller.enqueue(encoded)
+            }
+            logProgress('stream_tool_prefix_rewrite', { readMs })
+            releaseReader()
+            controller.close()
+            return
+          }
+
+          chunkCount++
+          inputBytes += value.byteLength
+          const decoded = decoder.decode(value, { stream: true })
+          if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
           const retryableStreamError =
-            updateSseErrorState(sseErrors, finalDecoded) ??
-            updateFinish(finalDecoded)
+            updateSseErrorState(sseErrors, decoded) ?? updateFinish(decoded)
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
               providerErrorType: retryableStreamError.providerErrorType,
+              readMs,
+              lastChunkBytes: value.byteLength,
             })
-            await cancelReader(retryableStreamError)
+            releaseReader()
             throw retryableStreamError
           }
+          const serverRewritten = serverSideFallback
+            ? serverSideFallback.push(decoded)
+            : decoded
+          const text = pending + serverRewritten
           const rewriteStart = rewriteNowMs()
-          const flushed = splitToolPrefixRewriteBuffer(
-            `${pending}${finalDecoded}`,
-            true,
-          )
+          const rewritten = splitToolPrefixRewriteBuffer(text)
           rewriteMs += rewriteNowMs() - rewriteStart
-          if (flushed.ready) {
-            const encoded = encoder.encode(flushed.ready)
+          pending = rewritten.pending
+          if (rewritten.ready) {
+            const encoded = encoder.encode(rewritten.ready)
             outputBytes += encoded.byteLength
             controller.enqueue(encoded)
           }
-          logProgress('stream_tool_prefix_rewrite', { readMs })
-          releaseReader()
-          controller.close()
-          return
-        }
 
-        chunkCount++
-        inputBytes += value.byteLength
-        const decoded = decoder.decode(value, { stream: true })
-        if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
-        const retryableStreamError =
-          updateSseErrorState(sseErrors, decoded) ?? updateFinish(decoded)
-        if (retryableStreamError) {
-          logProgress('stream_tool_prefix_retryable_error', {
-            error: retryableStreamError.message,
-            providerErrorType: retryableStreamError.providerErrorType,
-            readMs,
-            lastChunkBytes: value.byteLength,
+          const now = rewriteNowMs()
+          if (
+            chunkCount === 1 ||
+            chunkCount % 25 === 0 ||
+            now - lastProgressAt > 5000
+          ) {
+            lastProgressAt = now
+            logProgress('stream_tool_prefix_progress', {
+              readMs,
+              lastChunkBytes: value.byteLength,
+            })
+          }
+          if (rewritten.ready) return
+        } catch (error) {
+          logProgress('stream_tool_prefix_error', {
+            error: error instanceof Error ? error.message : String(error),
           })
           releaseReader()
-          throw retryableStreamError
+          throw error
         }
-        const text = pending + decoded
-        const rewriteStart = rewriteNowMs()
-        const rewritten = splitToolPrefixRewriteBuffer(text)
-        rewriteMs += rewriteNowMs() - rewriteStart
-        pending = rewritten.pending
-        if (rewritten.ready) {
-          const encoded = encoder.encode(rewritten.ready)
-          outputBytes += encoded.byteLength
-          controller.enqueue(encoded)
-        }
-
-        const now = rewriteNowMs()
-        if (
-          chunkCount === 1 ||
-          chunkCount % 25 === 0 ||
-          now - lastProgressAt > 5000
-        ) {
-          lastProgressAt = now
-          logProgress('stream_tool_prefix_progress', {
-            readMs,
-            lastChunkBytes: value.byteLength,
-          })
-        }
-      } catch (error) {
-        logProgress('stream_tool_prefix_error', {
-          error: error instanceof Error ? error.message : String(error),
-        })
-        releaseReader()
-        throw error
       }
     },
     async cancel(reason) {
