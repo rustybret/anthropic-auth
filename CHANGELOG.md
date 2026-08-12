@@ -2,6 +2,13 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Patch Changes
+
+- Keep deterministic Opus 4.8 recovery armed as a backstop when Anthropic's server-side safety policy still returns a refusal, while stripping the server-fallback opt-in from source-model prewarms.
+- Preserve completed tool calls when a served fallback later refuses, continuing with the existing tool result instead of replaying potentially non-idempotent tools.
+
 ## 1.19.0
 
 ### Minor Changes

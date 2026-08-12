@@ -49,8 +49,10 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   → prefix tool names `mcp_` → opt eligible Fable 5/Opus 5 OAuth calls into server-side safety fallback
   → restore fallback boundary markers → sign body with `cch` (xxhash). `createStrippedStream()` reverses
   the tool prefix in SSE events and rewrites Anthropic `fallback` blocks into hidden signed markers that
-  OpenCode can persist. `server-fallback.ts` classifies handoff/sticky/restored outcomes; `legacy` mode
-  retains the deterministic 10-response Opus 4.8 path. Fail-closed: returns original body on parse failure.
+  OpenCode can persist. `server-fallback.ts` classifies handoff/sticky/restored outcomes and preserves
+  completed tool calls when a served fallback later refuses. An unabsorbed server-policy refusal activates
+  the deterministic 10-response Opus 4.8 path as a backstop; `legacy` mode uses that path exclusively.
+  Fail-closed: returns original body on parse failure.
 - **Coupling:** almost entirely **[A]** (Claude headers, betas, identity, cch, Anthropic SSE shape).
   The pipeline *structure* (buffer body → transform → re-serialize → sign) is the [G] graft pattern
   openai-auth reuses with a Codex core.

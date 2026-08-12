@@ -2892,6 +2892,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             id?: string
             sessionID?: string
             role?: string
+            finish?: string
             time?: { completed?: number }
           }
           status?: { type?: string }
@@ -2912,6 +2913,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       if (
         value.type === 'message.updated' &&
         info?.role === 'assistant' &&
+        info.finish !== 'tool-calls' &&
         typeof info.time?.completed === 'number'
       ) {
         await flushDesktopNotices(sessionId)
@@ -4523,27 +4525,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 incomingHeaders.get('x-session-affinity') ||
                 incomingHeaders.get('x-opencode-session')
               const requestModel = parseRequestModel(init?.body)
-              const serverFallbackModel =
-                fallbackMode === 'server' &&
-                isRecoverableRefusalModel(requestModel)
-                  ? requestModel
-                  : undefined
               let fablePlan = fableFallbackManager.plan(sessionId, init?.body)
-              if (
-                fallbackMode === 'legacy' &&
-                fablePlan &&
-                !fablePlan.downgraded
-              ) {
+              if (fablePlan && !fablePlan.downgraded) {
                 const finalWarm = recoveryWarmChains.get(fablePlan.recoveryKey)
                 if (finalWarm) {
                   await finalWarm
                   fablePlan = fableFallbackManager.plan(sessionId, init?.body)
                 }
               }
+              const serverFallbackModel =
+                fallbackMode === 'server' &&
+                isRecoverableRefusalModel(
+                  fablePlan?.effectiveModel ?? requestModel,
+                )
+                  ? (fablePlan?.effectiveModel ?? requestModel)
+                  : undefined
               const fableRequest: FableRequestContext | undefined = fablePlan
                 ? { plan: fablePlan }
                 : undefined
-              if (fallbackMode === 'legacy' && fablePlan?.downgraded) {
+              if (fablePlan?.downgraded) {
                 init = { ...init, body: fablePlan.bodyText }
               }
 
@@ -4558,11 +4558,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
                   contentFilterModel: fablePlan?.requestedModel,
-                  ...(fallbackMode === 'legacy' &&
-                  !fablePlan?.downgraded &&
-                  fablePlan
+                  ...(!fablePlan?.downgraded && fablePlan
                     ? {
-                        onContentFilter: () => {
+                        onContentFilter: (context) => {
                           if (!fableRequest?.warmTarget) {
                             logger.debug(
                               'fable-fallback',
@@ -4575,12 +4573,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             fablePlan,
                             fableRequest.warmTarget.oauthAccountId,
                           )
+                          serverFallbackTargets.delete(fablePlan.recoveryKey)
                           logger.info(
                             'fable-fallback',
                             'content filter detected; switching session to Opus 4.8',
                             {
                               session: fablePlan.sessionId,
                               requestedModel: fablePlan.requestedModel,
+                              completedToolUse:
+                                context?.completedToolUse === true,
                               remaining,
                             },
                           )
@@ -4598,9 +4599,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         },
                       }
                     : {}),
-                  ...(fallbackMode === 'legacy' &&
-                  fablePlan?.downgraded &&
-                  fableRequest
+                  ...(fablePlan?.downgraded && fableRequest
                     ? {
                         onComplete: (finishReason: string) => {
                           const completed = fableFallbackManager.complete(

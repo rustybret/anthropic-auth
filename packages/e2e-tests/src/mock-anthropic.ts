@@ -39,6 +39,16 @@ export type MockResponse =
       headers?: Record<string, string>
     }
   | {
+      type: 'server_fallback_tool_refusal'
+      fromModel: string
+      toModel: string
+      name: string
+      input: Record<string, unknown>
+      refusalDelayMs?: number
+      usage?: MockUsage
+      headers?: Record<string, string>
+    }
+  | {
       type: 'error'
       status: number
       errorType: string
@@ -191,7 +201,10 @@ function createSseStream(
   const requestedModel =
     typeof requestBody.model === 'string' ? requestBody.model : 'mock-model'
   const model =
-    response.type === 'server_fallback' ? response.toModel : requestedModel
+    response.type === 'server_fallback' ||
+    response.type === 'server_fallback_tool_refusal'
+      ? response.toModel
+      : requestedModel
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -229,6 +242,42 @@ function createSseStream(
           type: 'message_delta',
           delta: { stop_reason: 'refusal', stop_sequence: null },
           usage: { output_tokens: usage.output_tokens },
+        })
+      } else if (response.type === 'server_fallback_tool_refusal') {
+        send('content_block_start', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'tool_use',
+            id: 'toolu_fallback_refusal',
+            name: response.name,
+            input: {},
+          },
+        })
+        send('content_block_delta', {
+          type: 'content_block_delta',
+          index: 0,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(response.input),
+          },
+        })
+        send('content_block_stop', { type: 'content_block_stop', index: 0 })
+        if (response.refusalDelayMs) await Bun.sleep(response.refusalDelayMs)
+        send('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'refusal', stop_sequence: null },
+          usage: {
+            output_tokens: usage.output_tokens,
+            iterations: [
+              {
+                type: 'fallback_message',
+                model: response.toModel,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+              },
+            ],
+          },
         })
       } else if (response.type === 'server_fallback') {
         let blockIndex = 0

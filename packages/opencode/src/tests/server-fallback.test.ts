@@ -346,4 +346,108 @@ describe('createServerSideFallbackStreamRewriter', () => {
     expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
     expect(output).toContain('partial source output')
   })
+
+  test('does not absorb a refusal while a tool call is incomplete', () => {
+    let handled = 0
+    const stream = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { model: 'claude-opus-4-8', usage: { input_tokens: 1 } },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_incomplete',
+          name: 'mcp_Bash',
+          input: {},
+        },
+      }),
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"command":' },
+      }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'refusal' },
+        usage: {
+          output_tokens: 1,
+          iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
+        },
+      }),
+      sse('message_stop', { type: 'message_stop' }),
+    ].join('')
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      onRefusalAfterToolUse: () => {
+        handled++
+        return true
+      },
+    })
+
+    const output = rewriter.push(stream) + rewriter.flush()
+
+    expect(handled).toBe(0)
+    expect(output).toContain('"stop_reason":"refusal"')
+    expect(output).not.toContain('"stop_reason":"tool_use"')
+  })
+
+  test('preserves a completed tool call when its fallback turn later refuses', () => {
+    let handled = 0
+    const outcomes: ServerSideFallbackOutcome[] = []
+    const stream = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { model: 'claude-opus-4-8', usage: { input_tokens: 1 } },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_1',
+          name: 'mcp_Peer_inbox',
+          input: {},
+        },
+      }),
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"action":"list"}' },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'refusal' },
+        usage: {
+          output_tokens: 1,
+          iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
+        },
+      }),
+      sse('message_stop', { type: 'message_stop' }),
+    ].join('')
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      onOutcome: (outcome) => outcomes.push(outcome),
+      onRefusalAfterToolUse: () => {
+        handled++
+        return true
+      },
+    })
+
+    const output = rewriter.push(stream) + rewriter.flush()
+
+    expect(handled).toBe(1)
+    expect(output).toContain('"stop_reason":"tool_use"')
+    expect(output).not.toContain('"stop_reason":"refusal"')
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        fallback: true,
+        targetModel: 'claude-opus-4-8',
+        stopReason: 'refusal',
+      }),
+    ])
+  })
 })

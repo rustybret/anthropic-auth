@@ -53,7 +53,7 @@ The OAuth spike did not issue a credit token:
 - The result was unchanged across two OAuth accounts, streaming and non-streaming requests, and requests carrying the server-fallback beta.
 - Server-side fallback succeeded on the same OAuth route and refusal prompt.
 
-Therefore Fallback Credit cannot implement OAuth refusal recovery in this plugin. Custom client retries remain useful only as the existing rollback path, without fallback-credit repricing.
+Therefore Fallback Credit cannot implement OAuth refusal recovery in this plugin. Client-managed recovery remains necessary as the server policy's unabsorbed-refusal backstop and as an exclusive legacy mode, without fallback-credit repricing.
 
 ## Implemented policy
 
@@ -63,13 +63,15 @@ OpenCode now defaults eligible Fable 5 and Opus 5 OAuth requests to Anthropic se
 2. Detect an initial handoff from the streamed `fallback` content block.
 3. Detect sticky fallback turns from the top-level served model and `usage.iterations[].type === "fallback_message"`.
 4. Detect restoration when the requested model serves a completed non-refusal turn without fallback evidence.
-5. Publish one session-scoped active/restored transition to the TUI sidebar or, when no matching TUI is connected, OpenCode Desktop.
+5. If an eligible OAuth response still ends in refusal, activate the deterministic ten-successful-response Opus 4.8 recovery as a client-side backstop. Source-model prewarms remove the server-fallback opt-in so they cannot be routed away from the model they are warming.
+6. If the refused response completed a tool call before its terminal refusal, preserve that call and continue the recovery with its existing tool result instead of replaying the original turn.
+7. Publish session-scoped active/restored transitions to the TUI sidebar or, when no matching TUI is connected, OpenCode Desktop.
 
 OpenCode's protocol does not natively retain Anthropic's `fallback` block. The stream rewriter therefore converts it to a hidden thinking block containing a CortexKit-owned signature before OpenCode persists the response. On the next eligible server-fallback request, the body transformer validates that signature and reconstructs the original `fallback` block before cache transforms and `cch` signing. Markers are dropped rather than forwarded to ineligible models or custom API-key providers.
 
 The fallback beta and payload field are OAuth/provider-specific. Custom Anthropic-compatible API-key routes strip both before forwarding.
 
-## Rollback mode
+## Exclusive legacy mode
 
 Set:
 
@@ -77,8 +79,8 @@ Set:
 OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy
 ```
 
-before starting OpenCode to restore the previous client-managed policy. Legacy mode keeps the existing ten-successful-response Opus 4.8 recovery, source-model zero-output prewarming, account-bound standby cache anchors, and deterministic countdown UX. No coexistence path runs both policies on one request: the environment variable selects server or legacy behavior at process startup.
+before starting OpenCode to bypass Anthropic's server policy and use the client-managed policy exclusively. Legacy mode keeps the ten-successful-response Opus 4.8 recovery, source-model zero-output prewarming, account-bound standby cache anchors, and deterministic countdown UX. Without the variable, server fallback remains the first line and client recovery activates only when the eligible OAuth response still refuses.
 
 ## Conclusion
 
-Server-side fallback is the default because it is the only Anthropic-supported OAuth mechanism that can turn safety refusals into completed responses. Its trade-offs remain server-controlled model selection, approximately one-hour best-effort stickiness, and cold fallback-model cache writes. The legacy mode remains intact as an explicit rollback path if live behavior proves worse than the deterministic ten-response policy.
+Server-side fallback remains the default first line because it is the Anthropic-supported OAuth mechanism for turning safety refusals into completed responses. Its trade-offs remain server-controlled model selection, approximately one-hour best-effort stickiness, cold fallback-model cache writes, and occasional terminal refusals even after a fallback model has produced output. Deterministic client recovery covers those unabsorbed refusals, while legacy mode remains available when the server policy should be bypassed entirely.

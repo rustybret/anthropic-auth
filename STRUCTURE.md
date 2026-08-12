@@ -108,9 +108,9 @@ anthropic-auth/
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, tool prefix, SSE stripping
-- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, and streamed handoff/sticky/restoration classification
-- `packages/opencode/src/fable-fallback.ts`: Legacy per-session and source-model-family 10-response Opus 4.8 downgrade state and standby cache-anchor identity, enabled by `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
+- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
+- `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state, source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering

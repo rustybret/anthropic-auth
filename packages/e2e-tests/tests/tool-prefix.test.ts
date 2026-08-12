@@ -190,6 +190,92 @@ describe('OpenCode Anthropic auth e2e', () => {
     ).toBe(true)
   }, 90_000)
 
+  it('continues a completed fallback tool call on Opus without replaying the side effect', async () => {
+    harness = await E2EHarness.create({ hybridCache: true })
+
+    const sideEffectPath = join(
+      harness.opencode.env.tempDir,
+      'fallback-tool-side-effect.txt',
+    )
+    const appendSideEffect = `printf x >> ${JSON.stringify(sideEffectPath)}`
+    harness.anthropic.script([
+      {
+        type: 'server_fallback',
+        fromModel: 'claude-fable-5',
+        toModel: 'claude-opus-4-8',
+        text: 'fallback established',
+      },
+      {
+        type: 'server_fallback_tool_refusal',
+        fromModel: 'claude-fable-5',
+        toModel: 'claude-opus-4-8',
+        name: 'mcp_Bash',
+        input: { command: appendSideEffect },
+        refusalDelayMs: 500,
+      },
+      { type: 'text', text: 'continued with the existing tool result' },
+    ])
+
+    const sessionId = await harness.createSession()
+    const first = await harness.sendPrompt(
+      sessionId,
+      'establish the server fallback',
+      60_000,
+      'claude-fable-5',
+    )
+    expect(JSON.stringify(first)).toContain('fallback established')
+
+    const recovered = await harness.sendPrompt(
+      sessionId,
+      'call the tool and then finish',
+      60_000,
+      'claude-fable-5',
+    )
+    expect(JSON.stringify(recovered)).toContain(
+      'continued with the existing tool result',
+    )
+    await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
+
+    await harness.waitFor(
+      () =>
+        harness.anthropic
+          .requests()
+          .some((request) => request.body.max_tokens === 0),
+      { timeoutMs: 5_000, label: 'source-model prewarm request' },
+    )
+
+    expect(await Bun.file(sideEffectPath).text()).toBe('x')
+    const generationRequests = harness.anthropic
+      .requests()
+      .filter(
+        (request) =>
+          request.body.model !== 'claude-haiku-4-5-20251001' &&
+          request.body.max_tokens !== 0,
+      )
+    expect(generationRequests.map((request) => request.body.model)).toEqual([
+      'claude-fable-5',
+      'claude-fable-5',
+      'claude-opus-4-8',
+    ])
+    expect(JSON.stringify(generationRequests[2]?.body)).toContain('tool_result')
+    expect(generationRequests[2]?.body.fallbacks).toBeUndefined()
+    expect(JSON.stringify(generationRequests[2]?.body)).not.toContain(
+      'cortexkit-server-fallback-v1:',
+    )
+
+    const prewarmRequest = harness.anthropic
+      .requests()
+      .find((request) => request.body.max_tokens === 0)
+    expect(prewarmRequest?.body.model).toBe('claude-fable-5')
+    expect(prewarmRequest?.body.fallbacks).toBeUndefined()
+    expect(JSON.stringify(prewarmRequest?.body)).not.toContain(
+      'cortexkit-server-fallback-v1:',
+    )
+    expect(prewarmRequest?.headers['anthropic-beta']).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
+  }, 60_000)
+
   it('retries a Fable refusal with Opus and immediately prewarms Fable', async () => {
     harness = await E2EHarness.create({
       hybridCache: true,

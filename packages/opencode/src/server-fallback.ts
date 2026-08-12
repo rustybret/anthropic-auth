@@ -217,12 +217,15 @@ function sameRequestedModel(requestedModel: string, servedModel: string) {
 export function createServerSideFallbackStreamRewriter(options: {
   requestedModel: string
   onOutcome?: (outcome: ServerSideFallbackOutcome) => void
+  onRefusalAfterToolUse?: () => boolean | undefined
 }) {
   let pending = ''
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
   let fallbackIterationModel: string | undefined
   let completed = false
+  let hasCompletedToolUse = false
+  const openToolUseIndexes = new Set<number>()
 
   const observeIterations = (usage: Record<string, unknown> | undefined) => {
     if (!Array.isArray(usage?.iterations)) return
@@ -264,10 +267,18 @@ export function createServerSideFallbackStreamRewriter(options: {
       observeIterations(asRecord(message?.usage))
     } else if (type === 'content_block_start') {
       const block = asRecord(data?.content_block)
+      const index = data?.index
+      if (
+        block?.type === 'tool_use' &&
+        typeof index === 'number' &&
+        Number.isInteger(index) &&
+        index >= 0
+      ) {
+        openToolUseIndexes.add(index)
+      }
       const marker = block ? markerFromFallbackBlock(block) : null
       if (marker) {
         handoff = marker
-        const index = data?.index
         if (
           typeof index === 'number' &&
           Number.isInteger(index) &&
@@ -276,10 +287,27 @@ export function createServerSideFallbackStreamRewriter(options: {
           return hiddenMarkerFrames(index, marker)
         }
       }
+    } else if (type === 'content_block_stop') {
+      const index = data?.index
+      if (typeof index === 'number' && openToolUseIndexes.delete(index)) {
+        hasCompletedToolUse = true
+      }
     } else if (type === 'message_delta') {
       observeIterations(asRecord(data?.usage))
-      const stopReason = stringField(asRecord(data?.delta), 'stop_reason')
+      const delta = asRecord(data?.delta)
+      const stopReason = stringField(delta, 'stop_reason')
       if (stopReason) complete(stopReason)
+      if (
+        stopReason === 'refusal' &&
+        hasCompletedToolUse &&
+        openToolUseIndexes.size === 0 &&
+        delta &&
+        options.onRefusalAfterToolUse &&
+        options.onRefusalAfterToolUse() !== false
+      ) {
+        delta.stop_reason = 'tool_use'
+        return `${parsed.event ? `event: ${parsed.event}\n` : ''}${data ? `data: ${JSON.stringify(data)}\n` : ''}${boundary}`
+      }
     }
     return rawEvent + boundary
   }
