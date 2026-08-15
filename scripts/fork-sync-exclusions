@@ -1,0 +1,9 @@
+# Standing conflict classes for anthropic-auth fork sync
+# Format: <action>: <glob>
+#
+# keep-deleted: files removed in this fork that upstream might re-introduce
+# take-theirs: regenerable files where upstream's version is always preferred
+
+# Arcus packaging outputs and transient local directories
+keep-deleted: dist-arcus/*
+keep-deleted: captures/*

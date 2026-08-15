@@ -6,6 +6,8 @@
     "packages/*"
   ],
   "scripts": {
+    "fork-sync": "bash scripts/fork-sync.sh",
+    "package:arcus": "bash scripts/pack-arcus.sh",
     "build": "cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
