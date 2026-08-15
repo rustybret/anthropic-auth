@@ -62,7 +62,7 @@ anthropic-auth/
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
-- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
+- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager and verification tests), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
 
 ## Key File Locations
 
