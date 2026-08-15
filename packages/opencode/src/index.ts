@@ -1496,7 +1496,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     primeManager.start()
   }
 
-  const fableWarmChains = new Map<string, Promise<void>>()
+  const _fableWarmChains = new Map<string, Promise<void>>()
 
   function warmRecoverySourceAfterOpus(context: FableRequestContext) {
     const sessionId = context.plan.sessionId
