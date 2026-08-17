@@ -10,6 +10,7 @@ packages/opencode/src/tui-compiled/
 .opencode/
 .claude/
 .cortexkit/
+.ucs/
 coordination_notes/
 
 # Editor and OS metadata
