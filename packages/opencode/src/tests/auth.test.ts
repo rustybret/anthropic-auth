@@ -12,10 +12,7 @@ import {
   TOKEN_URL,
 } from '@cortexkit/anthropic-auth-core'
 
-const originalSetTimeout = globalThis.setTimeout
-
 afterEach(() => {
-  globalThis.setTimeout = originalSetTimeout
   mock.restore()
 })
 
@@ -209,14 +206,13 @@ describe('refreshClaudeOAuthToken', () => {
     let calls = 0
     const setTimeoutMock = mock((handler: () => unknown) => {
       handler()
-      return 0
-    })
-    // @ts-expect-error — mock override for testing
-    globalThis.setTimeout = setTimeoutMock
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
 
     const result = await refreshClaudeOAuthToken({
       refreshToken: 'old-refresh',
       baseDelayMs: 25,
+      setTimeoutImpl: setTimeoutMock,
       fetchImpl: mock(() => {
         calls += 1
         if (calls === 1) {

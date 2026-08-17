@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  createStickyNoRouteResponse,
   decideStickyQuotaFailure,
   getStickyRoutingStatePath,
   type StickyRouteCandidate,
@@ -84,6 +85,64 @@ afterEach(async () => {
 })
 
 describe('sticky-balanced session routing', () => {
+  test('reports a permanent main auth failure when no fallback route is eligible', async () => {
+    const exhausted = candidate({
+      accountId: 'fallback',
+      order: 1,
+      fiveHour: 100,
+      sevenDay: 100,
+      fable: 0,
+    })
+    const response = createStickyNoRouteResponse({
+      mainRefreshError: {
+        message: 'invalid_grant',
+        checkedAt: NOW,
+        status: 400,
+        permanent: true,
+      },
+      routeQuotas: [exhausted.quota],
+      modelId: 'claude-fable-5',
+      now: NOW,
+    })
+
+    expect(response.status).toBe(401)
+    expect(response.headers.get('retry-after')).toBeNull()
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message:
+          'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for Fable.',
+      },
+    })
+  })
+
+  test('returns a scoped quota block when every sticky route is exhausted', async () => {
+    const exhausted = candidate({
+      accountId: 'main',
+      order: 0,
+      fiveHour: 100,
+      sevenDay: 100,
+      fable: 0,
+    })
+    const response = createStickyNoRouteResponse({
+      routeQuotas: [exhausted.quota],
+      modelId: 'claude-fable-5',
+      now: NOW,
+    })
+
+    expect(response.status).toBe(429)
+    expect(Number(response.headers.get('retry-after'))).toBe(96 * 60 * 60 + 60)
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message:
+          'Fable weekly limit reached, no routable OAuth accounts. Retry in 5761m 0s.',
+      },
+    })
+  })
+
   test('weights Fable accounts by spendable quota and time to reset', () => {
     const scarce = candidate({
       accountId: 'yiyi',

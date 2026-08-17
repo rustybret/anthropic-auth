@@ -477,6 +477,11 @@ function relayControlErrorMessage(
     : detail
 }
 
+type RelayTimerImplementations = {
+  setTimeout: typeof globalThis.setTimeout
+  clearTimeout: typeof globalThis.clearTimeout
+}
+
 type PendingWebSocketRequest = {
   payload: RelayPayload
   bodyText: string
@@ -513,6 +518,7 @@ class PersistentRelaySession {
   constructor(
     private readonly config: RelayConfig,
     private readonly affinity: string,
+    private readonly timers: RelayTimerImplementations,
   ) {}
 
   touch(now = Date.now()) {
@@ -657,7 +663,7 @@ class PersistentRelaySession {
       this.socket = socket
       this.serverState = undefined
 
-      const timeout = setTimeout(() => {
+      const timeout = this.timers.setTimeout(() => {
         socket.close()
         reject(new Error('relay websocket ready timed out'))
       }, 15_000)
@@ -670,14 +676,14 @@ class PersistentRelaySession {
           }
           const message = parseRelayControlMessage(event.data)
           if (message.type === 'ready') {
-            clearTimeout(timeout)
+            this.timers.clearTimeout(timeout)
             this.serverState = message.state
             resolve()
             return
           }
           this.handleMessage(message)
         } catch (error) {
-          clearTimeout(timeout)
+          this.timers.clearTimeout(timeout)
           reject(error)
           this.failPending(error)
           socket.close()
@@ -685,7 +691,7 @@ class PersistentRelaySession {
       })
 
       socket.addEventListener('error', () => {
-        clearTimeout(timeout)
+        this.timers.clearTimeout(timeout)
         const error = new RelayWebSocketConnectionResetError(
           'relay websocket error',
         )
@@ -694,7 +700,7 @@ class PersistentRelaySession {
       })
 
       socket.addEventListener('close', (event) => {
-        clearTimeout(timeout)
+        this.timers.clearTimeout(timeout)
         if (this.socket === socket) {
           this.socket = undefined
           this.serverState = undefined
@@ -781,8 +787,8 @@ class PersistentRelaySession {
   }
 
   private resetPendingTimeout(pending: PendingWebSocketRequest) {
-    clearTimeout(pending.timeout)
-    pending.timeout = setTimeout(() => {
+    this.timers.clearTimeout(pending.timeout)
+    pending.timeout = this.timers.setTimeout(() => {
       if (this.pending !== pending) return
       if (this.retryPendingBeforeResponse(pending, 'response timed out')) return
       this.failPending(new Error('relay websocket response timed out'))
@@ -802,7 +808,7 @@ class PersistentRelaySession {
 
     pending.retryAttempts += 1
     pending.retryingBeforeResponse = true
-    clearTimeout(pending.timeout)
+    this.timers.clearTimeout(pending.timeout)
     const attempt = pending.retryAttempts
     const originalId = pending.payload.id
     relayLog(
@@ -1015,7 +1021,7 @@ class PersistentRelaySession {
     relayLog(
       `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}${workerStats}`,
     )
-    clearTimeout(pending.timeout)
+    this.timers.clearTimeout(pending.timeout)
     if (!pending.streamDone) {
       this.deliverResponseHeaders(pending)
       pending.streamDone = true
@@ -1028,7 +1034,7 @@ class PersistentRelaySession {
   private failPending(error: unknown) {
     const pending = this.pending
     if (!pending) return
-    clearTimeout(pending.timeout)
+    this.timers.clearTimeout(pending.timeout)
     this.pending = undefined
     if (pending.responseStarted) {
       pending.streamController?.error(error)
@@ -1070,14 +1076,18 @@ function cleanupRelaySessionCaches(now = Date.now()) {
   }
 }
 
-function getPersistentRelaySession(config: RelayConfig, affinity: string) {
+function getPersistentRelaySession(
+  config: RelayConfig,
+  affinity: string,
+  timers: RelayTimerImplementations,
+) {
   cleanupRelaySessionCaches()
   const existing = websocketSessions.get(affinity)
   if (existing) {
     existing.touch()
     return existing
   }
-  const session = new PersistentRelaySession(config, affinity)
+  const session = new PersistentRelaySession(config, affinity, timers)
   websocketSessions.set(affinity, session)
   cleanupRelaySessionCaches()
   return session
@@ -1099,6 +1109,8 @@ export async function sendViaRelay(options: {
    * within an attempt are ignored.
    */
   onResponseHeaders?: (headers: Headers) => void
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  clearTimeoutImpl?: typeof globalThis.clearTimeout
 }): Promise<Response> {
   const {
     config,
@@ -1110,6 +1122,8 @@ export async function sendViaRelay(options: {
     affinity: explicitAffinity,
     optimisticResponse,
     onResponseHeaders,
+    setTimeoutImpl = globalThis.setTimeout,
+    clearTimeoutImpl = globalThis.clearTimeout,
   } = options
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
 
@@ -1153,7 +1167,10 @@ export async function sendViaRelay(options: {
     const sendStart = perfNowMs()
     if (config.transport === 'websocket') {
       try {
-        const session = getPersistentRelaySession(config, affinity)
+        const session = getPersistentRelaySession(config, affinity, {
+          setTimeout: setTimeoutImpl,
+          clearTimeout: clearTimeoutImpl,
+        })
         result = await session.send(
           payload,
           bodyText,

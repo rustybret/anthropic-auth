@@ -1,4 +1,4 @@
-import { watch } from 'node:fs'
+import { readFileSync, watch } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -292,12 +292,22 @@ const WATCH_POLL_MS = 100
 //      events, and against mtime granularity.
 //
 // Returns a disposer; never throws.
-export function watchTuiPreferences(onChange: () => void): () => void {
+export function watchTuiPreferences(
+  onChange: () => void,
+  options: { watchDirectory?: typeof watch } = {},
+): () => void {
   const file = getTuiPreferencesFile()
   const name = basename(file)
   let timer: ReturnType<typeof nativeSetTimeout> | null = null
+  // Capture the baseline before returning. An asynchronous seed can resolve
+  // after the caller's first write and absorb that change as already seen.
   let lastSeen: string | null = null
-  let observedEvent = false
+  try {
+    lastSeen = readFileSync(file, 'utf8')
+  } catch {
+    // Missing/unreadable files can still be created later and detected by the
+    // directory watcher or polling fallback.
+  }
   let disposed = false
 
   const checkForChange = async () => {
@@ -309,7 +319,6 @@ export function watchTuiPreferences(onChange: () => void): () => void {
   }
 
   const scheduleCheck = () => {
-    observedEvent = true
     if (timer) nativeClearTimeout(timer)
     timer = nativeSetTimeout(() => {
       timer = null
@@ -317,54 +326,52 @@ export function watchTuiPreferences(onChange: () => void): () => void {
     }, WATCH_DEBOUNCE_MS)
   }
 
-  // Seed asynchronously. If a real file event arrives before the read resolves,
-  // do not let the seed overwrite that pending change; the debounced re-read
-  // will compare against the previous value and fire.
-  void readFile(file, 'utf8')
-    .then((text) => {
-      if (!observedEvent && lastSeen === null) lastSeen = text
-    })
-    .catch(() => {})
-
+  let watcher: ReturnType<typeof watch> | null = null
   try {
-    const watcher = watch(dirname(file), (_event, filename) => {
-      // Exact match against the preferences file name, plus the temp file
-      // we use for atomic writes (carrying our pid + `.tmp`).
-      const isOurs =
-        filename === name ||
-        (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
-      if (filename != null && !isOurs) return
-      scheduleCheck()
-    })
-
-    // Bun's fs.watch can miss atomic temp-file rename updates on some
-    // backends, so keep a low-cost polling loop as the correctness path.
-    // Use recursive timers instead of fs.watchFile because watchFile can keep
-    // Bun test processes alive long after unwatchFile().
-    let pollTimer: ReturnType<typeof nativeSetTimeout> | null = null
-    let pollInFlight = false
-    const schedulePoll = () => {
-      if (disposed || pollTimer) return
-      pollTimer = nativeSetTimeout(() => {
-        pollTimer = null
-        if (disposed || pollInFlight) return
-        pollInFlight = true
-        void checkForChange().finally(() => {
-          pollInFlight = false
-          schedulePoll()
-        })
-      }, WATCH_POLL_MS)
-      pollTimer.unref?.()
-    }
-    schedulePoll()
-
-    return () => {
-      disposed = true
-      if (timer) nativeClearTimeout(timer)
-      if (pollTimer) nativeClearTimeout(pollTimer)
-      watcher.close()
-    }
+    watcher = (options.watchDirectory ?? watch)(
+      dirname(file),
+      (_event, filename) => {
+        // Exact match against the preferences file name, plus the temp file
+        // we use for atomic writes (carrying our pid + `.tmp`).
+        const isOurs =
+          filename === name ||
+          (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
+        if (filename != null && !isOurs) return
+        scheduleCheck()
+      },
+    )
   } catch {
-    return () => {}
+    // If the file exists, polling remains a complete fallback even when Bun
+    // cannot allocate a directory watcher (for example, transient EBADF).
+    // If neither the file nor its directory can be observed, remain a no-op.
+    if (lastSeen === null) return () => {}
+  }
+
+  // Bun's fs.watch can miss atomic temp-file renames and can itself fail after
+  // repeated close/recreate cycles, so polling must be independent of watcher
+  // construction. Recursive unreferenced timers avoid fs.watchFile's lingering
+  // handles while the host's normal event loop keeps active watchers polling.
+  let pollTimer: ReturnType<typeof nativeSetTimeout> | null = null
+  let pollInFlight = false
+  const schedulePoll = () => {
+    if (disposed || pollTimer) return
+    pollTimer = nativeSetTimeout(() => {
+      pollTimer = null
+      if (disposed || pollInFlight) return
+      pollInFlight = true
+      void checkForChange().finally(() => {
+        pollInFlight = false
+        schedulePoll()
+      })
+    }, WATCH_POLL_MS)
+    pollTimer.unref?.()
+  }
+  schedulePoll()
+
+  return () => {
+    disposed = true
+    if (timer) nativeClearTimeout(timer)
+    if (pollTimer) nativeClearTimeout(pollTimer)
+    watcher?.close()
   }
 }

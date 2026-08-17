@@ -242,14 +242,13 @@ async function waitForMockCall(fn: { mock?: { calls: unknown[] } }) {
  * with an already-expired OAuth token.
  */
 async function setupExpiredTokenLoader() {
-  // @ts-expect-error — mock override for testing
-  globalThis.setTimeout = mock((handler: () => unknown) => {
+  const setTimeoutMock = mock((handler: () => unknown) => {
     handler()
-    return 0
-  })
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
 
   const mockClient = createMockClient()
-  const plugin = await getPlugin(mockClient)
+  const plugin = await getPlugin(mockClient, { setTimeout: setTimeoutMock })
   const result = await plugin.auth.loader(
     () =>
       Promise.resolve({
@@ -271,15 +270,32 @@ function fireConcurrentFetches(result: { fetch: typeof fetch }) {
   )
 }
 
+type PluginTimerOverrides = Partial<{
+  setTimeout: typeof globalThis.setTimeout
+  setInterval: typeof globalThis.setInterval
+  clearInterval: typeof globalThis.clearInterval
+}>
+
+let pluginTimerOverrides: PluginTimerOverrides = {}
+
 async function getPlugin(
   client?: ReturnType<typeof createMockClient>,
+  timerOverrides: PluginTimerOverrides = pluginTimerOverrides,
   directory?: string,
 ) {
-  return (await AnthropicAuthPlugin({
-    // @ts-expect-error: minimal mock for testing
-    client: client ?? createMockClient(),
-    ...(directory && { directory }),
-  })) as Promise<any>
+  return (await (
+    AnthropicAuthPlugin as unknown as (
+      ctx: Parameters<typeof AnthropicAuthPlugin>[0],
+      timers?: PluginTimerOverrides,
+    ) => ReturnType<typeof AnthropicAuthPlugin>
+  )(
+    {
+      // @ts-expect-error: minimal mock for testing
+      client: client ?? createMockClient(),
+      ...(directory && { directory }),
+    },
+    timerOverrides,
+  )) as Promise<any>
 }
 
 describe('sidebar needsReauth (dead-fallback indicator)', () => {
@@ -694,17 +710,12 @@ describe('provider.models', () => {
 
 describe('auth.loader', () => {
   const originalFetch = globalThis.fetch
-  const originalSetTimeout = globalThis.setTimeout
-  const originalSetInterval = globalThis.setInterval
-  const originalClearInterval = globalThis.clearInterval
   const originalRandom = Math.random
   const originalDateNow = Date.now
 
   beforeEach(async () => {
     globalThis.fetch = originalFetch
-    globalThis.setTimeout = originalSetTimeout
-    globalThis.setInterval = originalSetInterval
-    globalThis.clearInterval = originalClearInterval
+    pluginTimerOverrides = {}
     Math.random = originalRandom
     Date.now = originalDateNow
     resetCache1hState()
@@ -720,9 +731,7 @@ describe('auth.loader', () => {
 
   afterEach(async () => {
     globalThis.fetch = originalFetch
-    globalThis.setTimeout = originalSetTimeout
-    globalThis.setInterval = originalSetInterval
-    globalThis.clearInterval = originalClearInterval
+    pluginTimerOverrides = {}
     Math.random = originalRandom
     Date.now = originalDateNow
     resetNotificationsForTest()
@@ -4625,9 +4634,19 @@ describe('auth.loader', () => {
     for (let generation = 0; generation < 66; generation++) {
       liveAccess = `token-${generation}`
       await showAccounts()
+      const expectedFingerprint = tokenFingerprint(liveAccess)
+      await waitForAccountStorage(
+        (storage) =>
+          storage?.main?.profile?.tokenFingerprint === expectedFingerprint,
+      )
     }
     liveAccess = 'token-0'
     await showAccounts()
+    await waitForAccountStorage(
+      (storage) =>
+        storage?.main?.profile?.tokenFingerprint ===
+        tokenFingerprint(liveAccess),
+    )
 
     expect(profileCalls).toBe(67)
   })
@@ -5168,14 +5187,16 @@ describe('auth.loader', () => {
     )
     Math.random = () => 0.5
     const intervalDelays: number[] = []
-    globalThis.setInterval = mock((handler: () => void, delay?: number) => {
+    const setIntervalMock = mock((handler: () => void, delay?: number) => {
       void handler
       intervalDelays.push(Number(delay))
       return { unref() {} }
     }) as unknown as typeof setInterval
-    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
 
-    const plugin = await getPlugin(createMockClient())
+    const plugin = await getPlugin(createMockClient(), {
+      setInterval: setIntervalMock,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    })
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -5199,11 +5220,10 @@ describe('auth.loader', () => {
       }),
     )
     const intervalHandlers: Array<() => void> = []
-    globalThis.setInterval = mock((handler: () => void) => {
+    const setIntervalMock = mock((handler: () => void) => {
       intervalHandlers.push(handler)
       return { unref() {} }
     }) as unknown as typeof setInterval
-    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
 
     globalThis.fetch = mock((input: any) => {
       const url = extractUrl(input)
@@ -5223,7 +5243,10 @@ describe('auth.loader', () => {
     }) as unknown as typeof fetch
 
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
+    const plugin = await getPlugin(mockClient, {
+      setInterval: setIntervalMock,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    })
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -5259,11 +5282,10 @@ describe('auth.loader', () => {
       }),
     )
     const intervalHandlers: Array<() => void> = []
-    globalThis.setInterval = mock((handler: () => void) => {
+    const setIntervalMock = mock((handler: () => void) => {
       intervalHandlers.push(handler)
       return { unref() {} }
     }) as unknown as typeof setInterval
-    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
 
     globalThis.fetch = mock((input: any) => {
       const url = extractUrl(input)
@@ -5283,7 +5305,10 @@ describe('auth.loader', () => {
     }) as unknown as typeof fetch
 
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
+    const plugin = await getPlugin(mockClient, {
+      setInterval: setIntervalMock,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    })
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -5504,11 +5529,8 @@ describe('auth.loader', () => {
     let tokenRefreshCalls = 0
     const setTimeoutMock = mock((handler: () => unknown) => {
       handler()
-      return 0
-    })
-
-    // @ts-expect-error — mock override for testing
-    globalThis.setTimeout = setTimeoutMock
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
 
     globalThis.fetch = mock((input: any) => {
       const url = extractUrl(input)
@@ -5538,7 +5560,7 @@ describe('auth.loader', () => {
     }) as unknown as typeof fetch
 
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
+    const plugin = await getPlugin(mockClient, { setTimeout: setTimeoutMock })
     const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -5565,11 +5587,8 @@ describe('auth.loader', () => {
     let tokenRefreshCalls = 0
     const setTimeoutMock = mock((handler: () => unknown) => {
       handler()
-      return 0
-    })
-
-    // @ts-expect-error — mock override for testing
-    globalThis.setTimeout = setTimeoutMock
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
 
     globalThis.fetch = mock((input: any) => {
       const url = extractUrl(input)
@@ -5582,7 +5601,9 @@ describe('auth.loader', () => {
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
-    const plugin = await getPlugin(createMockClient())
+    const plugin = await getPlugin(createMockClient(), {
+      setTimeout: setTimeoutMock,
+    })
     const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -6890,6 +6911,140 @@ describe('auth.loader', () => {
       'Bearer main-access',
       'Bearer scarce-access',
     ])
+  })
+
+  test('sticky-balanced reports main re-login instead of falling through when no fallback can serve the requested model', async () => {
+    const checkedAt = Date.now()
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        refresh: {
+          enabled: true,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 240,
+          mainLastRefreshError: {
+            message:
+              'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
+            checkedAt,
+            nextRetryAt: checkedAt + 24 * 60 * 60_000,
+            retryCount: 1,
+            tokenHash: hashRefreshToken('main-refresh'),
+            status: 400,
+            permanent: true,
+          },
+        },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(88),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'fallback-a',
+            type: 'oauth',
+            access: 'fallback-a-access',
+            refresh: 'fallback-a-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(0),
+          },
+          {
+            id: 'fallback-b',
+            type: 'oauth',
+            access: 'fallback-b-access',
+            refresh: 'fallback-b-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(0),
+          },
+        ],
+      }),
+    )
+    let messageRequests = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/v1/messages')) messageRequests += 1
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    let currentAuth = {
+      type: 'oauth' as const,
+      access: 'main-access',
+      refresh: 'main-refresh',
+      expires: checkedAt - 1,
+    }
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(currentAuth),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_no_fable_route' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message:
+          'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for Fable.',
+      },
+    })
+    expect(messageRequests).toBe(0)
+
+    currentAuth = {
+      type: 'oauth',
+      access: 'main-access',
+      refresh: 'relogged-main-refresh',
+      expires: checkedAt + 5 * 60 * 60_000,
+    }
+    const recovered = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_no_fable_route' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'after re-login' }],
+      }),
+    })
+
+    expect(recovered.status).toBe(200)
+    expect(messageRequests).toBe(1)
+    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(savedState.main?.lastRefreshError).toBeUndefined()
   })
 
   test('sticky-balanced uses API routes only after confirmed OAuth exhaustion', async () => {
@@ -9266,21 +9421,23 @@ describe('auth.loader', () => {
 
 describe('killswitch fetch gate', () => {
   const originalFetch = globalThis.fetch
-  const originalSetInterval = globalThis.setInterval
 
   beforeEach(() => {
     globalThis.fetch = originalFetch
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    // Prevent the plugin's background quota-refresh interval from leaking a
-    // real timer that fires during later tests (test-isolation flake).
-    globalThis.setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    ) as unknown as typeof setInterval
+    // Prevent this plugin instance's background intervals from leaking into
+    // later tests without mutating process-global timers used by other files.
+    pluginTimerOverrides = {
+      setInterval: mock(
+        () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+      ) as unknown as typeof setInterval,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    }
   })
 
   afterEach(() => {
     globalThis.fetch = originalFetch
-    globalThis.setInterval = originalSetInterval
+    pluginTimerOverrides = {}
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
   })
 
@@ -10652,11 +10809,11 @@ describe('claude-prime direct request', () => {
   test('plugin instances with different storage paths own independent prime managers', async () => {
     const fixture = createFallbackStorage({ prime: { enabled: true } })
     await useTempAccountFile(fixture)
-    const plugin1 = await getPlugin(undefined, '/project/one')
+    const plugin1 = await getPlugin(undefined, undefined, '/project/one')
     const mgr1 = (plugin1 as any).__primeManager
 
     await useTempAccountFile(fixture)
-    const plugin2 = await getPlugin(undefined, '/project/two')
+    const plugin2 = await getPlugin(undefined, undefined, '/project/two')
     const mgr2 = (plugin2 as any).__primeManager
 
     expect(mgr2).not.toBe(mgr1)

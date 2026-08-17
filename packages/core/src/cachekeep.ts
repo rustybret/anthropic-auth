@@ -351,6 +351,8 @@ export class CacheKeepManager {
       fetchImpl?: typeof fetch
       now?: () => number
       prewarmTimeoutMs?: number
+      setIntervalImpl?: typeof globalThis.setInterval
+      clearIntervalImpl?: typeof globalThis.clearInterval
       prepareHeaders?: (
         headers: Headers,
         target: CacheKeepTarget,
@@ -364,20 +366,25 @@ export class CacheKeepManager {
   start() {
     if (this.timer) return
     logger.debug('cachekeep', 'started')
-    this.timer = setInterval(() => {
-      void this.tick().catch((error) => {
-        logger.warn('cachekeep', 'tick failed', {
-          error: error instanceof Error ? error.message : String(error),
+    this.timer = (this.options.setIntervalImpl ?? globalThis.setInterval)(
+      () => {
+        void this.tick().catch((error) => {
+          logger.warn('cachekeep', 'tick failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
         })
-      })
-    }, CACHE_KEEP_TICK_MS)
+      },
+      CACHE_KEEP_TICK_MS,
+    )
     if ('unref' in this.timer) this.timer.unref()
   }
 
   stop() {
     if (!this.timer) return
     logger.debug('cachekeep', 'stopped')
-    clearInterval(this.timer)
+    const clearIntervalImpl =
+      this.options.clearIntervalImpl ?? globalThis.clearInterval
+    clearIntervalImpl(this.timer)
     this.timer = null
   }
 

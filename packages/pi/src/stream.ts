@@ -4,6 +4,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  createStickyNoRouteResponse,
   decideStickyQuotaFailure,
   dumpDirectRequest,
   FAST_MODE_BETA,
@@ -696,8 +697,11 @@ async function executeWithFallback(options: {
       Buffer.byteLength(JSON.stringify(options.context)),
     )
     let routes = await buildStickyRoutes(options.model.id)
+    const mainPermanentlyUnavailable = isPermanentRefreshError(
+      storage?.refresh?.mainLastRefreshError,
+    )
     const incompleteQuotaPool =
-      routes.allRoutes.length === 0 ||
+      (routes.allRoutes.length === 0 && !mainPermanentlyUnavailable) ||
       routes.allRoutes.some(
         (candidate) =>
           !candidate.quota ||
@@ -726,6 +730,15 @@ async function executeWithFallback(options: {
         syscall: 'sticky-routing',
       })
       throw error
+    }
+    if (!resolution) {
+      return createStickyNoRouteResponse({
+        mainRefreshError: storage?.refresh?.mainLastRefreshError,
+        routeQuotas: routes.allRoutes.flatMap((route) =>
+          route.quota ? [route.quota] : [],
+        ),
+        modelId: options.model.id,
+      })
     }
     let route = routes.allRoutes.find(
       (candidate) => candidate.id === resolution?.accountId,

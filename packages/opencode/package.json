@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-anthropic-auth",
-  "version": "1.19.0",
+  "version": "1.19.1",
   "type": "module",
   "repository": {
     "type": "git",
@@ -61,7 +61,7 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@cortexkit/anthropic-auth-core": "1.19.0",
+    "@cortexkit/anthropic-auth-core": "1.19.1",
     "@opentui/core": "0.4.3",
     "@opentui/solid": "0.4.3",
     "jsonc-parser": "^3.3.1",

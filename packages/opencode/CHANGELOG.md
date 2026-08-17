@@ -4,10 +4,17 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+## 1.19.1
+
 ### Patch Changes
 
 - Keep deterministic Opus 4.8 recovery armed as a backstop when Anthropic's server-side safety policy still returns a refusal, while stripping the server-fallback opt-in from source-model prewarms.
 - Preserve completed tool calls when a served fallback later refuses, continuing with the existing tool result instead of replaying potentially non-idempotent tools.
+- Return an explicit authentication or quota response when sticky-balanced routing has no eligible account instead of falling through to an excluded main account.
+- Clear a permanent, token-bound `invalid_grant` state immediately after the main account is re-authenticated, while retaining shared transient and rate-limit backoffs.
+- Keep TUI preferences live updates working when Bun cannot create a directory watcher (for example, `EBADF`) by running the polling fallback independently, and capture the baseline before returning so an immediate first update cannot be absorbed.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the server-fallback recovery contribution.
 
 ## 1.19.0
 

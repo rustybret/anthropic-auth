@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import {
+  type AccountOperationError,
   type AccountStorage,
   acquireRefreshFileLock,
   getKillswitchThresholdsForAccount,
@@ -9,7 +10,10 @@ import {
   getQuotaMinimumRemainingThresholds,
   getScopedQuotaWindowForModel,
   isKillswitchEnabled,
+  isPermanentRefreshError,
+  killswitchRetryAfterSeconds,
   type OAuthQuotaSnapshot,
+  quotaSnapshotPassesModelScope,
 } from './accounts.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
 
@@ -65,6 +69,76 @@ export type StickyQuotaFailureDecision =
       action: 'migrate'
       reason: 'five-hour' | 'seven-day' | 'model-scoped'
     }
+
+/**
+ * Build the terminal response for a complete sticky quota pool that has no
+ * eligible route. This prevents callers from silently falling through to the
+ * main account after the router deliberately excluded it.
+ */
+export function createStickyNoRouteResponse(input: {
+  mainRefreshError?: AccountOperationError
+  routeQuotas: readonly OAuthQuotaSnapshot[]
+  modelId?: string
+  now?: number
+}): Response {
+  const modelId = input.modelId
+  const modelName = modelId
+    ? input.routeQuotas
+        .map((quota) => getScopedQuotaWindowForModel(quota, modelId))
+        .find(Boolean)?.modelName
+    : undefined
+
+  if (isPermanentRefreshError(input.mainRefreshError)) {
+    const message = modelName
+      ? `Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for ${modelName}.`
+      : 'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable.'
+    return new Response(
+      JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message },
+      }),
+      {
+        status: 401,
+        headers: { 'content-type': 'application/json' },
+      },
+    )
+  }
+
+  const scopedBlocked = Boolean(
+    modelId &&
+      input.routeQuotas.length > 0 &&
+      input.routeQuotas.every(
+        (quota) => !quotaSnapshotPassesModelScope(quota, modelId),
+      ),
+  )
+  const [firstQuota, ...remainingQuotas] = input.routeQuotas
+  const retryAfter = killswitchRetryAfterSeconds(
+    firstQuota,
+    remainingQuotas.map((quota) => ({ quota })),
+    input.now ?? Date.now(),
+    scopedBlocked ? modelId : undefined,
+  )
+  const minutes = Math.floor(retryAfter / 60)
+  const seconds = retryAfter % 60
+  const reason =
+    scopedBlocked && modelName
+      ? `${modelName} weekly limit reached, no routable OAuth accounts.`
+      : 'No OAuth account currently satisfies sticky-balanced quota policy.'
+  const message = `${reason} Retry in ${minutes}m ${seconds}s.`
+  return new Response(
+    JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message },
+    }),
+    {
+      status: 429,
+      headers: {
+        'content-type': 'application/json',
+        'retry-after': String(retryAfter),
+      },
+    },
+  )
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)

@@ -387,6 +387,8 @@ export type AccountManagerOptions = {
   // (e.g. the OpenCode sidebar) can re-render without a request flowing through
   // the fetch handler.
   onFallbackStorageChanged?: () => void
+  setIntervalImpl?: typeof globalThis.setInterval
+  clearIntervalImpl?: typeof globalThis.clearInterval
 }
 
 export type AccountRefreshError = {
@@ -3271,6 +3273,8 @@ export class FallbackAccountManager {
   private quotaTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
   private readonly onFallbackStorageChanged: (() => void) | undefined
+  private readonly setIntervalImpl: typeof globalThis.setInterval
+  private readonly clearIntervalImpl: typeof globalThis.clearInterval
 
   constructor(options: AccountManagerOptions = {}) {
     this.now = options.now ?? Date.now
@@ -3278,6 +3282,9 @@ export class FallbackAccountManager {
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
+    this.setIntervalImpl = options.setIntervalImpl ?? globalThis.setInterval
+    this.clearIntervalImpl =
+      options.clearIntervalImpl ?? globalThis.clearInterval
   }
 
   /**
@@ -3326,7 +3333,7 @@ export class FallbackAccountManager {
     }
     void run().catch(() => {})
     if (!this.refreshTimer) {
-      this.refreshTimer = setInterval(() => {
+      this.refreshTimer = this.setIntervalImpl(() => {
         void run().catch(() => {})
       }, BACKGROUND_TICK_MS + jitterMs(BACKGROUND_TICK_JITTER_MS))
       if ('unref' in this.refreshTimer) this.refreshTimer.unref()
@@ -3334,8 +3341,8 @@ export class FallbackAccountManager {
   }
 
   stopBackgroundRefresh() {
-    if (this.refreshTimer) clearInterval(this.refreshTimer)
-    if (this.quotaTimer) clearInterval(this.quotaTimer)
+    if (this.refreshTimer) this.clearIntervalImpl(this.refreshTimer)
+    if (this.quotaTimer) this.clearIntervalImpl(this.quotaTimer)
     this.refreshTimer = null
     this.quotaTimer = null
   }

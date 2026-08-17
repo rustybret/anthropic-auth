@@ -1491,13 +1491,11 @@ describe('relay client', () => {
 
   test('websocket keepalive resets pre-response timeout', async () => {
     const originalWebSocket = globalThis.WebSocket
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     const timeouts: Array<{ id: number; ms?: number }> = []
     const cleared: number[] = []
     let nextTimerId = 1
 
-    globalThis.setTimeout = ((
+    const setTimeoutMock = ((
       _: Parameters<typeof setTimeout>[0],
       ms?: number,
     ) => {
@@ -1505,7 +1503,7 @@ describe('relay client', () => {
       timeouts.push({ id, ms })
       return id
     }) as unknown as typeof setTimeout
-    globalThis.clearTimeout = ((id?: number) => {
+    const clearTimeoutMock = ((id?: number) => {
       if (typeof id === 'number') cleared.push(id)
     }) as unknown as typeof clearTimeout
 
@@ -1579,12 +1577,12 @@ describe('relay client', () => {
         headers: headers('session-relay-keepalive'),
         body: 'body',
         fallback: async () => new Response('direct'),
+        setTimeoutImpl: setTimeoutMock,
+        clearTimeoutImpl: clearTimeoutMock,
       })
       expect(response.status).toBe(200)
     } finally {
       globalThis.WebSocket = originalWebSocket
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
     }
 
     expect(timeouts.map((timeout) => timeout.ms)).toEqual([
