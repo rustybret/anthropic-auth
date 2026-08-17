@@ -10,11 +10,12 @@
 #   5. push to origin (unless FORK_SYNC_NO_PUSH=1)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXCLUSIONS="$ROOT/scripts/fork-sync-exclusions"
+ROOT="${FORK_SYNC_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+EXCLUSIONS="${FORK_SYNC_EXCLUSIONS:-$ROOT/scripts/fork-sync-exclusions}"
 REMOTE="${1:-upstream}"
 BRANCH="${2:-main}"
 NO_PUSH="${FORK_SYNC_NO_PUSH:-0}"
+SKIP_BUILD="${FORK_SYNC_SKIP_BUILD:-0}"
 LOCAL_BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 
 if [[ ! -f "$EXCLUSIONS" ]]; then
@@ -25,6 +26,10 @@ fi
 # --- guards ------------------------------------------------------------------
 if git -C "$ROOT" rev-parse -q --verify REBASE_HEAD >/dev/null 2>&1; then
   echo "error: a rebase is in progress. The fork model is merge-only: abort or finish it first." >&2
+  exit 2
+fi
+if git -C "$ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  echo "error: a merge is already in progress. Resolve conflicts and run 'git commit --no-edit', or run 'git merge --abort', then re-run." >&2
   exit 2
 fi
 if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
@@ -64,15 +69,16 @@ else
   else
     echo "Resolving conflicts via exclusion manifest..."
     # Check unmerged files against exclusions
-    for conflict_file in $(git -C "$ROOT" diff --name-only --diff-filter=U); do
-      for g in "${KEEP_DELETED[@]}"; do
+    while IFS= read -r conflict_file; do
+      [[ -z "$conflict_file" ]] && continue
+      for g in "${KEEP_DELETED[@]+"${KEEP_DELETED[@]}"}"; do
         g="${g#"${g%%[![:space:]]*}"}"
         if [[ "$conflict_file" == $g ]]; then
           git -C "$ROOT" rm -f "$conflict_file" || true
           break
         fi
       done
-      for g in "${TAKE_THEIRS[@]}"; do
+      for g in "${TAKE_THEIRS[@]+"${TAKE_THEIRS[@]}"}"; do
         g="${g#"${g%%[![:space:]]*}"}"
         if [[ "$conflict_file" == $g ]]; then
           git -C "$ROOT" checkout --theirs "$conflict_file"
@@ -80,13 +86,14 @@ else
           break
         fi
       done
-    done
+    done < <(git -C "$ROOT" diff --name-only --diff-filter=U)
 
     # Check if remaining conflicts exist
     REMAINING="$(git -C "$ROOT" diff --name-only --diff-filter=U)"
     if [[ -n "$REMAINING" ]]; then
       echo "error: unhandled merge conflicts in:" >&2
       echo "$REMAINING" >&2
+      echo "Resolve the conflicts, then run 'git commit --no-edit', or abort with 'git merge --abort'." >&2
       exit 1
     fi
 
@@ -97,7 +104,11 @@ fi
 # --- 3. verify build -----------------------------------------------------------
 echo "== verifying workspace build =="
 cd "$ROOT"
-bun run build
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  echo "FORK_SYNC_SKIP_BUILD=1; skipping workspace build."
+else
+  bun run build
+fi
 
 # --- 4. push -------------------------------------------------------------------
 if [[ "$NO_PUSH" == "1" ]]; then
