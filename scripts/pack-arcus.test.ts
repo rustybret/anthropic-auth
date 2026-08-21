@@ -17,15 +17,21 @@ describe('anthropic-auth arcus packaging & sync', () => {
     readFileSync(resolve(repoRoot, 'packages/opencode/package.json'), 'utf-8'),
   )
 
-  it('defines fork-sync and package:arcus in package.json', () => {
+  it('defines fork-sync and arcus packaging scripts in package.json and omits upstream publish hooks', () => {
     const pkg = JSON.parse(
       readFileSync(resolve(repoRoot, 'package.json'), 'utf-8'),
     )
     expect(pkg.scripts['fork-sync']).toBe('bash scripts/fork-sync.sh')
     expect(pkg.scripts['package:arcus']).toBe('bash scripts/pack-arcus.sh')
+    expect(pkg.scripts['arcus:pack']).toBe('bash scripts/pack-arcus.sh')
+    expect(pkg.scripts['arcus:test']).toBe(
+      'bun test scripts/pack-arcus.test.ts',
+    )
+    expect(pkg.scripts.prepublishOnly).toBeUndefined()
+    expect(pkg.scripts['pack:core:dry']).toBeUndefined()
   })
 
-  it('ships executable scripts and exclusion manifest with correct permissions', () => {
+  it('ships executable scripts and exclusion manifest with correct permissions and keeps upstream release scripts deleted', () => {
     const forkSyncPath = resolve(repoRoot, 'scripts/fork-sync.sh')
     const packArcusPath = resolve(repoRoot, 'scripts/pack-arcus.sh')
     const exclusionsPath = resolve(repoRoot, 'scripts/fork-sync-exclusions')
@@ -36,6 +42,16 @@ describe('anthropic-auth arcus packaging & sync', () => {
     expect(existsSync(exclusionsPath)).toBe(true)
     expect(existsSync(docPath)).toBe(true)
 
+    // Ensure upstream publish scripts are purged
+    expect(existsSync(resolve(repoRoot, 'scripts/release.sh'))).toBe(false)
+    expect(existsSync(resolve(repoRoot, 'scripts/wait-release.sh'))).toBe(false)
+    expect(existsSync(resolve(repoRoot, 'scripts/version-sync.mjs'))).toBe(
+      false,
+    )
+    expect(
+      existsSync(resolve(repoRoot, '.github/workflows/release.yaml')),
+    ).toBe(false)
+
     // Check executable bit on scripts (0o111)
     const forkSyncStat = statSync(forkSyncPath)
     const packArcusStat = statSync(packArcusPath)
@@ -45,6 +61,10 @@ describe('anthropic-auth arcus packaging & sync', () => {
     const exclusionsContent = readFileSync(exclusionsPath, 'utf-8')
     expect(exclusionsContent).toContain('keep-deleted:')
     expect(exclusionsContent).toContain('dist-arcus/*')
+    expect(exclusionsContent).toContain('scripts/release.sh')
+    expect(exclusionsContent).toContain('scripts/wait-release.sh')
+    expect(exclusionsContent).toContain('scripts/version-sync.mjs')
+    expect(exclusionsContent).toContain('.github/workflows/release.yaml')
   })
 
   it('builds package and generates a valid Arcus manifest and tarball in an isolated directory', () => {

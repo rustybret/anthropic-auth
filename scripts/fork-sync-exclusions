@@ -7,3 +7,10 @@
 # Arcus packaging outputs and transient local directories
 keep-deleted: dist-arcus/*
 keep-deleted: captures/*
+
+# Upstream release and publishing artifacts replaced by Arcus distribution
+keep-deleted: scripts/release.sh
+keep-deleted: scripts/wait-release.sh
+keep-deleted: scripts/version-sync.mjs
+keep-deleted: .github/workflows/release.yaml
+

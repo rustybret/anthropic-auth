@@ -23,8 +23,7 @@
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc",
-    "types": "tsc",
-    "prepublishOnly": "bun run build"
+    "types": "tsc"
   },
   "dependencies": {
     "xxhash-wasm": "^1.1.0"

@@ -54,8 +54,7 @@
     "extract": "bun ../../scripts/extract-system-prompt.ts",
     "test": "bun test src/tests",
     "typecheck": "tsc && tsc -p tsconfig.scripts.json",
-    "types": "tsc && tsc -p tsconfig.scripts.json",
-    "prepublishOnly": "bun run build"
+    "types": "tsc && tsc -p tsconfig.scripts.json"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"

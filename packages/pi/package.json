@@ -32,8 +32,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc",
     "types": "tsc",
-    "test": "bun test src/tests",
-    "prepublishOnly": "bun run build"
+    "test": "bun test src/tests"
   },
   "dependencies": {
     "@cortexkit/anthropic-auth-core": "1.19.1"

@@ -61,8 +61,8 @@ anthropic-auth/
 - Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene)
 
 **`scripts/`:**
-- Purpose: Development, release, and analysis utilities
-- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager and verification tests), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
+- Purpose: Development, Arcus packaging, sync, and analysis utilities
+- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager and verification tests), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
 
 ## Key File Locations
 
