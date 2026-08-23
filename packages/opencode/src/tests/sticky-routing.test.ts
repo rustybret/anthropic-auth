@@ -117,6 +117,33 @@ describe('sticky-balanced session routing', () => {
     })
   })
 
+  test('reports fallback accounts that require re-login when no route is eligible', async () => {
+    const exhausted = candidate({
+      accountId: 'main',
+      order: 0,
+      fiveHour: 100,
+      sevenDay: 100,
+      fable: 0,
+    })
+    const response = createStickyNoRouteResponse({
+      fallbackReauthLabels: ['ufuk2', 'yiyi'],
+      routeQuotas: [exhausted.quota],
+      modelId: 'claude-fable-5',
+      now: NOW,
+    })
+
+    expect(response.status).toBe(401)
+    expect(response.headers.get('retry-after')).toBeNull()
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message:
+          'No OAuth account is currently routable for Fable. Fallback Claude OAuth accounts require re-login: ufuk2, yiyi.',
+      },
+    })
+  })
+
   test('returns a scoped quota block when every sticky route is exhausted', async () => {
     const exhausted = candidate({
       accountId: 'main',

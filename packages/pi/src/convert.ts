@@ -27,6 +27,11 @@ import type {
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
 
+// Anchor identifying Pi's documentation paragraph — the only part of the prompt
+// that Anthropic currently rejects in system[]. Unknown prompt shapes take the
+// service-preserving fallback below instead of returning the full prompt there.
+const PI_DOCS_ANCHOR = 'Pi documentation'
+
 const CLAUDE_CODE_TOOLS = new Map(
   [
     'Read',
@@ -334,6 +339,51 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
   }
 }
 
+function splitPiSystemPrompt(prompt: string): {
+  systemText?: string
+  messageText: string
+} {
+  const sanitized = sanitize(prompt)
+  const paragraphs = sanitized.split(/\n\n+/)
+  const docs = paragraphs.filter((paragraph) =>
+    paragraph.includes(PI_DOCS_ANCHOR),
+  )
+
+  // If Pi changes the heading or prompt layout, fail away from the request shape
+  // known to trigger billing rejection: carry the complete host prompt in the
+  // first user message until the new shape can be classified precisely.
+  if (docs.length === 0) return { messageText: sanitized }
+
+  const keep = paragraphs.filter(
+    (paragraph) => !paragraph.includes(PI_DOCS_ANCHOR),
+  )
+  return {
+    ...(keep.length ? { systemText: keep.join('\n\n') } : {}),
+    messageText: docs.join('\n\n'),
+  }
+}
+
+function prependCachedPromptBlock(
+  messages: AnthropicRequestBody['messages'],
+  text: string,
+): void {
+  const firstUser = messages.find((message) => message.role === 'user')
+  if (!firstUser) return
+
+  const promptBlock = {
+    type: 'text',
+    text,
+    cache_control: { type: 'ephemeral' as const },
+  }
+  if (typeof firstUser.content === 'string') {
+    firstUser.content = [promptBlock, { type: 'text', text: firstUser.content }]
+    return
+  }
+  if (Array.isArray(firstUser.content)) {
+    firstUser.content.unshift(promptBlock)
+  }
+}
+
 function applyCacheMode(
   body: AnthropicRequestBody,
   enabled: boolean,
@@ -391,7 +441,35 @@ export async function buildAnthropicRequest(
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
   if (context.systemPrompt?.trim()) {
-    system.push({ type: 'text', text: sanitize(context.systemPrompt) })
+    // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
+    // its documentation paragraph (the docs/*.md enumeration and the "follow .md
+    // cross-references" instruction) are each independently sufficient to make
+    // Anthropic reject the request with 400 "You're out of extra usage". Entry
+    // count and payload size are ruled out — 2697 bytes of neutral filler in the
+    // same position is accepted, and the same text is accepted inside messages[].
+    //
+    // For the recognized Pi prompt, keep the identity, tool contract, and
+    // guidelines in system[], where they carry system weight and survive context
+    // compaction, and carry only the documentation paragraph in messages[]. An
+    // unknown future prompt shape is moved whole rather than risking this 400.
+    //
+    // It goes in as its own content block ahead of the user's text, not merged
+    // into it and not as a separate message. A cache prefix matches contiguously
+    // from the start of the request, so a block boundary here lets the prefix end
+    // before the user's words: a new conversation with a different first message
+    // still reads the paragraph from cache instead of re-writing ~1.1k tokens.
+    // A role: "system" message cannot be used at messages[0] — Anthropic rejects
+    // that — and placing one after the first user message puts it behind content
+    // that varies, which defeats the caching.
+    //
+    // cache_control is set explicitly because addEphemeralCacheControl's
+    // message-level breakpoint only fires for array content on the *last* user
+    // message, which is not this one after the first turn.
+    const prompt = splitPiSystemPrompt(context.systemPrompt)
+    if (prompt.systemText) {
+      system.push({ type: 'text', text: prompt.systemText })
+    }
+    prependCachedPromptBlock(messages, prompt.messageText)
   }
 
   const body: AnthropicRequestBody = {

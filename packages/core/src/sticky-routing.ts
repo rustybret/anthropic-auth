@@ -77,6 +77,7 @@ export type StickyQuotaFailureDecision =
  */
 export function createStickyNoRouteResponse(input: {
   mainRefreshError?: AccountOperationError
+  fallbackReauthLabels?: readonly string[]
   routeQuotas: readonly OAuthQuotaSnapshot[]
   modelId?: string
   now?: number
@@ -88,14 +89,23 @@ export function createStickyNoRouteResponse(input: {
         .find(Boolean)?.modelName
     : undefined
 
+  let authenticationMessage: string | undefined
   if (isPermanentRefreshError(input.mainRefreshError)) {
-    const message = modelName
+    authenticationMessage = modelName
       ? `Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for ${modelName}.`
       : 'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable.'
+  } else if (input.fallbackReauthLabels?.length) {
+    const scope = modelName ? ` for ${modelName}` : ''
+    authenticationMessage = `No OAuth account is currently routable${scope}. Fallback Claude OAuth accounts require re-login: ${input.fallbackReauthLabels.join(', ')}.`
+  }
+  if (authenticationMessage) {
     return new Response(
       JSON.stringify({
         type: 'error',
-        error: { type: 'authentication_error', message },
+        error: {
+          type: 'authentication_error',
+          message: authenticationMessage,
+        },
       }),
       {
         status: 401,

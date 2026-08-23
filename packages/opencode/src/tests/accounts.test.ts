@@ -24,6 +24,7 @@ import {
   formatOAuthAccountTier,
   getAccountStatePath,
   getCache1hPersistentMode,
+  getFallbackReauthLabels,
   getLogLevel,
   getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
@@ -2369,6 +2370,55 @@ describe('FallbackAccountManager', () => {
     ).toBeUndefined()
   })
 
+  test('preserves a permanent refresh classification across a concurrent refresh join', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'dead-fallback',
+      type: 'oauth',
+      access: 'expired-access',
+      refresh: 'expired-refresh',
+      expires: 100,
+    })
+    await saveAccounts(storage)
+
+    const refreshStarted = Promise.withResolvers<void>()
+    const refreshCanFinish = Promise.withResolvers<void>()
+    const fetchImpl = mock(async () => {
+      refreshStarted.resolve()
+      await refreshCanFinish.promise
+      return new Response(
+        JSON.stringify({
+          error: 'invalid_grant',
+          error_description: 'Refresh token not found or invalid',
+        }),
+        { status: 400 },
+      )
+    }) as unknown as typeof fetch
+    const managerA = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 2_000,
+    })
+    const managerB = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 2_000,
+    })
+
+    const first = managerA.refreshDueAccounts()
+    await refreshStarted.promise
+    const second = managerB.refreshDueAccounts()
+    await Bun.sleep(25)
+    refreshCanFinish.resolve()
+    await Promise.all([first, second])
+
+    const error = expectOAuthAccount(
+      (await loadAccounts())?.accounts[0],
+    ).lastRefreshError
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(error?.status).toBe(400)
+    expect(error?.permanent).toBe(true)
+    expect(error?.message).toContain('invalid_grant')
+  })
+
   test('starts an immediate background refresh pass for unused expired fallbacks', async () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, enabled: false }
@@ -3012,6 +3062,48 @@ describe('FallbackAccountManager', () => {
     expect(qm.getFallback('fallback-1', 'new-access')).toBeNull()
   })
 
+  test('uses a fresh persisted scoped-only fallback quota without refetching it', async () => {
+    const storage = baseStorage()
+    storage.quota = { checkIntervalMinutes: 5 }
+    storage.accounts.push({
+      id: 'scoped-only',
+      type: 'oauth',
+      access: 'fallback-access',
+      refresh: 'fallback-refresh',
+      expires: 30_000_000,
+      quota: {
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 10,
+            remainingPercent: 90,
+            checkedAt: 999_000,
+          },
+        ],
+      },
+    })
+    const fetchImpl = mock(() => {
+      throw new Error('fresh scoped quota should not be refetched')
+    }) as unknown as typeof fetch
+    const qm = new QuotaManager({ storage, fetchImpl, now: () => 1_000_000 })
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 1_000_000,
+      quotaManager: qm,
+    })
+
+    // General-window policy remains fail-closed, but a fresh scoped snapshot is
+    // not re-polled merely because it lacks five-hour/seven-day windows.
+    expect(
+      await manager.getUsableFallbackAccounts(storage, {
+        modelId: 'claude-fable-5',
+      }),
+    ).toEqual([])
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
   test('re-login invalidates fallback cache seeded from persisted quota', async () => {
     // Regression: seedFallbackQuota used to write a tokenless QuotaManager entry.
     // A still-running plugin process could then reuse old same-label quota after
@@ -3177,6 +3269,48 @@ describe('buildRefreshOperationError', () => {
     })
     expect(dead.permanent).toBe(true)
     expect(isPermanentRefreshError(dead)).toBe(true)
+  })
+})
+
+describe('getFallbackReauthLabels', () => {
+  test('reports enabled OAuth fallbacks with permanent refresh failures only', () => {
+    const storage = baseStorage()
+    storage.accounts.push(
+      {
+        id: 'expired',
+        type: 'oauth',
+        label: 'ufuk2',
+        enabled: true,
+        access: 'expired-access',
+        refresh: 'expired-refresh',
+        expires: 1,
+        lastRefreshError: {
+          message: 'invalid_grant: Refresh token expired',
+          checkedAt: 1,
+          nextRetryAt: 86_400_001,
+          status: 400,
+          permanent: true,
+        },
+      },
+      {
+        id: 'transient',
+        type: 'oauth',
+        label: 'temporary',
+        enabled: true,
+        access: 'transient-access',
+        refresh: 'transient-refresh',
+        expires: 1,
+        lastRefreshError: {
+          message: 'service unavailable',
+          checkedAt: 1,
+          nextRetryAt: 60_001,
+          status: 503,
+          permanent: false,
+        },
+      },
+    )
+
+    expect(getFallbackReauthLabels(storage)).toEqual(['ufuk2'])
   })
 })
 

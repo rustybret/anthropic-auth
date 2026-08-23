@@ -28,35 +28,33 @@ type WorkerSocket = {
   ) => Promise<ControlMessage>
 }
 
-function startUpstream() {
+function createUpstream() {
   const bodies: string[] = []
-  const server = Bun.serve({
-    port: 0,
-    async fetch(request) {
-      bodies.push(await request.text())
-      return new Response('upstream-ok', {
-        status: 200,
-        headers: {
-          'content-type': 'text/plain',
-          'anthropic-ratelimit-unified-5h-utilization': '0.78',
-          'anthropic-ratelimit-unified-5h-reset': '1784246400',
-          'anthropic-ratelimit-unified-7d-utilization': '0.4',
-          'anthropic-ratelimit-unified-7d-reset': '1784628000',
-          'anthropic-ratelimit-unified-fallback': 'available',
-        },
-      })
-    },
-  })
-  return { server, bodies, url: `http://127.0.0.1:${server.port}/messages` }
+  const fetch = async (request: Request) => {
+    bodies.push(await request.text())
+    return new Response('upstream-ok', {
+      status: 200,
+      headers: {
+        'content-type': 'text/plain',
+        'anthropic-ratelimit-unified-5h-utilization': '0.78',
+        'anthropic-ratelimit-unified-5h-reset': '1784246400',
+        'anthropic-ratelimit-unified-7d-utilization': '0.4',
+        'anthropic-ratelimit-unified-7d-reset': '1784628000',
+        'anthropic-ratelimit-unified-fallback': 'available',
+      },
+    })
+  }
+  return { bodies, fetch, url: 'https://upstream.test/messages' }
 }
 
-async function startWorker() {
+async function startWorker(upstream: ReturnType<typeof createUpstream>) {
   const mf = new Miniflare({
     script: WORKER_SCRIPT,
     modules: true,
     compatibilityDate: '2026-04-28',
     kvNamespaces: ['RELAY_STATE'],
     bindings: { RELAY_TOKEN },
+    outboundService: upstream.fetch,
     port: 0,
     log: new NoOpLog(),
   })
@@ -151,8 +149,8 @@ function sendPayload(socket: WebSocket, payload: Record<string, unknown>) {
 
 describe('relay Worker under Miniflare', () => {
   test('HTTP relay forwards upstream unified quota headers', async () => {
-    const upstream = startUpstream()
-    const mf = await startWorker()
+    const upstream = createUpstream()
+    const mf = await startWorker(upstream)
 
     try {
       const response = await sendViaRelay({
@@ -183,13 +181,12 @@ describe('relay Worker under Miniflare', () => {
       expect(upstream.bodies).toEqual(['{}'])
     } finally {
       await mf.dispose()
-      upstream.server.stop(true)
     }
   }, 30_000)
 
   test('client websocket transport reaches Miniflare Worker with byte-exact patch reconstruction', async () => {
-    const upstream = startUpstream()
-    const mf = await startWorker()
+    const upstream = createUpstream()
+    const mf = await startWorker(upstream)
     const affinity = 'miniflare-client-session'
 
     try {
@@ -237,13 +234,12 @@ describe('relay Worker under Miniflare', () => {
       expect(upstream.bodies).toEqual([firstBody, secondBody])
     } finally {
       await mf.dispose()
-      upstream.server.stop(true)
     }
   }, 30_000)
 
   test('websocket full_sync and patch reconstruct byte-exact upstream bodies', async () => {
-    const upstream = startUpstream()
-    const mf = await startWorker()
+    const upstream = createUpstream()
+    const mf = await startWorker(upstream)
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-byte-exact-session',
@@ -302,13 +298,12 @@ describe('relay Worker under Miniflare', () => {
     } finally {
       workerSocket.socket.close()
       await mf.dispose()
-      upstream.server.stop(true)
     }
   }, 30_000)
 
   test('websocket hash mismatch returns 409 before upstream fetch', async () => {
-    const upstream = startUpstream()
-    const mf = await startWorker()
+    const upstream = createUpstream()
+    const mf = await startWorker(upstream)
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-hash-mismatch-session',
@@ -358,7 +353,6 @@ describe('relay Worker under Miniflare', () => {
     } finally {
       workerSocket.socket.close()
       await mf.dispose()
-      upstream.server.stop(true)
     }
   }, 30_000)
 })

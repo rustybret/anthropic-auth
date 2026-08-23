@@ -11,6 +11,7 @@ import {
   FallbackAccountManager,
   getCache1hPersistentMode,
   getDefaultCacheKeepRegistryDirectory,
+  getFallbackReauthLabels,
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
@@ -734,6 +735,7 @@ async function executeWithFallback(options: {
     if (!resolution) {
       return createStickyNoRouteResponse({
         mainRefreshError: storage?.refresh?.mainLastRefreshError,
+        fallbackReauthLabels: getFallbackReauthLabels(storage),
         routeQuotas: routes.allRoutes.flatMap((route) =>
           route.quota ? [route.quota] : [],
         ),

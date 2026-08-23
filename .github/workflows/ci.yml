@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4
       - run: bun install --frozen-lockfile
       - run: bun run types
       - run: bun run build
@@ -23,7 +23,7 @@ jobs:
         env:
           TUI_SMOKE_SKIP_BUILD: "1"
       - run: bun run test
-      - run: npm install -g opencode-ai@1.17.13
+      - run: npm install -g opencode-ai@1.18.18
       - run: bun run test:e2e
       - run: bun run format:check
       - run: bun run lint

@@ -33,10 +33,22 @@ function toolResultMsg(toolCallId: string, text: string): Message {
 
 const defaultCache = { enabled: false, mode: 'hybrid' as const }
 
-async function buildMessages(messages: Message[]) {
+// Mirrors the shape of Pi's real prompt: instruction paragraphs followed by the
+// documentation paragraph, which is the only part Anthropic rejects in system[].
+const PI_PROMPT = [
+  'KEEP ONE: you are an assistant.',
+  'KEEP TWO: available tools.',
+  'Pi documentation (read only when the user asks about pi itself):\n- MOVE THIS',
+].join('\n\n')
+
+// systemPrompt is opt-in. buildAnthropicRequest splits a non-empty prompt between
+// system[] and the first user message, so tests that assert raw conversion output
+// pass no prompt and observe messages unchanged. The split itself is covered by
+// the "Claude Code system[] shape" block below.
+async function buildMessages(messages: Message[], systemPrompt?: string) {
   const context = {
     messages,
-    systemPrompt: 'test',
+    systemPrompt,
     tools: [],
   }
   const { body } = await buildAnthropicRequest(
@@ -323,6 +335,106 @@ describe('convertMessages — empty base64 image guard', () => {
     const content = messages[0]?.content as Array<Record<string, unknown>>
     expect(content.length).toBe(2)
     expect(content[1]?.type).toBe('image')
+  })
+})
+
+describe('buildAnthropicRequest — Claude Code system[] shape', () => {
+  // Anthropic rejects Pi's documentation paragraph inside the top-level
+  // system[] array — see the note in convert.ts. These cases pin the resulting
+  // shape: the remaining paragraphs stay in system[], and the documentation
+  // paragraph is carried as its own marked content block ahead of the user's
+  // text inside the first user message.
+  async function buildBody(messages: Message[], systemPrompt?: string) {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-4-20250514',
+      { messages, systemPrompt, tools: [] } as any,
+      undefined,
+      defaultCache,
+    )
+    return body
+  }
+
+  test('keeps the non-documentation paragraphs in system[]', async () => {
+    const body = await buildBody([userMsg('hello')], PI_PROMPT)
+    expect(body.system).toHaveLength(3)
+    const text = String(body.system?.[2]?.text)
+    expect(text).toContain('KEEP ONE')
+    expect(text).toContain('KEEP TWO')
+    expect(text).not.toContain('MOVE THIS')
+  })
+
+  test('carries the documentation paragraph as its own block ahead of the user text', async () => {
+    const body = await buildBody([userMsg('hello')], PI_PROMPT)
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>
+    expect(content).toHaveLength(2)
+    expect(String(content[0]?.text)).toContain('MOVE THIS')
+    expect(content[1]).toMatchObject({ type: 'text', text: 'hello' })
+  })
+
+  test('marks the documentation block so the cached prefix ends before the user text', async () => {
+    // Without this marker the prefix would extend into the user's own words,
+    // and a new conversation with a different first message would have to
+    // re-cache the paragraph.
+    const body = await buildBody([userMsg('hello')], PI_PROMPT)
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>
+    expect(content[0]?.cache_control).toEqual({ type: 'ephemeral' })
+  })
+
+  test('unshifts the documentation block onto a structured first user message', async () => {
+    const body = await buildBody(
+      [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'see image' },
+            { type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' },
+          ],
+          timestamp: 0,
+        } as Message,
+      ],
+      PI_PROMPT,
+    )
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>
+    expect(content).toHaveLength(3)
+    expect(String(content[0]?.text)).toContain('MOVE THIS')
+    expect(content[1]).toMatchObject({ type: 'text', text: 'see image' })
+  })
+
+  test('drops the documentation paragraph when there is no user message to carry it', async () => {
+    // convertMessages emits only user/assistant and trailing assistants are
+    // stripped, so a conversation with no user message converts to empty. The
+    // remaining paragraphs still go to system[], which is a shape Anthropic
+    // accepts; only the documentation paragraph is dropped.
+    const body = await buildBody([assistantMsg('only assistant')], PI_PROMPT)
+    expect(body.messages).toHaveLength(0)
+    expect(body.system).toHaveLength(3)
+    expect(JSON.stringify(body.system)).not.toContain('MOVE THIS')
+  })
+
+  test('moves the complete prompt ahead of user text when the documentation heading is unknown', async () => {
+    const renamedPrompt = [
+      'KEEP ONE: you are an assistant.',
+      'Reference material for Pi (read only when asked):\n- MOVE THIS',
+    ].join('\n\n')
+    const body = await buildBody([userMsg('hello')], renamedPrompt)
+
+    expect(body.system).toHaveLength(2)
+    expect(JSON.stringify(body.system)).not.toContain('KEEP ONE')
+    expect(JSON.stringify(body.system)).not.toContain('MOVE THIS')
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>
+    expect(content).toHaveLength(2)
+    expect(content[0]).toEqual({
+      type: 'text',
+      text: renamedPrompt,
+      cache_control: { type: 'ephemeral' },
+    })
+    expect(content[1]).toMatchObject({ type: 'text', text: 'hello' })
+  })
+
+  test('leaves system[] and messages untouched when no prompt is set', async () => {
+    const body = await buildBody([userMsg('hello')])
+    expect(body.system).toHaveLength(2)
+    expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
   })
 })
 

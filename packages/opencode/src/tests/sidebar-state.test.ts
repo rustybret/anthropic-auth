@@ -1193,21 +1193,24 @@ describe('setSidebarState cross-process writes', () => {
 
     let child: ReturnType<typeof Bun.spawn> | undefined
     let paused = false
-    __setSidebarStateWriteTestHooks({
-      beforeRename: async () => {
-        if (paused) return
-        paused = true
-        const stale = new Date(Date.now() - 3_000)
-        await utimes(lockDir, stale, stale)
-        const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-        child = Bun.spawn([
-          process.execPath,
-          '--eval',
-          `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
-        ])
-        expect(await child.exited).toBe(0)
+    __setSidebarStateWriteTestHooks(
+      {
+        beforeRename: async () => {
+          if (paused) return
+          paused = true
+          const stale = new Date(Date.now() - 3_000)
+          await utimes(lockDir, stale, stale)
+          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
+          child = Bun.spawn([
+            process.execPath,
+            '--eval',
+            `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
+          ])
+          expect(await child.exited).toBe(0)
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       await setSidebarState(staleWriter, stateFile, {
@@ -1221,7 +1224,7 @@ describe('setSidebarState cross-process writes', () => {
       expect(written.activeId).toBe('successor-routing')
       expect(written.route).toBe('successor-route')
     } finally {
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       child?.kill()
       await rm(stateDir, { recursive: true, force: true })
     }
@@ -1260,21 +1263,25 @@ describe('setSidebarState cross-process writes', () => {
 
       let child: ReturnType<typeof Bun.spawn> | undefined
       let paused = false
-      __setSidebarStateWriteTestHooks({
-        afterRename: async () => {
-          if (paused) return
-          paused = true
-          const stale = new Date(Date.now() - 3_000)
-          await utimes(lockDir, stale, stale)
-          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-          child = Bun.spawn([
-            process.execPath,
-            '--eval',
-            `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
-          ])
-          expect(await child.exited).toBe(0)
+      __setSidebarStateWriteTestHooks(
+        {
+          afterRename: async () => {
+            if (paused) return
+            paused = true
+            const stale = new Date(Date.now() - 3_000)
+            await utimes(lockDir, stale, stale)
+            const moduleUrl = new URL('../sidebar-state.ts', import.meta.url)
+              .href
+            child = Bun.spawn([
+              process.execPath,
+              '--eval',
+              `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
+            ])
+            expect(await child.exited).toBe(0)
+          },
         },
-      })
+        stateFile,
+      )
 
       try {
         await setSidebarState(staleWriter, stateFile, {
@@ -1306,7 +1313,7 @@ describe('setSidebarState cross-process writes', () => {
         expect(written.main.quota.five_hour.usedPercent).toBe(80)
         expect(written.fastMode).toBe(true)
       } finally {
-        __setSidebarStateWriteTestHooks(null)
+        __setSidebarStateWriteTestHooks(null, stateFile)
         child?.kill()
         await rm(stateDir, { recursive: true, force: true })
       }
@@ -1338,11 +1345,14 @@ describe('setSidebarState cross-process writes', () => {
       await mkdir(stateDir, { recursive: true })
       await writeFile(stateFile, originalContents)
       await mkdir(lockDir)
-      __setSidebarStateWriteTestHooks({
-        lockBudgetMs: 20,
-        lockRetryMinMs: 1,
-        lockRetryMaxMs: 1,
-      })
+      __setSidebarStateWriteTestHooks(
+        {
+          lockBudgetMs: 20,
+          lockRetryMinMs: 1,
+          lockRetryMaxMs: 1,
+        },
+        stateFile,
+      )
 
       try {
         await setSidebarState(staleWriter, stateFile, {
@@ -1359,7 +1369,7 @@ describe('setSidebarState cross-process writes', () => {
         expect(drained).toBe(true)
         expect(await readFile(stateFile, 'utf8')).toBe(originalContents)
       } finally {
-        __setSidebarStateWriteTestHooks(null)
+        __setSidebarStateWriteTestHooks(null, stateFile)
         await rm(stateDir, { recursive: true, force: true })
       }
     })
@@ -1387,23 +1397,26 @@ describe('setSidebarState cross-process writes', () => {
     await writeFile(stateFile, JSON.stringify(initial))
 
     let child: ReturnType<typeof Bun.spawn> | undefined
-    __setSidebarStateWriteTestHooks({
-      afterMergeRead: async () => {
-        const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-        const script = `
+    __setSidebarStateWriteTestHooks(
+      {
+        afterMergeRead: async () => {
+          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
+          const script = `
           import { setSidebarState } from ${JSON.stringify(moduleUrl)}
           await setSidebarState(${JSON.stringify(foreign)}, ${JSON.stringify(stateFile)})
         `
-        child = Bun.spawn([process.execPath, '--eval', script], {
-          stdout: 'pipe',
-          stderr: 'pipe',
-        })
-        await Promise.race([
-          child.exited,
-          new Promise((resolve) => setTimeout(resolve, 50)),
-        ])
+          child = Bun.spawn([process.execPath, '--eval', script], {
+            stdout: 'pipe',
+            stderr: 'pipe',
+          })
+          await Promise.race([
+            child.exited,
+            new Promise((resolve) => setTimeout(resolve, 50)),
+          ])
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       await setSidebarState(nonAuthoritative, stateFile, {
@@ -1419,9 +1432,48 @@ describe('setSidebarState cross-process writes', () => {
       expect(written.activeId).toBe('foreign-routing')
       expect(written.route).toBe('foreign-route')
     } finally {
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       child?.kill()
       await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('scopes write hooks to their state file', async () => {
+    const firstStateFile = sidebarTestPath('hook-scope-first')
+    const secondStateFile = sidebarTestPath('hook-scope-second')
+    await mkdir(join(firstStateFile, '..'), { recursive: true })
+    await mkdir(join(secondStateFile, '..'), { recursive: true })
+    let firstAcquisitions = 0
+    let secondAcquisitions = 0
+    __setSidebarStateWriteTestHooks(
+      {
+        onLockAcquired: () => {
+          firstAcquisitions++
+        },
+      },
+      firstStateFile,
+    )
+    __setSidebarStateWriteTestHooks(
+      {
+        onLockAcquired: () => {
+          secondAcquisitions++
+        },
+      },
+      secondStateFile,
+    )
+
+    let release: (() => Promise<void>) | null = null
+    try {
+      release = await __acquireSidebarStateLockForTest(firstStateFile)
+      expect(release).toBeFunction()
+      expect(firstAcquisitions).toBe(1)
+      expect(secondAcquisitions).toBe(0)
+    } finally {
+      await release?.()
+      __setSidebarStateWriteTestHooks(null, firstStateFile)
+      __setSidebarStateWriteTestHooks(null, secondStateFile)
+      await rm(join(firstStateFile, '..'), { recursive: true, force: true })
+      await rm(join(secondStateFile, '..'), { recursive: true, force: true })
     }
   })
 
@@ -1461,9 +1513,7 @@ describe('setSidebarState cross-process writes', () => {
         acquisitions++
       },
     }
-    ;(__setSidebarStateWriteTestHooks as (hooks: RaceHooks | null) => void)(
-      hooks,
-    )
+    __setSidebarStateWriteTestHooks(hooks, stateFile)
 
     let firstRelease: (() => Promise<void>) | null = null
     let secondRelease: (() => Promise<void>) | null = null
@@ -1478,7 +1528,7 @@ describe('setSidebarState cross-process writes', () => {
     } finally {
       await firstRelease?.()
       await secondRelease?.()
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
@@ -1532,9 +1582,7 @@ describe('setSidebarState cross-process writes', () => {
         await resumed
       },
     }
-    ;(__setSidebarStateWriteTestHooks as (hooks: ReleaseHooks | null) => void)(
-      hooks,
-    )
+    __setSidebarStateWriteTestHooks(hooks, stateFile)
 
     let firstRelease: (() => Promise<void>) | null = null
     let secondRelease: (() => Promise<void>) | null = null
@@ -1561,13 +1609,14 @@ describe('setSidebarState cross-process writes', () => {
       resumeRelease()
       await firstReleaseResult
 
-      ;(
-        __setSidebarStateWriteTestHooks as (hooks: ReleaseHooks | null) => void
-      )({
-        lockBudgetMs: 20,
-        lockRetryMinMs: 5,
-        lockRetryMaxMs: 5,
-      })
+      __setSidebarStateWriteTestHooks(
+        {
+          lockBudgetMs: 20,
+          lockRetryMinMs: 5,
+          lockRetryMaxMs: 5,
+        },
+        stateFile,
+      )
       thirdRelease = await __acquireSidebarStateLockForTest(stateFile)
       expect(thirdRelease).toBeNull()
       expect(await pathExists(lockDir)).toBe(true)
@@ -1575,7 +1624,7 @@ describe('setSidebarState cross-process writes', () => {
       resumeRelease()
       await thirdRelease?.()
       await secondRelease?.()
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
@@ -1655,12 +1704,15 @@ describe('setSidebarState cross-process writes', () => {
     const renameReleased = new Promise<void>((resolve) => {
       releaseRename = resolve
     })
-    __setSidebarStateWriteTestHooks({
-      beforeRename: async () => {
-        enteredRename()
-        await renameReleased
+    __setSidebarStateWriteTestHooks(
+      {
+        beforeRename: async () => {
+          enteredRename()
+          await renameReleased
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       const write = setSidebarState(next, stateFile)
@@ -1681,7 +1733,7 @@ describe('setSidebarState cross-process writes', () => {
       expect(visible.activeId).toBe('next')
     } finally {
       releaseRename()
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
@@ -1699,22 +1751,25 @@ describe('setSidebarState cross-process writes', () => {
     const replacementLock: {
       release: (() => Promise<void>) | null
     } = { release: null }
-    __setSidebarStateWriteTestHooks({
-      beforeRename: async () => {
-        const stale = new Date(Date.now() - 3_000)
-        await utimes(lockDir, stale, stale)
-        replacementLock.release =
-          await __acquireSidebarStateLockForTest(stateFile)
-        expect(replacementLock.release).toBeFunction()
-        await writeFile(stateFile, JSON.stringify(replacement))
+    __setSidebarStateWriteTestHooks(
+      {
+        beforeRename: async () => {
+          const stale = new Date(Date.now() - 3_000)
+          await utimes(lockDir, stale, stale)
+          replacementLock.release =
+            await __acquireSidebarStateLockForTest(stateFile)
+          expect(replacementLock.release).toBeFunction()
+          await writeFile(stateFile, JSON.stringify(replacement))
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       await setSidebarState(staleWriter, stateFile)
       expect(JSON.parse(await readFile(stateFile, 'utf8'))).toEqual(replacement)
     } finally {
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await replacementLock.release?.()
       await rm(stateDir, { recursive: true, force: true })
     }

@@ -608,6 +608,46 @@ describe('QuotaManager', () => {
       expect(qm.getFallback('fallback-1', 'new-fallback-token')).toBeNull()
     })
 
+    test('seedFallbacksFromAccounts preserves freshness for scoped-only quota', () => {
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: { checkIntervalMinutes: 5 },
+        },
+        now: () => 1_000_000,
+      })
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'scoped-only',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'refresh-token',
+          expires: 2_000_000,
+          quota: {
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: 999_000,
+              },
+            ],
+          },
+        },
+      ])
+
+      expect(qm.getFallback('scoped-only', 'fallback-token')?.checkedAt).toBe(
+        999_000,
+      )
+      expect(
+        qm.isFallbackStale('scoped-only', 'fallback-token', 'claude-fable-5'),
+      ).toBe(false)
+    })
+
     test('seedFallbacksFromAccounts updates older in-memory quota from disk', () => {
       const qm = new QuotaManager({
         storage: {

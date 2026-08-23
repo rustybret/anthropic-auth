@@ -50,6 +50,20 @@ describe('FableFallbackManager', () => {
     expect(JSON.parse(restored.bodyText).model).toBe('claude-fable-5')
   })
 
+  test('keeps a recovery alive when its in-flight plan is touched before capacity pruning', () => {
+    const manager = new FableFallbackManager()
+    for (let index = 0; index < 128; index++) {
+      manager.activate(manager.plan(`session-${index}`, body())!)
+    }
+
+    // plan() LRU-touches the recovery before returning the downgraded request.
+    const inFlight = manager.plan('session-0', body())!
+    expect(inFlight.downgraded).toBe(true)
+    manager.activate(manager.plan('session-128', body())!)
+
+    expect(manager.complete(inFlight)).toEqual({ counted: true, remaining: 9 })
+  })
+
   test('rebinds an active recovery cycle when sticky routing must migrate accounts', () => {
     const manager = new FableFallbackManager()
     manager.activate(manager.plan('session-a', body())!, 'old-account')

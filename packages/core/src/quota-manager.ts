@@ -23,6 +23,7 @@ import {
   getScopedQuotaWindowForModel,
   isQuotaPolicyAuthError,
   quotaBackoffActive,
+  quotaSnapshotCheckedAt,
 } from './accounts.ts'
 import { mergeHeaderQuotaSnapshot } from './quota-headers.ts'
 
@@ -466,10 +467,7 @@ export class QuotaManager {
     for (const account of accounts) {
       if (account.enabled === false) continue
       if (!account.quota) continue
-      const checkedAt = Math.max(
-        account.quota.five_hour?.checkedAt ?? 0,
-        account.quota.seven_day?.checkedAt ?? 0,
-      )
+      const checkedAt = quotaSnapshotCheckedAt(account.quota)
       if (checkedAt <= 0) continue
       const existing = this.getFallback(account.id, account.access)
       if (existing && existing.checkedAt >= checkedAt) continue

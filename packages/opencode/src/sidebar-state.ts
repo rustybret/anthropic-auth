@@ -440,12 +440,20 @@ interface SidebarStateWriteTestHooks {
   lockRetryMaxMs?: number
 }
 
-let sidebarStateWriteTestHooks: SidebarStateWriteTestHooks | null = null
+const sidebarStateWriteTestHooks = new Map<string, SidebarStateWriteTestHooks>()
 
 export function __setSidebarStateWriteTestHooks(
   hooks: SidebarStateWriteTestHooks | null,
+  stateFile = getSidebarStateFile(),
 ): void {
-  sidebarStateWriteTestHooks = hooks
+  if (hooks) sidebarStateWriteTestHooks.set(stateFile, hooks)
+  else sidebarStateWriteTestHooks.delete(stateFile)
+}
+
+function sidebarStateWriteHooksFor(
+  stateFile: string,
+): SidebarStateWriteTestHooks | undefined {
+  return sidebarStateWriteTestHooks.get(stateFile)
 }
 
 // Boot-routing test hooks live here rather than in index.ts: the plugin entry
@@ -480,12 +488,10 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
   ownsLock: () => Promise<boolean>
 } | null> {
   const lockDir = `${stateFile}.lock`
-  const budgetMs =
-    sidebarStateWriteTestHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
-  const retryMinMs =
-    sidebarStateWriteTestHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
-  const retryMaxMs =
-    sidebarStateWriteTestHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
+  const testHooks = sidebarStateWriteHooksFor(stateFile)
+  const budgetMs = testHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
+  const retryMinMs = testHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
+  const retryMaxMs = testHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
   const deadline = Date.now() + budgetMs
 
   while (true) {
@@ -498,7 +504,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
         mode: 0o600,
         flag: 'wx',
       })
-      await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
+      await testHooks?.onLockAcquired?.(lockDir)
       return {
         ownsLock: async () => {
           try {
@@ -516,9 +522,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
           } catch {
             return
           }
-          await sidebarStateWriteTestHooks?.beforeReleaseDirectoryRemoval?.(
-            lockDir,
-          )
+          await testHooks?.beforeReleaseDirectoryRemoval?.(lockDir)
           await rmdir(lockDir).catch(() => {})
         },
       }
@@ -535,7 +539,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
     try {
       const lockStat = await stat(lockDir)
       if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
-        await sidebarStateWriteTestHooks?.afterStaleLockStat?.(lockDir)
+        await testHooks?.afterStaleLockStat?.(lockDir)
         const evictedLockDir = `${lockDir}.evict-${process.pid}-${randomUUID()}`
         try {
           await rename(lockDir, evictedLockDir)
@@ -543,7 +547,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
           throw error
         }
-        await sidebarStateWriteTestHooks?.onStaleLockClaimed?.(lockDir)
+        await testHooks?.onStaleLockClaimed?.(lockDir)
         await rm(evictedLockDir, { recursive: true, force: true }).catch(
           () => {},
         )
@@ -583,6 +587,7 @@ async function writeSidebarStateAtomic(
   state: SidebarState,
   ownsLock: () => Promise<boolean>,
 ): Promise<'written' | 'lock-lost-before-rename' | 'lock-lost-after-rename'> {
+  const testHooks = sidebarStateWriteHooksFor(stateFile)
   const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
   await writeFile(tempFile, JSON.stringify(state), {
     encoding: 'utf8',
@@ -596,7 +601,7 @@ async function writeSidebarStateAtomic(
       await rm(tempFile, { force: true }).catch(() => {})
       return 'lock-lost-before-rename'
     }
-    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    await testHooks?.beforeRename?.(stateFile, tempFile)
     // No production await separates this ownership fence from rename. A process
     // freeze between the adjacent syscalls remains possible, so rename is also
     // fenced from the other side below.
@@ -608,7 +613,7 @@ async function writeSidebarStateAtomic(
       return 'lock-lost-before-rename'
     }
     await rename(tempFile, stateFile)
-    await sidebarStateWriteTestHooks?.afterRename?.(stateFile)
+    await testHooks?.afterRename?.(stateFile)
     if (!(await ownsLock())) return 'lock-lost-after-rename'
     return 'written'
   } catch (error) {
@@ -693,7 +698,9 @@ export async function setSidebarState(
                 ),
               }
             }
-            await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+            await sidebarStateWriteHooksFor(stateFile)?.afterMergeRead?.(
+              stateFile,
+            )
           } else if (repairingPostRenameLoss) {
             const current = await getSidebarState(stateFile)
             // A successor owns its fresh account/quota and recovery snapshots;
