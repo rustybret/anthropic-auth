@@ -18,6 +18,7 @@ export type CacheDiagnosticsSource = string
 
 export const CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC = {
   turn: false,
+  start: true,
   prewarm_cachekeep: true,
 } as const
 

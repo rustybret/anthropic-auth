@@ -87,6 +87,75 @@ describe('mergeHeaders', () => {
   })
 })
 
+describe('lane start request shaping', () => {
+  const laneStartBody = (
+    model: string,
+    thinking: unknown = { type: 'enabled' },
+  ) =>
+    JSON.stringify({
+      model,
+      max_tokens: 512,
+      stream: true,
+      thinking,
+      output_config: { effort: 'high' },
+      tools: [{ name: 'lookup', input_schema: { type: 'object' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      cache_control: { type: 'ephemeral' },
+      speed: 'fast',
+    })
+
+  test('sets one streaming token and strips thinking after model normalization', async () => {
+    const thinkingShapes = [
+      { type: 'enabled' },
+      { type: 'adaptive' },
+      { type: 'summarized' },
+      { type: 'disabled' },
+    ]
+    for (const model of [
+      'claude-fable-5',
+      'claude-sonnet-5',
+      'claude-opus-5',
+    ]) {
+      for (const thinking of thinkingShapes) {
+        const result = JSON.parse(
+          await rewriteRequestBody(laneStartBody(model, thinking), {
+            laneStart: true,
+          }),
+        )
+        expect(result.max_tokens).toBe(1)
+        expect(result.stream).toBe(true)
+        expect(result.model).toBe(model)
+        expect(result.thinking).toBeUndefined()
+      }
+    }
+  })
+
+  test('preserves prompt and request features governed by existing paths', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(laneStartBody('claude-opus-4-8'), {
+        laneStart: true,
+        fastModeEnabled: true,
+      }),
+    )
+    expect(result.output_config).toEqual({ effort: 'high' })
+    expect(result.tools).toHaveLength(1)
+    expect(result.messages).toHaveLength(1)
+    expect(result.cache_control).toBeUndefined()
+    expect(result.speed).toBe('fast')
+  })
+
+  test('leaves ordinary requests unchanged and fails closed on invalid JSON', async () => {
+    const body = laneStartBody('claude-opus-4-8')
+    expect(await rewriteRequestBody(body)).not.toContain('"max_tokens":1')
+    expect(await rewriteRequestBody(body, { laneStart: false })).not.toContain(
+      '"max_tokens":1',
+    )
+    expect(await rewriteRequestBody('{not-json', { laneStart: true })).toBe(
+      '{not-json',
+    )
+  })
+})
+
 describe('mergeBetaHeaders', () => {
   test('includes required betas when no incoming betas', () => {
     const headers = new Headers()
@@ -485,6 +554,87 @@ describe('isInsecure', () => {
 })
 
 describe('createStrippedStream', () => {
+  test('rewrites the lane-start max_tokens finish as end_turn before completion', async () => {
+    const finishReasons: string[] = []
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+      usage: { output_tokens: 1 },
+    })
+
+    const splitAt = body.indexOf('max_tokens') + 4
+    const text = await createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder()
+            controller.enqueue(encoder.encode(body.slice(0, splitAt)))
+            controller.enqueue(encoder.encode(body.slice(splitAt)))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        laneStart: true,
+        onComplete: (finishReason) => finishReasons.push(finishReason),
+      },
+    ).text()
+
+    expect(text).toContain('"stop_reason":"end_turn"')
+    expect(text).toContain('"output_tokens":1')
+    expect(finishReasons).toEqual(['end_turn'])
+  })
+
+  test('leaves API-key-served lane-start max_tokens finish unchanged', async () => {
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+      usage: { output_tokens: 1 },
+    })
+
+    const text = await createStrippedStream(new Response(body), {
+      laneStart: true,
+      laneStartOAuthServed: false,
+    }).text()
+
+    expect(text).toBe(body)
+  })
+
+  test('leaves max_tokens bytes unchanged without the lane-start marker', async () => {
+    const finishReasons: string[] = []
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+      usage: { output_tokens: 1 },
+    })
+
+    const text = await createStrippedStream(new Response(body), {
+      onComplete: (finishReason) => finishReasons.push(finishReason),
+    }).text()
+
+    expect(text).toBe(body)
+    expect(finishReasons).toEqual(['max_tokens'])
+  })
+
+  test('preserves lane-start refusal handling', async () => {
+    let refusals = 0
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'refusal' },
+    })
+
+    const text = await createStrippedStream(new Response(body), {
+      laneStart: true,
+      onContentFilter: () => {
+        refusals++
+        return false
+      },
+    }).text()
+
+    expect(text).toBe(body)
+    expect(refusals).toBe(1)
+  })
+
   test('observes a split message_start envelope exactly once', async () => {
     const message = {
       id: 'msg_provider_1',

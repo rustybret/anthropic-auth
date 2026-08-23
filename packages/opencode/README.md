@@ -20,7 +20,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
 | Runtime state | `~/.config/opencode/anthropic-auth-state.json` | next to the Pi sidecar as `anthropic-auth-state.json` |
-| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-prime` (status only), `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-prime` (status only), `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
 | Fallback accounts, quota routing, killswitch, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
@@ -31,6 +31,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
+- **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
 - **Fable/Opus 5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
@@ -217,6 +218,9 @@ Example:
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
+
+## OpenCode lane-start setting
+
 
 ## Fallback accounts
 
@@ -412,6 +416,18 @@ Prime marker identities live in `anthropic-auth-state.json`. Plugin-owned refres
 
 Pi exposes `/claude-prime` as a status-only command. Its `on` and `off` arguments are ignored; enable or disable priming from OpenCode.
 
+## OpenCode lane start
+
+`/claude-start` is an OpenCode-only command. It queues one synthetic turn for the current session:
+
+```text
+/claude-start
+```
+
+The bare command fires immediately. The synthetic prompt uses the session's current model, agent, and variant, then travels through the ordinary quota, routing, cache, relay, signing, and response pipeline. OpenCode shapes that OAuth request to `max_tokens: 1` while keeping streaming enabled, and correlates the request by its synthetic message ID. A queued modal is a request to start the turn, not a provider-success claim.
+
+Pi does not expose this command.
+
 ### Cache diagnostics (beta)
 
 The `cache-diagnosis-2026-04-07` beta is measure-only. It asks Anthropic to report prompt-cache diagnostics; it does not change cache controls or routing. OpenCode captures the provider's top-level response ID as an opaque string and sends it as `diagnostics.previous_message_id` on the next request in the same session. The first request sends `null`.
@@ -421,7 +437,7 @@ The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Records and thei
 | Field | Type | Source |
 | --- | --- | --- |
 | `v` | `2` | Capture schema |
-| `source` | string | Observation path; known values are `"turn"` and `"prewarm_cachekeep"`, but consumers must tolerate future values |
+| `source` | string | Observation path; known values are `"turn"`, `"start"`, and `"prewarm_cachekeep"`, but consumers must tolerate future values |
 | `synthetic` | boolean | Whether this observation was generated by plugin machinery rather than a real turn |
 | `account_id` | string | Persisted plugin-internal OAuth account identifier used by routing and the sidebar; stable across restarts and token refreshes, so consumers may key timelines on it. Opaque mixed key space (the main account is a sentinel string, fallbacks are UUIDs) — never validate its shape |
 | `betas_hash` | 16-character lowercase hex | xxHash64 (seed `0`) of the sorted `anthropic-beta` list actually sent, truncated to its first 16 hexadecimal characters |
@@ -453,7 +469,10 @@ Known sources map to `synthetic` as follows:
 | `source` | `synthetic` |
 | --- | --- |
 | `turn` | `false` |
+| `start` | `true` |
 | `prewarm_cachekeep` | `true` |
+
+Lane-start cache observations therefore appear as ordinary `MC-CACHE-DIAG ` records with `source: "start"`; the row above is the diagnostics-side companion to the `/claude-start` pipeline described earlier.
 
 `synthetic` wins on conflict. A disagreement for a known source is an emitter defect: OpenCode writes one warning and still emits the record with the supplied `synthetic` value. Unknown future sources have no mapping and must not be rejected by consumers.
 
@@ -480,7 +499,7 @@ Diagnostics comparison requires a cacheable prefix. Requests below the model's c
 
 Version 1 records come from the unversioned-source era and cannot distinguish prewarms from turns; consumers must treat their source as unknown and cannot split machinery from traffic retroactively. Version 2 always states the source.
 
-When request dumps are enabled, each response gets a `.response.json` artifact containing status and parsed response metadata, but no response content. Cache keepalive prewarms are tagged `-prewarm-cachekeep` in dump filenames and metadata. If Prime prewarming is enabled in a build that supports it, those artifacts use `-prewarm-prime`. Treat request bodies and related dump files as sensitive local debugging data.
+When request dumps are enabled, each response gets a `.response.json` artifact containing status and parsed response metadata, but no response content. Lane-start requests are tagged `-start-`; CacheKeep prewarms retain `-prewarm-cachekeep-`. If Prime prewarming is enabled in a build that supports it, those artifacts use `-prewarm-prime`. Treat request bodies and related dump files as sensitive local debugging data.
 
 ## Claude fast mode
 

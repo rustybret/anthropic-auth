@@ -1109,7 +1109,8 @@ export async function sendViaRelay(options: {
    * within an attempt are ignored.
    */
   onResponseHeaders?: (headers: Headers) => void
-  onDumpCreated?: (handle: { responsePath: string; tag?: 'cachekeep' }) => void
+  dumpTag?: import('./dump.ts').DumpTag
+  onDumpCreated?: (handle: import('./dump.ts').DumpHandle) => void
   setTimeoutImpl?: typeof globalThis.setTimeout
   clearTimeoutImpl?: typeof globalThis.clearTimeout
 }): Promise<Response> {
@@ -1123,6 +1124,7 @@ export async function sendViaRelay(options: {
     affinity: explicitAffinity,
     optimisticResponse,
     onResponseHeaders,
+    dumpTag,
     onDumpCreated,
     setTimeoutImpl = globalThis.setTimeout,
     clearTimeoutImpl = globalThis.clearTimeout,
@@ -1249,6 +1251,7 @@ export async function sendViaRelay(options: {
       previousBodyText: previous?.body,
       payload: result.payload,
       relayBytes: actualPayloadBytes,
+      tag: dumpTag,
     })
     try {
       if (dumpHandle) onDumpCreated?.(dumpHandle)

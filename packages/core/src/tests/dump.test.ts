@@ -92,6 +92,156 @@ test('request dumps return response handles only when enabled', async () => {
   expect(await lstat(direct!.responsePath).catch(() => null)).toBeNull()
 })
 
+test('seeds a direct-request diff from the latest same-session dump after restart', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+
+  const previousBody = '{"value":"old-tail"}'
+  const currentBody = '{"value":"new-tail"}'
+  await dumpDirectRequest({
+    affinity: 'ses-restart',
+    bodyText: previousBody,
+    route: 'main',
+  })
+  await Bun.sleep(2)
+  await dumpDirectRequest({
+    // This deliberately shares the target session's filename prefix. It must
+    // not be mistaken for a tagged dump belonging to ses-restart.
+    affinity: 'ses-restart-prewarm-cachekeep',
+    bodyText: '{"value":"unrelated"}',
+    route: 'main',
+  })
+
+  // resetDumpState clears the in-memory baseline and counter, matching a fresh
+  // process while leaving the configured dump directory intact.
+  resetDumpState()
+  setDumpEnabled(true)
+  await Bun.sleep(2)
+  await dumpDirectRequest({
+    affinity: 'ses-restart',
+    bodyText: currentBody,
+    route: 'fallback',
+  })
+
+  const metadataFiles = (await readdir(dumpDir))
+    .filter(
+      (name) =>
+        name.includes('-ses-restart-direct-') && name.endsWith('.meta.json'),
+    )
+    .sort()
+  expect(metadataFiles).toHaveLength(2)
+  const latest = JSON.parse(
+    await readFile(join(dumpDir, metadataFiles.at(-1)!), 'utf8'),
+  )
+  expect(latest.diff).toEqual({
+    changed: true,
+    firstByte: 10,
+    lastPreviousByte: 12,
+    lastCurrentByte: 12,
+    changedPreviousBytes: 3,
+    changedCurrentBytes: 3,
+    previousBytes: previousBody.length,
+    currentBytes: currentBody.length,
+  })
+})
+
+test('recognizes a tagged prewarm as the latest same-session restart baseline', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+
+  const previousBody = '{"value":"prewarm-old"}'
+  const currentBody = '{"value":"request-new"}'
+  await dumpDirectRequest({
+    affinity: 'ses-tagged-restart',
+    bodyText: previousBody,
+    tag: 'cachekeep',
+  })
+
+  resetDumpState()
+  setDumpEnabled(true)
+  await Bun.sleep(2)
+  await dumpDirectRequest({
+    affinity: 'ses-tagged-restart',
+    bodyText: currentBody,
+  })
+
+  const metadataFile = (await readdir(dumpDir))
+    .filter(
+      (name) =>
+        name.includes('-ses-tagged-restart-direct') &&
+        name.endsWith('.meta.json'),
+    )
+    .sort()
+    .at(-1)
+  const latest = JSON.parse(
+    await readFile(join(dumpDir, metadataFile!), 'utf8'),
+  )
+  expect(latest.diff).toMatchObject({
+    changed: true,
+    previousBytes: previousBody.length,
+    currentBytes: currentBody.length,
+  })
+})
+
+test('seeds a relay-request diff from the latest same-session dump after restart', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+
+  const previousBody = '{"value":"relay-old"}'
+  const currentBody = '{"value":"relay-new"}'
+  await dumpRelayRequest({
+    affinity: 'ses-relay-restart',
+    transport: 'websocket',
+    protocol: 2,
+    mode: 'full_sync',
+    bodyText: previousBody,
+    payload: {},
+    relayBytes: previousBody.length,
+  })
+
+  resetDumpState()
+  setDumpEnabled(true)
+  await Bun.sleep(2)
+  await dumpRelayRequest({
+    affinity: 'ses-relay-restart',
+    transport: 'http',
+    protocol: 1,
+    mode: 'full_sync',
+    bodyText: currentBody,
+    payload: {},
+    relayBytes: currentBody.length,
+  })
+
+  const metadataFiles = (await readdir(dumpDir))
+    .filter(
+      (name) =>
+        name.includes('-ses-relay-restart-') && name.endsWith('.meta.json'),
+    )
+    .sort()
+  expect(metadataFiles).toHaveLength(2)
+  const latest = JSON.parse(
+    await readFile(join(dumpDir, metadataFiles.at(-1)!), 'utf8'),
+  )
+  expect(latest.diff).toMatchObject({
+    changed: true,
+    firstByte: 16,
+    previousBytes: previousBody.length,
+    currentBytes: currentBody.length,
+  })
+})
+
 test('sweeps tagged dumps with a maximum-length affinity segment', async () => {
   const dumpDir = await mkdtemp(
     join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
@@ -193,6 +343,31 @@ test('tagged prewarm dumps include the tag in filenames and metadata', async () 
     ),
   )
   expect(metadata.tag).toBe('cachekeep')
+})
+
+test('start dumps use the distinct start filename segment', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-start',
+    bodyText: '{}',
+    tag: 'start',
+  })
+  expect(handle?.tag).toBe('start')
+  expect(handle?.responsePath).toMatch(/-start-direct\.response\.json$/)
+  expect(handle?.responsePath).not.toContain('-prewarm-start')
+  const files = await readdir(dumpDir)
+  const metadata = JSON.parse(
+    await readFile(
+      join(dumpDir, files.find((name) => name.endsWith('.meta.json'))!),
+      'utf8',
+    ),
+  )
+  expect(metadata.tag).toBe('start')
 })
 
 test('dump sweep recognizes response artifacts', async () => {

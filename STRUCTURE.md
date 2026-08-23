@@ -105,7 +105,7 @@ anthropic-auth/
 - `packages/core/src/commands/account.ts`: Account slash command execution logic
 - `packages/core/src/cache1h.ts`: 1h prompt cache configuration and commands
 - `packages/core/src/fast.ts`: Fast mode configuration and commands
-- `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, CacheKeep/Prime prewarm tagging, and commands
+- `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, same-session on-disk byte-diff baseline recovery after restart, CacheKeep/Prime prewarm tagging, and commands
 - `packages/core/src/models.ts`: Supported Claude models and specs, including the Haiku 4.5 prime model and pricing constants
 - `packages/core/src/logger.ts`: Shared structured logger
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
@@ -144,7 +144,7 @@ anthropic-auth/
 
 **New OpenCode hook or fetch transform:** `packages/opencode/src/` — follow the pattern in `index.ts` for hook registration or `transform.ts` for pipeline steps. Add tests in `packages/opencode/src/tests/`.
 
-**New slash command:** Register the command name in `packages/core/src/constants.ts` (or a dedicated module), implement execution logic in core (shared) or per-package (if platform-specific), add the command hook in `packages/opencode/src/index.ts` (config hook) or `packages/pi/src/commands.ts`. If the command owns a background scheduler, keep its manager in core and adopt one process-wide manager through a keyed registry in the host package; persist user opt-in separately from runtime counters when the command spans processes, as `/claude-prime` does.
+**New slash command:** Register the command name in `packages/core/src/constants.ts` (or a dedicated module), implement execution logic in core (shared) or per-package (if platform-specific), add it to the shared `COMMAND_MODAL_NAMES` tuple in `packages/opencode/src/rpc/protocol.ts`, register its `template` and `description` in the `config` hook, and handle it exhaustively in `buildDialogPayload` in `packages/opencode/src/index.ts`. The tuple derives the closed `CommandModalName` type and the `command.execute.before` interception list; `index.test.ts` asserts that the config-hook command set exactly matches it, while the exhaustive payload branch makes new unhandled modal names fail type-checking. An interactive palette check still verifies that the running host surfaces the command. For Pi, add the command in `packages/pi/src/commands.ts`. If the command owns a background scheduler, keep its manager in core and adopt one process-wide manager through a keyed registry in the host package; persist user opt-in separately from runtime counters when the command spans processes, as `/claude-prime` does.
 
 **New TUI feature:** `packages/opencode/src/tui/` — add components as `.tsx` files using SolidJS + OpenTUI. Add RPC protocol types in `packages/opencode/src/rpc/protocol.ts` if the feature needs server-to-TUI IPC.
 

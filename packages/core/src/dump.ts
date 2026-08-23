@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   readdir,
+  readFile,
   rename,
   unlink,
   writeFile,
@@ -41,6 +42,11 @@ const DIRECT_DUMP_PATTERN = new RegExp(
 const RELAY_DUMP_PATTERN = new RegExp(
   `^${DUMP_SEGMENT_PATTERN}{1,80}-(?:http|websocket)-p[12]-(?:full_sync|patch)$`,
 )
+const DIRECT_DUMP_SUFFIX_PATTERN = new RegExp(
+  `^-direct(?:-${DUMP_SEGMENT_PATTERN}{1,80})?$`,
+)
+const RELAY_DUMP_SUFFIX_PATTERN =
+  /^-(?:http|websocket)-p[12]-(?:full_sync|patch)$/
 
 let dumpEnabled = false
 let nextDumpId = 0
@@ -55,7 +61,7 @@ export type DumpCommandAction =
   | { type: 'disable' }
   | { type: 'usage' }
 
-export type DumpTag = 'cachekeep'
+export type DumpTag = 'cachekeep' | 'start'
 
 export type DumpHandle = {
   responsePath: string
@@ -362,7 +368,9 @@ function dumpRequestSegment(input: {
 }
 
 function dumpTagSegment(tag: DumpTag | undefined) {
-  return tag ? `-prewarm-${tag}` : ''
+  if (tag === 'cachekeep') return '-prewarm-cachekeep'
+  if (tag === 'start') return '-start'
+  return ''
 }
 
 function directDumpPreviousKey(input: {
@@ -373,6 +381,87 @@ function directDumpPreviousKey(input: {
   const affinity = input.affinity?.trim()
   if (affinity) return `session:${affinity}`
   return `request:${input.route ?? 'direct'}:${input.url ?? ''}`
+}
+
+function dumpBodyTagForAffinity(
+  name: string,
+  affinity: string,
+): DumpTag | null | undefined {
+  if (!name.endsWith('.body.json')) return undefined
+  const stem = name.replace(DUMP_ARTIFACT_SUFFIX_PATTERN, '')
+  const requestPath = DUMP_ARTIFACT_ID_PATTERN.exec(stem)?.[1]
+  if (
+    !requestPath ||
+    (!DIRECT_DUMP_PATTERN.test(requestPath) &&
+      !RELAY_DUMP_PATTERN.test(requestPath))
+  ) {
+    return undefined
+  }
+
+  const cachekeepTag = dumpTagSegment('cachekeep')
+  const candidates: Array<{ prefix: string; tag: DumpTag | null }> = [
+    { prefix: dumpFileSessionSegment(affinity), tag: null },
+    {
+      prefix: `${dumpFileSessionSegment(affinity, 80 - cachekeepTag.length)}${cachekeepTag}`,
+      tag: 'cachekeep',
+    },
+  ]
+  for (const candidate of candidates) {
+    if (!requestPath.startsWith(`${candidate.prefix}-`)) continue
+    const suffix = requestPath.slice(candidate.prefix.length)
+    if (
+      DIRECT_DUMP_SUFFIX_PATTERN.test(suffix) ||
+      RELAY_DUMP_SUFFIX_PATTERN.test(suffix)
+    ) {
+      return candidate.tag
+    }
+  }
+  return undefined
+}
+
+async function loadLatestDumpBody(input: {
+  affinity?: string | null
+}): Promise<string | undefined> {
+  const affinity = input.affinity?.trim()
+  if (!affinity) return undefined
+
+  const dumpDir = getDumpDirectory()
+  let names: string[]
+  try {
+    names = await readdir(dumpDir)
+  } catch {
+    return undefined
+  }
+  const candidates = names
+    .map((name) => ({ name, tag: dumpBodyTagForAffinity(name, affinity) }))
+    .filter(
+      (candidate): candidate is { name: string; tag: DumpTag | null } =>
+        candidate.tag !== undefined,
+    )
+    .sort((a, b) => b.name.localeCompare(a.name))
+  for (const candidate of candidates) {
+    try {
+      const path = join(dumpDir, candidate.name)
+      const metadataPath = path.replace(/\.body\.json$/, '.meta.json')
+      if (!(await lstat(path)).isFile()) continue
+      const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {
+        session?: unknown
+        tag?: unknown
+      }
+      if (
+        metadata.session !== shortAffinity(affinity) ||
+        (candidate.tag === null
+          ? metadata.tag != null
+          : metadata.tag !== candidate.tag)
+      ) {
+        continue
+      }
+      return await readFile(path, 'utf8')
+    } catch {
+      // A concurrent sweep can remove the newest artifact; try its predecessor.
+    }
+  }
+  return undefined
 }
 
 function rememberDirectDumpBody(key: string, bodyText: string) {
@@ -551,6 +640,8 @@ async function dumpRequest(input: {
 
   try {
     await mkdir(dumpDir, { recursive: true })
+    const previousBodyText =
+      input.previousBodyText ?? (await loadLatestDumpBody(input))
     const metadata = {
       id,
       createdAt: new Date().toISOString(),
@@ -565,7 +656,7 @@ async function dumpRequest(input: {
       bodyBytes: input.bodyText.length,
       relayBytes: input.relayBytes,
       bodyHash: hashText(input.bodyText),
-      diff: diffSummary(input.previousBodyText, input.bodyText),
+      diff: diffSummary(previousBodyText, input.bodyText),
       body: bodyStructureSummary(input.bodyText),
       files,
     }

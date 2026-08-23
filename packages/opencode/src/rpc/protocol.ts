@@ -1,14 +1,18 @@
-export type CommandModalName =
-  | 'claude-account'
-  | 'claude-cache'
-  | 'claude-cachekeep'
-  | 'claude-prime'
-  | 'claude-quota'
-  | 'claude-dump'
-  | 'claude-fast'
-  | 'claude-routing'
-  | 'claude-killswitch'
-  | 'claude-logging'
+export const COMMAND_MODAL_NAMES = [
+  'claude-account',
+  'claude-cache',
+  'claude-cachekeep',
+  'claude-prime',
+  'claude-start',
+  'claude-quota',
+  'claude-dump',
+  'claude-fast',
+  'claude-routing',
+  'claude-killswitch',
+  'claude-logging',
+] as const
+
+export type CommandModalName = (typeof COMMAND_MODAL_NAMES)[number]
 
 export interface OpenDialogPayload {
   command: CommandModalName

@@ -161,6 +161,7 @@ describe('cache diagnostics v2 contract', () => {
   test('exports the known source synthetic mapping', () => {
     expect(CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC).toEqual({
       turn: false,
+      start: true,
       prewarm_cachekeep: true,
     })
   })

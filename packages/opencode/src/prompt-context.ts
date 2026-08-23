@@ -22,7 +22,12 @@ interface RawInfo {
   variant?: string
   providerID?: string
   modelID?: string
-  model?: { providerID?: string; modelID?: string; variant?: string }
+  model?: {
+    providerID?: string
+    modelID?: string
+    id?: string
+    variant?: string
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -65,9 +70,11 @@ function extractFromMessage(message: unknown): ResolvedPromptContext | null {
   const modelID =
     typeof modelInfo?.modelID === 'string'
       ? modelInfo.modelID
-      : typeof info.modelID === 'string'
-        ? info.modelID
-        : undefined
+      : typeof modelInfo?.id === 'string'
+        ? modelInfo.id
+        : typeof info.modelID === 'string'
+          ? info.modelID
+          : undefined
   const variant =
     typeof modelInfo?.variant === 'string'
       ? modelInfo.variant
@@ -115,24 +122,26 @@ export async function resolvePromptContext(
         | Promise<{ data?: unknown[] } | unknown[]>
         | { data?: unknown[] }
         | unknown[]
+      get?: (input: {
+        path: { id: string }
+      }) => Promise<{ data?: unknown } | unknown> | { data?: unknown } | unknown
     }
   }
-  if (typeof typedClient.session?.messages !== 'function') return null
-
   let messages: unknown[] = []
-  try {
-    messages = extractMessages(
-      await Promise.resolve(
-        typedClient.session.messages({
-          path: { id: sessionId },
-          query: { limit: 100 },
-        }),
-      ),
-    )
-  } catch {
-    return null
+  if (typeof typedClient.session?.messages === 'function') {
+    try {
+      messages = extractMessages(
+        await Promise.resolve(
+          typedClient.session.messages({
+            path: { id: sessionId },
+            query: { limit: 100 },
+          }),
+        ),
+      )
+    } catch {
+      messages = []
+    }
   }
-  if (messages.length === 0) return null
 
   let latestAssistantMessageId: string | undefined
   let latestUserMessageId: string | undefined
@@ -168,6 +177,24 @@ export async function resolvePromptContext(
     if (!context) continue
     result = mergeContexts(result, context)
     if (isComplete(result)) return result
+  }
+
+  if (typeof typedClient.session?.get === 'function') {
+    try {
+      const response = await Promise.resolve(
+        typedClient.session.get({ path: { id: sessionId } }),
+      )
+      const session =
+        isRecord(response) && isRecord(response.data)
+          ? response.data
+          : isRecord(response)
+            ? response
+            : undefined
+      const metadata = session ? extractFromMessage({ info: session }) : null
+      if (metadata) result = mergeContexts(result, metadata)
+    } catch {
+      // Message-derived context remains usable when the metadata fallback fails.
+    }
   }
 
   if (

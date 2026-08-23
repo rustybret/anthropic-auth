@@ -223,6 +223,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session relay/dump:alpha'),
+        dumpTag: 'start',
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
           stream: true,
@@ -249,9 +250,9 @@ describe('relay client', () => {
       expect(metaPath).toBeString()
       expect(bodyPath).toBeString()
       expect(relayPath).toBeString()
-      expect(metaPath).toInclude('session-relay-dump-alpha')
-      expect(bodyPath).toInclude('session-relay-dump-alpha')
-      expect(relayPath).toInclude('session-relay-dump-alpha')
+      expect(metaPath).toInclude('session-relay-dump-alpha-start-http-p1-')
+      expect(bodyPath).toInclude('session-relay-dump-alpha-start-http-p1-')
+      expect(relayPath).toInclude('session-relay-dump-alpha-start-http-p1-')
 
       const meta = JSON.parse(
         await readFile(`${getDumpDirectory()}/${metaPath}`, 'utf8'),
@@ -262,6 +263,7 @@ describe('relay client', () => {
         systemCount: 2,
         cch: 'abcde',
       })
+      expect(meta.tag).toBe('start')
       expect(
         await readFile(`${getDumpDirectory()}/${bodyPath}`, 'utf8'),
       ).toContain('first')

@@ -227,9 +227,9 @@ describe('CacheKeepManager', () => {
       bodyText: body,
     })
     expect(result.ok).toBe(true)
+    expect(sent[0]).toBeDefined()
     expect(sent[0]).toContain('prepared')
     expect(observed).toHaveLength(1)
-    expect(sent[0]).toBeDefined()
     expect((observed[0] as { bodyText: string }).bodyText).toBe(sent[0]!)
     expect(
       (observed[0] as { data: { usage: { cache_creation: unknown } } }).data
