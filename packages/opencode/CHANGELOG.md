@@ -2,14 +2,23 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
-## Unreleased
+## 1.20.0
+
+### Minor Changes
+
+- Add opt-in `/claude-prime` scheduling that sends a minimal Haiku 4.5 request shortly after each OAuth account's five-hour quota reset so each window starts immediately.
+- Add `/claude-start` for an explicit synthetic one-token turn through the current session's normal model, routing, cache, and request pipeline.
+- Capture Anthropic cache diagnostics in versioned `MC-CACHE-DIAG ` debug records and sanitized dump artifacts, preserving provider response IDs across normal requests and CacheKeep prewarms.
+
+### Patch Changes
 
 - Deliver OpenCode Desktop recovery notices without triggering an extra billed provider turn on OpenCode 1.18 and newer, including holding the switch notice until the first successful Opus recovery response and revalidating the idle delivery lease after asynchronous status and message-history reads so a racing prompt cannot adopt the notice as its retry parent.
-- Add opt-in `/claude-prime` scheduling that sends a minimal Haiku 4.5 request shortly after each OAuth account's five-hour quota reset so each window starts immediately.
 - Retry failed CacheKeep prewarms while the last confirmed cache can still be alive, and serialize overlapping manager ticks to avoid duplicate requests.
 - Preserve fresh scoped-only fallback quota snapshots, permanent refresh-error classification across lock contention, and explicit re-login guidance for unusable fallback accounts.
-- Evict complete request artifact groups when enforcing the dump-directory size cap.
-- Capture Anthropic cache diagnostics in debug logs and sanitized dump artifacts, finalizing a valid provider response artifact before its transformed response stream completes and restoring the first same-session request byte-diff baseline from disk after a process restart.
+- Finalize response-artifact writes before transformed streams complete, recover the first same-session request byte-diff baseline from disk after a restart, sweep stale partial dump files even below the size cap, and evict complete request artifact groups when enforcing that cap.
+- Update OpenCode 1.18 and OpenTUI 0.5 dependencies while preserving Desktop notification delivery, TUI reactivity, and deterministic Miniflare relay tests.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing quota priming, cache diagnostics, and explicit lane starts.
 
 ## 1.19.1
 

@@ -27,6 +27,7 @@ export function executeLaneStartCommand(input: { argumentsText: string }): {
         START_QUEUED_TITLE,
         '',
         '- Queued an explicit lane-start request.',
+        '- This is a billed request: the one-token limit does not remove prompt-cache read or write charges.',
       ].join('\n'),
     }
   }

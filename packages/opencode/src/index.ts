@@ -3350,7 +3350,7 @@ const anthropicAuthPlugin = async (
         [CLAUDE_START_COMMAND_NAME]: {
           template: CLAUDE_START_COMMAND_NAME,
           description:
-            'Warm and renew the current Claude session cache with a one-token synthetic turn.',
+            'Send a billed one-token synthetic turn to warm and renew the current Claude session cache.',
         },
 
         [CLAUDE_QUOTAS_COMMAND_NAME]: {

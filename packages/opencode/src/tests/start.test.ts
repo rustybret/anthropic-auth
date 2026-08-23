@@ -8,10 +8,10 @@ describe('claude-start command contract', () => {
   test('bare and whitespace-only input queues a start turn', () => {
     expect(parseLaneStartCommandAction('')).toEqual({ type: 'fire' })
     expect(parseLaneStartCommandAction('  \t')).toEqual({ type: 'fire' })
-    expect(executeLaneStartCommand({ argumentsText: ' ' })).toEqual({
-      action: { type: 'fire' },
-      text: expect.stringContaining('Queued'),
-    })
+    const result = executeLaneStartCommand({ argumentsText: ' ' })
+    expect(result.action).toEqual({ type: 'fire' })
+    expect(result.text).toContain('Queued')
+    expect(result.text).toContain('billed request')
   })
 
   test('multiple or invalid arguments return usage', () => {

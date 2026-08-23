@@ -521,6 +521,9 @@ Pi exposes `/claude-prime` as a status-only command. Its `on` and `off` argument
 
 The bare command fires immediately. The synthetic prompt uses the session's current model, agent, and variant, then travels through the ordinary quota, routing, cache, relay, signing, and response pipeline. OpenCode shapes that OAuth request to `max_tokens: 1` while keeping streaming enabled, and correlates the request by its synthetic message ID. A queued modal is a request to start the turn, not a provider-success claim.
 
+> [!IMPORTANT]
+> This is a real billed request. The one-token limit reduces generated output only; Anthropic still charges for prompt-cache reads and any new cache writes. Use it when you plan to resume the session before the refreshed cache expires.
+
 Pi does not expose this command.
 
 ## Claude fast mode
