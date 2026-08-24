@@ -23,7 +23,7 @@
 **@cortexkit/opencode-anthropic-auth (OpenCode Plugin):**
 - Purpose: OpenCode plugin that intercepts Anthropic fetch requests, provides CLI, TUI sidebar, and command modal dialogs
 - Location: `packages/opencode/src/`
-- Contains: Plugin entry point (`index.ts`), CLI (`cli.ts`), request transform/SSE stripping (`transform.ts`), cache diagnostics tracking and accounting (`cache-diagnostics.ts`), Anthropic server-side safety fallback (`server-fallback.ts`), deterministic client content-filter recovery (`fable-fallback.ts`), system prompt sanitization/memoization (`sanitize-memo.ts`), message-history context reconstruction (`prompt-context.ts`), lane-start request correlation (`lane-start.ts`), TUI sidebar widget (`tui.tsx`), TUI preferences (`tui-preferences.ts`), command modal dialogs (`tui/command-dialogs.tsx`), loopback RPC server/client for TUI IPC (`rpc/`), and TUI sidebar IPC state management (`sidebar-state.ts`)
+- Contains: Plugin entry point (`index.ts`), CLI (`cli.ts`), request transform/SSE stripping (`transform.ts`), cache diagnostics tracking and accounting (`cache-diagnostics.ts`), Anthropic server-side safety fallback (`server-fallback.ts`), deterministic client content-filter recovery (`fable-fallback.ts`), system prompt sanitization/memoization (`sanitize-memo.ts`), message-history context reconstruction (`prompt-context.ts`), lane-start request correlation (`lane-start.ts`), quota priming manager registry (`prime-manager-registry.ts`), TUI sidebar widget (`tui.tsx`), TUI preferences (`tui-preferences.ts`), command modal dialogs (`tui/command-dialogs.tsx`), loopback RPC server/client for TUI IPC (`rpc/`), and TUI sidebar IPC state management (`sidebar-state.ts`)
 - Depends on: `@cortexkit/anthropic-auth-core`, `@opencode-ai/plugin` (peer), `@opentui/core` + `@opentui/solid` + `solid-js` (TUI), `jsonc-parser` (TUI preferences)
 - Used by: OpenCode agent (loaded as plugin + TUI plugin)
 
@@ -198,7 +198,7 @@
 **TUI Sidebar Widget:**
 - Location: source in `packages/opencode/src/tui.tsx`; package loader in `packages/opencode/src/tui/entry.mjs`
 - Triggers: OpenCode TUI loads the plugin from `tui.json`
-- Packaging: build-time Solid/OpenTUI transformation emits `src/tui-compiled/` with host-runtime virtual imports; the loader selects that compiled tree on OpenTUI 0.4.x and retains raw TSX only for older hosts/development checkouts
+- Packaging: build-time Solid/OpenTUI transformation emits `src/tui-compiled/` with host-runtime virtual imports; the loader selects that compiled tree on OpenTUI 0.4.x+ hosts and retains raw TSX only for older hosts/development checkouts
 - Responsibilities: Render quota/reporting sidebar, open command modal dialogs on `/claude-*` commands, honor TUI preferences from `tui-preferences.jsonc`
 
 ## Error Handling
