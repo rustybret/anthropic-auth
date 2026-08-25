@@ -1,4 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from 'bun:test'
 import {
   hashBody,
   sendViaRelay,
@@ -148,98 +155,98 @@ function sendPayload(socket: WebSocket, payload: Record<string, unknown>) {
 }
 
 describe('relay Worker under Miniflare', () => {
+  let upstream: ReturnType<typeof createUpstream>
+  let mf: Miniflare
+
+  beforeAll(async () => {
+    upstream = createUpstream()
+    mf = await startWorker(upstream)
+  })
+
+  afterAll(async () => {
+    await mf?.dispose()
+  })
+
+  beforeEach(() => {
+    upstream.bodies.length = 0
+  })
+
   test('HTTP relay forwards upstream unified quota headers', async () => {
-    const upstream = createUpstream()
-    const mf = await startWorker(upstream)
+    const response = await sendViaRelay({
+      config: {
+        enabled: true,
+        url: (await mf.ready).toString(),
+        token: RELAY_TOKEN,
+        fallbackToDirect: false,
+        transport: 'http',
+      },
+      input: upstream.url,
+      init: { method: 'POST' },
+      headers: new Headers({
+        authorization: 'Bearer test-token',
+        'x-session-affinity': 'miniflare-http-session',
+      }),
+      body: '{}',
+      fallback: async () => new Response('direct'),
+    })
 
-    try {
-      const response = await sendViaRelay({
-        config: {
-          enabled: true,
-          url: (await mf.ready).toString(),
-          token: RELAY_TOKEN,
-          fallbackToDirect: false,
-          transport: 'http',
-        },
-        input: upstream.url,
-        init: { method: 'POST' },
-        headers: new Headers({
-          authorization: 'Bearer test-token',
-          'x-session-affinity': 'miniflare-http-session',
-        }),
-        body: '{}',
-        fallback: async () => new Response('direct'),
-      })
-
-      expect(
-        response.headers.get('anthropic-ratelimit-unified-5h-utilization'),
-      ).toBe('0.78')
-      expect(response.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
-        'available',
-      )
-      expect(await response.text()).toBe('upstream-ok')
-      expect(upstream.bodies).toEqual(['{}'])
-    } finally {
-      await mf.dispose()
-    }
+    expect(
+      response.headers.get('anthropic-ratelimit-unified-5h-utilization'),
+    ).toBe('0.78')
+    expect(response.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
+      'available',
+    )
+    expect(await response.text()).toBe('upstream-ok')
+    expect(upstream.bodies).toEqual(['{}'])
   }, 30_000)
 
   test('client websocket transport reaches Miniflare Worker with byte-exact patch reconstruction', async () => {
-    const upstream = createUpstream()
-    const mf = await startWorker(upstream)
     const affinity = 'miniflare-client-session'
-
-    try {
-      const firstBody = `client prefix cch=aaaaa; ${'x'.repeat(2048)} tail`
-      const secondBody = `client prefix cch=bbbbb; ${'x'.repeat(2048)} tail!`
-      const relayUrl = (await mf.ready).toString()
-      const relayConfig = {
-        enabled: true,
-        url: relayUrl,
-        token: RELAY_TOKEN,
-        fallbackToDirect: false,
-        transport: 'websocket' as const,
-      }
-      const requestHeaders = () =>
-        new Headers({
-          'x-session-affinity': affinity,
-          authorization: 'Bearer test-token',
-        })
-
-      const first = await sendViaRelay({
-        config: relayConfig,
-        input: `${upstream.url}?beta=true`,
-        init: { method: 'POST' },
-        headers: requestHeaders(),
-        body: firstBody,
-        fallback: async () => new Response('direct'),
-      })
-      expect(await first.text()).toBe('upstream-ok')
-      expect(
-        first.headers.get('anthropic-ratelimit-unified-5h-utilization'),
-      ).toBe('0.78')
-      expect(first.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
-        'available',
-      )
-
-      const second = await sendViaRelay({
-        config: relayConfig,
-        input: `${upstream.url}?beta=true`,
-        init: { method: 'POST' },
-        headers: requestHeaders(),
-        body: secondBody,
-        fallback: async () => new Response('direct'),
-      })
-      expect(await second.text()).toBe('upstream-ok')
-      expect(upstream.bodies).toEqual([firstBody, secondBody])
-    } finally {
-      await mf.dispose()
+    const firstBody = `client prefix cch=aaaaa; ${'x'.repeat(2048)} tail`
+    const secondBody = `client prefix cch=bbbbb; ${'x'.repeat(2048)} tail!`
+    const relayUrl = (await mf.ready).toString()
+    const relayConfig = {
+      enabled: true,
+      url: relayUrl,
+      token: RELAY_TOKEN,
+      fallbackToDirect: false,
+      transport: 'websocket' as const,
     }
+    const requestHeaders = () =>
+      new Headers({
+        'x-session-affinity': affinity,
+        authorization: 'Bearer test-token',
+      })
+
+    const first = await sendViaRelay({
+      config: relayConfig,
+      input: `${upstream.url}?beta=true`,
+      init: { method: 'POST' },
+      headers: requestHeaders(),
+      body: firstBody,
+      fallback: async () => new Response('direct'),
+    })
+    expect(await first.text()).toBe('upstream-ok')
+    expect(
+      first.headers.get('anthropic-ratelimit-unified-5h-utilization'),
+    ).toBe('0.78')
+    expect(first.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
+      'available',
+    )
+
+    const second = await sendViaRelay({
+      config: relayConfig,
+      input: `${upstream.url}?beta=true`,
+      init: { method: 'POST' },
+      headers: requestHeaders(),
+      body: secondBody,
+      fallback: async () => new Response('direct'),
+    })
+    expect(await second.text()).toBe('upstream-ok')
+    expect(upstream.bodies).toEqual([firstBody, secondBody])
   }, 30_000)
 
   test('websocket full_sync and patch reconstruct byte-exact upstream bodies', async () => {
-    const upstream = createUpstream()
-    const mf = await startWorker(upstream)
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-byte-exact-session',
@@ -297,13 +304,10 @@ describe('relay Worker under Miniflare', () => {
       expect(upstream.bodies).toEqual([firstBody, secondBody])
     } finally {
       workerSocket.socket.close()
-      await mf.dispose()
     }
   }, 30_000)
 
   test('websocket hash mismatch returns 409 before upstream fetch', async () => {
-    const upstream = createUpstream()
-    const mf = await startWorker(upstream)
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-hash-mismatch-session',
@@ -352,7 +356,6 @@ describe('relay Worker under Miniflare', () => {
       expect(upstream.bodies).toEqual([firstBody])
     } finally {
       workerSocket.socket.close()
-      await mf.dispose()
     }
   }, 30_000)
 })

@@ -116,7 +116,6 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
-  primeQuotaSnapshotCheckedAt,
   type QuotaAccountSummary,
   type QuotaEntry,
   QuotaManager,
