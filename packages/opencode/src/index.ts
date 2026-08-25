@@ -236,6 +236,9 @@ const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
+// OpenCode creates one plugin instance per project, but those instances share
+// the same host OAuth credential and account sidecar within a server process.
+const mainAccessRefreshesByStoragePath = new Map<string, Promise<string>>()
 
 function hasEnabledOAuthAccount(
   storage: AccountStorage | null,
@@ -3462,11 +3465,29 @@ const anthropicAuthPlugin = async (
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type === 'oauth') {
-          // Shared inflight refresh promise — prevents concurrent token refreshes
-          // from racing against each other (and causing 401 cascades with token rotation)
-          let refreshPromise: Promise<string> | null = null
+          async function refreshMainAccessToken(rejectedAccess?: string) {
+            if (rejectedAccess) {
+              const currentAuth = await getAuth()
+              if (
+                currentAuth.type === 'oauth' &&
+                currentAuth.access &&
+                currentAuth.access !== rejectedAccess &&
+                (!currentAuth.expires || currentAuth.expires > Date.now())
+              ) {
+                log(
+                  '[refresh] opencode main oauth reused concurrently rotated access token',
+                  {
+                    expiresInMs: currentAuth.expires
+                      ? currentAuth.expires - Date.now()
+                      : undefined,
+                  },
+                )
+                return currentAuth.access
+              }
+            }
 
-          async function refreshMainAccessToken() {
+            let refreshPromise =
+              mainAccessRefreshesByStoragePath.get(accountStoragePath)
             if (!refreshPromise) {
               refreshPromise = (async () => {
                 const maxRetries = 2
@@ -3793,12 +3814,22 @@ const anthropicAuthPlugin = async (
                 // Unreachable — each iteration either returns or throws.
                 // Kept as a TypeScript exhaustiveness guard.
                 throw new Error('Token refresh exhausted all retries')
-              })().finally(() => {
-                refreshPromise = null
-              })
+              })()
+              mainAccessRefreshesByStoragePath.set(
+                accountStoragePath,
+                refreshPromise,
+              )
             }
-
-            return refreshPromise
+            try {
+              return await refreshPromise
+            } finally {
+              if (
+                mainAccessRefreshesByStoragePath.get(accountStoragePath) ===
+                refreshPromise
+              ) {
+                mainAccessRefreshesByStoragePath.delete(accountStoragePath)
+              }
+            }
           }
 
           latestRefreshMainAccessToken = refreshMainAccessToken
@@ -5455,7 +5486,9 @@ const anthropicAuthPlugin = async (
                       const authRouteId = route.id
                       try {
                         if (authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID) {
-                          auth.access = await refreshMainAccessToken()
+                          auth.access = await refreshMainAccessToken(
+                            route.access,
+                          )
                           route = { ...route, access: auth.access }
                         } else if (route.account && stickyRoutes.storage) {
                           const refreshed =

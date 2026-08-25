@@ -5792,6 +5792,166 @@ describe('auth.loader', () => {
     expect(tokenRefreshCount).toBe(1)
   })
 
+  test('plugin instances sharing main auth join a refresh while auth persistence is delayed', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+    )
+    let tokenRefreshCount = 0
+    let releaseAuthSet!: () => void
+    const authSetBlocked = new Promise<void>((resolve) => {
+      releaseAuthSet = resolve
+    })
+    let authSetStarted!: () => void
+    const authSetStartedPromise = new Promise<void>((resolve) => {
+      authSetStarted = resolve
+    })
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCount += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const firstClient = createMockClient()
+    firstClient.auth.set = mock(async () => {
+      authSetStarted()
+      await authSetBlocked
+    })
+    const secondRefreshWait = mock(() => {
+      throw new Error('second plugin entered the cross-process refresh wait')
+    }) as unknown as typeof setTimeout
+    const firstPlugin = await getPlugin(firstClient, '/project-a')
+    const secondPlugin = await getPlugin(createMockClient(), '/project-b', {
+      setTimeout: secondRefreshWait,
+    })
+    const expiredAuth = () =>
+      Promise.resolve({
+        type: 'oauth' as const,
+        access: 'expired-token',
+        refresh: 'old-refresh',
+        expires: Date.now() - 1_000,
+      })
+    const firstResult = await firstPlugin.auth.loader(expiredAuth, {
+      models: {},
+    })
+    const secondResult = await secondPlugin.auth.loader(expiredAuth, {
+      models: {},
+    })
+
+    const firstFetch = firstResult.fetch(MESSAGES_URL, EMPTY_POST)
+    await authSetStartedPromise
+    const secondFetch = secondResult.fetch(MESSAGES_URL, EMPTY_POST)
+    await Bun.sleep(0)
+    releaseAuthSet()
+
+    const responses = await Promise.all([firstFetch, secondFetch])
+    expect(responses.map((response) => response.status)).toEqual([200, 200])
+    expect(tokenRefreshCount).toBe(1)
+    expect(secondRefreshWait).not.toHaveBeenCalled()
+  })
+
+  test('sticky 401 retries with a concurrently rotated main access token', async () => {
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt,
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt,
+            },
+          },
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('old-access'),
+        },
+      }),
+    )
+    let currentAuth = {
+      type: 'oauth' as const,
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: checkedAt + 8 * 60 * 60_000,
+    }
+    let tokenRefreshCount = 0
+    const messageAuthorizations: string[] = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCount += 1
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'invalid_grant' }), {
+            status: 400,
+          }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        messageAuthorizations.push(authorization)
+        if (authorization === 'Bearer old-access') {
+          currentAuth = {
+            type: 'oauth',
+            access: 'new-access',
+            refresh: 'new-refresh',
+            expires: checkedAt + 8 * 60 * 60_000,
+          }
+          return Promise.resolve(new Response('unauthorized', { status: 401 }))
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(currentAuth),
+      {
+        models: {},
+      },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses-refresh-race' },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(messageAuthorizations).toEqual([
+      'Bearer old-access',
+      'Bearer new-access',
+    ])
+    expect(tokenRefreshCount).toBe(0)
+  })
+
   test('concurrent refresh with token rotation should not cause cascading failures', async () => {
     const usedRefreshTokens = new Set<string>()
 
