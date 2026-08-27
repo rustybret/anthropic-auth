@@ -512,3 +512,57 @@ describe('Pi API fallback routing helpers', () => {
     expect(cancelled).toBe(false)
   })
 })
+
+describe('Pi Anthropic stream content blocks', () => {
+  test('preserves redacted thinking for same-model replay', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-redacted-thinking-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      return Promise.resolve(
+        new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-redacted-data"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const events: any[] = []
+    const providerStream = streamCortexKitAnthropic(
+      anthropicModel,
+      anthropicContext,
+      {
+        apiKey: 'main-access',
+        sessionId: 'ses_pi_redacted_thinking',
+      },
+    )
+    for await (const event of providerStream) events.push(event)
+
+    expect(events.map((event) => event.type)).toContain('thinking_start')
+    expect(events.map((event) => event.type)).toContain('thinking_end')
+    const done = events.find((event) => event.type === 'done')
+    expect(done?.message.content).toEqual([
+      {
+        type: 'thinking',
+        thinking: '[Reasoning redacted]',
+        thinkingSignature: 'opaque-redacted-data',
+        redacted: true,
+      },
+    ])
+  })
+})

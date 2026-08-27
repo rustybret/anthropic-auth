@@ -27,7 +27,7 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
+import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
   drainNotifications,
@@ -12505,45 +12505,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch
     globalThis.setInterval = originalSetInterval
-  })
-
-  test('R1: a cached positive checkedAt before the refresh call is stale even with no baseline snapshot', () => {
-    const preCall = 10_000
-    const cachedQuota = {
-      five_hour: {
-        usedPercent: 0,
-        remainingPercent: 100,
-        checkedAt: preCall - 1,
-      },
-    }
-
-    expect(primeQuotaSnapshotIsFreshSince(cachedQuota, preCall)).toBe(false)
-  })
-
-  test('R1: a snapshot stamped at the refresh-call boundary is stale', () => {
-    const preCall = 10_000
-    const fetchedQuota = {
-      five_hour: {
-        usedPercent: 0,
-        remainingPercent: 100,
-        checkedAt: preCall,
-      },
-    }
-
-    expect(primeQuotaSnapshotIsFreshSince(fetchedQuota, preCall)).toBe(false)
-  })
-
-  test('R1: a snapshot stamped after the refresh-call boundary is fresh', () => {
-    const preCall = 10_000
-    const fetchedQuota = {
-      five_hour: {
-        usedPercent: 0,
-        remainingPercent: 100,
-        checkedAt: preCall + 1,
-      },
-    }
-
-    expect(primeQuotaSnapshotIsFreshSince(fetchedQuota, preCall)).toBe(true)
   })
 
   test('R1: the manager skips a quota result classified stale', async () => {

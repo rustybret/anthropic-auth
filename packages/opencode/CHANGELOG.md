@@ -2,6 +2,13 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## Unreleased
+
+### Patch Changes
+
+- Keep the plugin entrypoint limited to the plugin factory so OpenCode cannot invoke internal request-policy helpers as plugins.
+- Update OpenTUI Core and Solid together to 0.5.7.
+
 ## 1.20.0
 
 ### Minor Changes

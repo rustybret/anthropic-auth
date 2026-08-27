@@ -22,7 +22,7 @@ import {
 import {
   formatKillswitchBlockMessage,
   resolveScopedDrivenBlock,
-} from '../index.ts'
+} from '../request-policy.ts'
 
 let tempDir: string
 let accountPath: string

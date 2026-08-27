@@ -1068,6 +1068,19 @@ export function streamCortexKitAnthropic(
               contentIndex: output.content.length - 1,
               partial: output,
             })
+          } else if (block?.type === 'redacted_thinking') {
+            output.content.push({
+              type: 'thinking',
+              thinking: '[Reasoning redacted]',
+              thinkingSignature: String(block.data ?? ''),
+              redacted: true,
+              index: event.index,
+            } as Block)
+            stream.push({
+              type: 'thinking_start',
+              contentIndex: output.content.length - 1,
+              partial: output,
+            })
           } else if (block?.type === 'tool_use') {
             output.content.push({
               type: 'toolCall',

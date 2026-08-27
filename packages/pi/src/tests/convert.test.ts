@@ -32,6 +32,7 @@ function toolResultMsg(toolCallId: string, text: string): Message {
 }
 
 const defaultCache = { enabled: false, mode: 'hybrid' as const }
+const TEST_MODEL_ID = 'claude-sonnet-4-20250514'
 
 // Mirrors the shape of Pi's real prompt: instruction paragraphs followed by the
 // documentation paragraph, which is the only part Anthropic rejects in system[].
@@ -45,14 +46,18 @@ const PI_PROMPT = [
 // system[] and the first user message, so tests that assert raw conversion output
 // pass no prompt and observe messages unchanged. The split itself is covered by
 // the "Claude Code system[] shape" block below.
-async function buildMessages(messages: Message[], systemPrompt?: string) {
+async function buildMessages(
+  messages: Message[],
+  systemPrompt?: string,
+  modelId = TEST_MODEL_ID,
+) {
   const context = {
     messages,
     systemPrompt,
     tools: [],
   }
   const { body } = await buildAnthropicRequest(
-    'claude-sonnet-4-20250514',
+    modelId,
     context as any,
     undefined,
     defaultCache,
@@ -643,11 +648,25 @@ function thinkingToolMsg(
   thinking: string,
   signature: string,
   toolId: string,
+  options: {
+    provider?: string
+    api?: string
+    model?: string
+    redacted?: boolean
+  } = {},
 ): Message {
   return {
     role: 'assistant',
+    provider: options.provider ?? 'anthropic',
+    api: options.api ?? 'cortexkit-anthropic-messages',
+    model: options.model ?? TEST_MODEL_ID,
     content: [
-      { type: 'thinking', thinking, thinkingSignature: signature },
+      {
+        type: 'thinking',
+        thinking,
+        thinkingSignature: signature,
+        redacted: options.redacted,
+      },
       { type: 'toolCall', id: toolId, name: 'Bash', arguments: {} },
     ],
     timestamp: 0,
@@ -687,6 +706,7 @@ describe('convertMessages — signed thinking blocks', () => {
           summary: [{ type: 'summary_text', text: 'gpt reasoning summary' }],
         }),
         'tool_1',
+        { provider: 'openai-codex', model: 'gpt-5.6-sol' },
       ),
       toolResultMsg('tool_1', 'out1'),
     ])
@@ -700,6 +720,137 @@ describe('convertMessages — signed thinking blocks', () => {
     })
     expect(JSON.stringify(messages)).not.toContain('gAAAAABqKqht')
     expect(JSON.stringify(messages)).not.toContain('gpt reasoning summary')
+  })
+
+  test('drops another provider signature but preserves its visible reasoning as text', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('deepseek reasoning', 'reasoning_content', 'tool_1', {
+        provider: 'opencode-go',
+        model: 'deepseek-v4-flash',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block).toEqual([
+      { type: 'text', text: 'deepseek reasoning' },
+      {
+        type: 'tool_use',
+        id: 'tool_1',
+        name: 'Bash',
+        input: {},
+      },
+    ])
+  })
+
+  test('drops a different Anthropic model signature but preserves visible reasoning', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('old model reasoning', 'sig-old', 'tool_1', {
+        model: 'claude-opus-4-8',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block).toEqual([
+      { type: 'text', text: 'old model reasoning' },
+      {
+        type: 'tool_use',
+        id: 'tool_1',
+        name: 'Bash',
+        input: {},
+      },
+    ])
+  })
+
+  test('drops a different API signature even when provider and model match', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('Bedrock reasoning', 'sig-bedrock', 'tool_1', {
+        api: 'bedrock-converse-stream',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({ type: 'text', text: 'Bedrock reasoning' })
+    expect(block[1]?.type).toBe('tool_use')
+  })
+
+  test('accepts same-model signatures from Pi native Anthropic history', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('native reasoning', 'sig-native', 'tool_1', {
+        api: 'anthropic-messages',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'thinking',
+      thinking: 'native reasoning',
+      signature: 'sig-native',
+    })
+  })
+
+  test('drops foreign redacted thinking because its payload is opaque', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg(
+        '[Reasoning redacted]',
+        'foreign-redacted-data',
+        'tool_1',
+        { model: 'claude-opus-4-8', redacted: true },
+      ),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block).toEqual([
+      {
+        type: 'tool_use',
+        id: 'tool_1',
+        name: 'Bash',
+        input: {},
+      },
+    ])
+  })
+
+  test('round-trips same-model redacted thinking as an opaque redacted block', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg(
+        '[Reasoning redacted]',
+        'encrypted-redacted-data',
+        'tool_1',
+        { redacted: true },
+      ),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'redacted_thinking',
+      data: 'encrypted-redacted-data',
+    })
+  })
+
+  test('preserves same-model omitted thinking when only its signature is visible', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('', 'sig-omitted', 'tool_1'),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'thinking',
+      thinking: '',
+      signature: 'sig-omitted',
+    })
   })
 
   test('downgrades a signed thinking block with a lone surrogate to sanitized text', async () => {

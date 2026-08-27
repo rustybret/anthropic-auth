@@ -2,6 +2,14 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Patch Changes
+
+- Prevent Pi from replaying foreign thinking signatures to Anthropic while preserving visible reasoning as text, and round-trip Anthropic `redacted_thinking` blocks for valid same-model continuation.
+- Keep the OpenCode plugin entrypoint limited to the plugin factory so the host cannot invoke internal request-policy helpers as plugins.
+- Update OpenTUI Core and Solid together to 0.5.7 and `@tsconfig/bun` to 1.0.11.
+
 ## 1.20.0
 
 ### Minor Changes

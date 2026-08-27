@@ -31,6 +31,10 @@ import type {
 // that Anthropic currently rejects in system[]. Unknown prompt shapes take the
 // service-preserving fallback below instead of returning the full prompt there.
 const PI_DOCS_ANCHOR = 'Pi documentation'
+const ANTHROPIC_REPLAY_APIS = new Set([
+  'anthropic-messages',
+  'cortexkit-anthropic-messages',
+])
 
 const CLAUDE_CODE_TOOLS = new Map(
   [
@@ -171,6 +175,7 @@ function convertTextAndImages(
 
 function convertMessages(
   messages: Message[],
+  targetModelId: string,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
 
@@ -210,33 +215,69 @@ function convertMessages(
       for (const block of message.content) {
         if (block.type === 'text' && block.text.trim()) {
           blocks.push({ type: 'text', text: sanitize(block.text) })
-        } else if (block.type === 'thinking' && block.thinking.trim()) {
+        } else if (block.type === 'thinking') {
           const thinking = block as ThinkingContent
-          if (isOpenAIReasoningSignature(thinking.thinkingSignature)) {
-            // OpenAI reasoningEncryptedContent is also opaque encrypted state,
-            // but it is not an Anthropic thinking signature. Sending it as
-            // `thinking.signature` makes Anthropic reject the request.
+          const signature = thinking.thinkingSignature
+          const hasSignature =
+            typeof signature === 'string' && signature.trim().length > 0
+          const signatureBelongsToTarget =
+            message.provider === 'anthropic' &&
+            ANTHROPIC_REPLAY_APIS.has(message.api) &&
+            message.model === targetModelId &&
+            !isOpenAIReasoningSignature(signature)
+
+          // Match Pi's built-in origin check: only replay signatures from the
+          // same Anthropic API/model. Preserve visible foreign reasoning as
+          // ordinary text, but drop opaque redacted/OpenAI encrypted state.
+          if (hasSignature && !signatureBelongsToTarget) {
+            if (
+              !thinking.redacted &&
+              !isOpenAIReasoningSignature(signature) &&
+              thinking.thinking.trim()
+            ) {
+              blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
+            }
             continue
           }
-          if (
-            thinking.thinkingSignature &&
-            !hasLoneSurrogate(thinking.thinking)
-          ) {
-            // Signed thinking blocks must be sent back verbatim — the signature
-            // is computed over the original text. Sanitizing would alter it and
-            // Anthropic rejects the block as "modified". Anthropic-origin
-            // thinking is valid UTF-8, so this is the normal path.
+
+          if (thinking.redacted) {
+            if (hasSignature) {
+              blocks.push({
+                type: 'redacted_thinking',
+                data: signature,
+              })
+            }
+            continue
+          }
+
+          if (!hasSignature) {
+            // Anthropic rejects unsigned thinking blocks. Preserve readable
+            // output from interrupted streams as ordinary assistant text.
+            if (thinking.thinking.trim()) {
+              blocks.push({
+                type: 'text',
+                text: sanitize(thinking.thinking),
+              })
+            }
+            continue
+          }
+
+          if (hasLoneSurrogate(thinking.thinking)) {
+            // Signature authenticates the thinking bytes exactly. Sanitizing the
+            // text would invalidate it, so downgrade malformed signed thinking
+            // to plain text and omit the signature instead.
+            if (thinking.thinking.trim()) {
+              blocks.push({
+                type: 'text',
+                text: sanitize(thinking.thinking),
+              })
+            }
+          } else {
             blocks.push({
               type: 'thinking',
               thinking: thinking.thinking,
-              signature: thinking.thinkingSignature,
+              signature,
             })
-          } else {
-            // Either unsigned, or signed-but-contains a lone surrogate. In the
-            // latter case we cannot keep the signature: sanitizing breaks it and
-            // sending the raw lone surrogate is an invalid-UTF8 400. Drop the
-            // signature and downgrade to sanitized text.
-            blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
           }
         } else if (block.type === 'toolCall') {
           blocks.push({
@@ -421,7 +462,7 @@ export async function buildAnthropicRequest(
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
-  const messages = convertMessages(context.messages)
+  const messages = convertMessages(context.messages, modelId)
   // Strip trailing assistant messages — Anthropic rejects prefill on some models
   while (
     messages.length &&

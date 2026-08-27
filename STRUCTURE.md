@@ -42,7 +42,7 @@ anthropic-auth/
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, cache diagnostics, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `cache-diagnostics.ts` (cache diagnosis beta opt-in, message ID tracking, and schema v:2 record formatting), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `prime-manager-registry.ts` (process-wide PrimeManager registry keyed by account-storage identity), `lane-start.ts` (synthetic prompt injection and request correlation), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing, prime status, and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Key files: `index.ts` (single exported plugin factory — auth loader, command registration, background services), `request-policy.ts` (internal killswitch request classification and messaging), `transform.ts` (request body rewriting + SSE stream stripping), `cache-diagnostics.ts` (cache diagnosis beta opt-in, message ID tracking, and schema v:2 record formatting), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `prime-manager-registry.ts` (process-wide PrimeManager registry keyed by account-storage identity), `lane-start.ts` (synthetic prompt injection and request correlation), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing, prime status, and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -56,7 +56,7 @@ anthropic-auth/
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, origin-aware thinking-signature filtering, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers
@@ -117,13 +117,15 @@ anthropic-auth/
 - `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
 - `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state, source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
 - `packages/opencode/src/prime-manager-registry.ts`: Process-wide registry that shares PrimeManager instances by account-storage identity and releases managers when project slots move
+- `packages/opencode/src/request-policy.ts`: Internal killswitch block classification and user-facing request-policy messages kept outside the plugin entrypoint so OpenCode invokes only `AnthropicAuthPlugin`
 - `packages/opencode/src/lane-start.ts`: Resolves the current prompt context, injects the exact synthetic lane-start marker, and correlates its message ID to one request through a bounded session-scoped tracker
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing, prime status, and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
-- `packages/pi/src/stream.ts`: Pi provider streaming implementation
+- `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including same-origin thinking-signature replay and `redacted_thinking` mapping
+- `packages/pi/src/stream.ts`: Pi provider streaming implementation, including preservation of Anthropic redacted-thinking blocks for later replay
 
 **Tests:**
 - `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces)

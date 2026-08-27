@@ -60,14 +60,12 @@ import {
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getKillswitchConfig,
-  getKillswitchThresholdsForAccount,
   getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
   getRelayConfig,
   getRoutingMode,
-  getScopedQuotaWindowForModel,
   getStickyRoutingStatePath,
   hashRefreshToken,
   incrementPrimeUsagePersistent,
@@ -119,7 +117,6 @@ import {
   type QuotaAccountSummary,
   type QuotaEntry,
   QuotaManager,
-  quotaSnapshotCheckedAt,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -184,6 +181,10 @@ import {
 } from './lane-start.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
+import {
+  formatKillswitchBlockMessage,
+  resolveScopedDrivenBlock,
+} from './request-policy.ts'
 import {
   drainNotifications,
   isTuiConnected,
@@ -345,70 +346,6 @@ async function resolveInitialSidebarRouting(
     ...resolveLoadedSidebarRouting(existing, freshStorage),
     freshStorage,
   }
-}
-
-/**
- * Format the user-facing 429 message for a killswitch block. When the block
- * is scoped-driven (the request's model matches a scoped window that is at
- * or below the killswitch threshold), the message names the model so the
- * operator can distinguish a per-model weekly block from a whole-account
- * kill. Otherwise the generic account-level message is used.
- */
-export function formatKillswitchBlockMessage(input: {
-  retryAfterSeconds: number
-  modelName?: string
-}): string {
-  const minutes = Math.floor(input.retryAfterSeconds / 60)
-  const seconds = input.retryAfterSeconds % 60
-  const retryHint = `Retry in ${minutes}m ${seconds}s.`
-  return input.modelName
-    ? `${input.modelName} weekly limit reached, no routable accounts. ${retryHint}`
-    : `Killswitch: no routable accounts. ${retryHint}`
-}
-
-/**
- * Decide whether a killswitch block is scoped-driven (a per-model weekly
- * block) versus a whole-account 5h/7d-driven block. A block is scoped-driven
- * only when the request's model matches a scoped window AND that window is
- * actually at or below the per-account scoped threshold. A Fable request
- * with a healthy Fable window is therefore correctly classified as
- * account-level (the 5h/7d breach killed the account, not the Fable quota).
- *
- * Priority: account-level 5h/7d always wins. `killswitchPassesPolicy` called
- * WITHOUT a modelId evaluates only 5h/7d; if it returns false, 5h/7d drove
- * the block, so this is account-level regardless of the scoped window's
- * state. Only when 5h/7d pass AND the matched scoped window is at/below the
- * scoped threshold do we call it scoped-driven.
- */
-export function resolveScopedDrivenBlock(input: {
-  mainQuota: OAuthQuotaSnapshot | undefined
-  requestModelId: string | undefined
-  storage: AccountStorage | null
-}):
-  | { isScopedDriven: true; modelName: string; modelId: string }
-  | { isScopedDriven: false } {
-  if (!input.requestModelId) return { isScopedDriven: false }
-  if (!killswitchPassesPolicy(input.mainQuota, input.storage)) {
-    // 5h/7d already killed the account — account-level, not scoped-driven.
-    return { isScopedDriven: false }
-  }
-  const matchedWindow = getScopedQuotaWindowForModel(
-    input.mainQuota,
-    input.requestModelId,
-  )
-  if (!matchedWindow) return { isScopedDriven: false }
-  if (!Number.isFinite(matchedWindow.remainingPercent)) {
-    return { isScopedDriven: false }
-  }
-  const thresholds = getKillswitchThresholdsForAccount(input.storage)
-  if (matchedWindow.remainingPercent <= thresholds.scoped) {
-    return {
-      isScopedDriven: true,
-      modelName: matchedWindow.modelName,
-      modelId: input.requestModelId,
-    }
-  }
-  return { isScopedDriven: false }
 }
 
 type NotificationRequest = {
@@ -825,13 +762,6 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
       { ...model, cost: ZERO_MODEL_COST },
     ]),
   ) as T
-}
-
-export function primeQuotaSnapshotIsFreshSince(
-  quota: OAuthQuotaSnapshot | undefined,
-  refreshStartedAt: number,
-): boolean {
-  return quotaSnapshotCheckedAt(quota) > refreshStartedAt
 }
 
 type PluginRuntimeTimerOverrides = Partial<{

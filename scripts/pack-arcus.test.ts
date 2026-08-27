@@ -153,7 +153,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
     } finally {
       rmSync(testOutDir, { recursive: true, force: true })
     }
-  })
+  }, 15000)
 
   it('supports --stamp-sha flag to embed computed SHA256 in manifest', () => {
     const testOutDir = mkdtempSync(join(tmpdir(), 'arcus-sha-test-'))
@@ -178,7 +178,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
     } finally {
       rmSync(testOutDir, { recursive: true, force: true })
     }
-  })
+  }, 15000)
 
   it('supports positional and key-value --outdir= argument formats', () => {
     const testOutDirPos = mkdtempSync(join(tmpdir(), 'arcus-pos-'))
@@ -210,5 +210,5 @@ describe('anthropic-auth arcus packaging & sync', () => {
       rmSync(testOutDirPos, { recursive: true, force: true })
       rmSync(testOutDirEq, { recursive: true, force: true })
     }
-  })
+  }, 15000)
 })

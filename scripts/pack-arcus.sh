@@ -72,7 +72,7 @@ fi
 
 echo "-> Packaging @cortexkit/opencode-anthropic-auth..."
 cd "$PLUGIN_DIR"
-TARBALL=$(npm pack --pack-destination="$OUTDIR" 2>/dev/null | tail -n 1)
+TARBALL=$(npm pack --ignore-scripts --pack-destination="$OUTDIR" 2>/dev/null | tail -n 1)
 cd "$REPO_ROOT"
 
 TARBALL_PATH="$OUTDIR/$TARBALL"

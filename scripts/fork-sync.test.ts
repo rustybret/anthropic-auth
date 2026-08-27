@@ -42,8 +42,8 @@ function makeFixture(exclusions = defaultExclusions) {
   const fork = join(root, 'fork')
   const upstreamWork = join(root, 'upstream-work')
 
-  git(root, ['init', '--bare', upstreamBare])
-  git(root, ['init', '--bare', originBare])
+  git(root, ['init', '--bare', '-b', 'main', upstreamBare])
+  git(root, ['init', '--bare', '-b', 'main', originBare])
   mkdirSync(seed, { recursive: true })
   git(seed, ['init', '-b', 'main'])
   configure(seed)
