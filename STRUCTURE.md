@@ -130,7 +130,7 @@ anthropic-auth/
 **Tests:**
 - `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces)
 - `packages/opencode/src/tests/`: One test file per module (30+ test files covering core + opencode)
-- `packages/pi/src/tests/`: Pi-specific tests (convert, stream, index)
+- `packages/pi/src/tests/`: Pi-specific tests (commands, convert, index, stream)
 - `packages/e2e-tests/tests/`: Integration tests
 
 ## Naming Conventions

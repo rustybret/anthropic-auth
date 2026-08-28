@@ -12,6 +12,7 @@ import {
   getCache1hPersistentMode,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
+  getOrCreateMainAccountId,
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
@@ -30,9 +31,12 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   QuotaManager,
+  type QuotaState,
+  quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  refreshBackoffActive,
   resolveClaudeCodeIdentity,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
@@ -71,6 +75,10 @@ let cacheKeepRegistryDirectory: string | undefined
 const stickyRouters = new Map<string, StickySessionRouter>()
 const quotaManagers = new Map<string, QuotaManager>()
 const fallbackManagers = new Map<string, FallbackAccountManager>()
+const mainAccountIdInitializations = new Map<
+  string,
+  Promise<string | undefined>
+>()
 const PI_SERVICE_CACHE_LIMIT = 16
 
 function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
@@ -81,6 +89,20 @@ function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
     if (oldest === undefined) break
     map.delete(oldest)
   }
+}
+
+function ensurePiMainAccountId(storagePath: string) {
+  let initialization = mainAccountIdInitializations.get(storagePath)
+  if (!initialization) {
+    initialization = getOrCreateMainAccountId(storagePath).catch((error) => {
+      if (mainAccountIdInitializations.get(storagePath) === initialization) {
+        mainAccountIdInitializations.delete(storagePath)
+      }
+      throw error
+    })
+    setBoundedService(mainAccountIdInitializations, storagePath, initialization)
+  }
+  return initialization
 }
 
 function getPiRoutingServices(
@@ -144,9 +166,13 @@ const cacheKeepManager = new CacheKeepManager({
     if (!accessToken) return headers
     try {
       const body = JSON.parse(target.bodyText) as Record<string, unknown>
+      const storagePath = getPiAccountStoragePath()
+      await ensurePiMainAccountId(storagePath)
+      const storage = await loadAccounts(storagePath)
       const identity = await resolveClaudeCodeIdentity(
         accessToken,
         typeof body.model === 'string' ? body.model : undefined,
+        target.oauthAccountId ?? storage?.mainAccountId,
       )
       headers.delete('anthropic-beta')
       applyClaudeCodeHeaders(headers, accessToken, { body, identity })
@@ -322,10 +348,19 @@ async function sendAnthropicRequest(options: {
   oauthAccountId?: string
   route?: string
 }): Promise<Response> {
+  await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
   setDumpEnabled(isDumpPersistentlyEnabled(storage))
+  const accountIdentity =
+    options.oauthAccountId === STICKY_ROUTING_MAIN_ACCOUNT_ID
+      ? storage?.mainAccountId
+      : options.oauthAccountId
   const identity = options.accessToken
-    ? await resolveClaudeCodeIdentity(options.accessToken, options.model.id)
+    ? await resolveClaudeCodeIdentity(
+        options.accessToken,
+        options.model.id,
+        accountIdentity,
+      )
     : undefined
   const { body, bodyText } = await buildAnthropicRequest(
     options.model.id,
@@ -461,12 +496,14 @@ async function executeWithFallback(options: {
   primaryAccessToken: string
   storagePath: string
 }): Promise<Response> {
+  await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
   const { quotaManager, fallbackManager: manager } = getPiRoutingServices(
     options.storagePath,
     storage,
   )
-  quotaManager.seedMainFromStorage(storage, options.primaryAccessToken)
+  const mainAccountId = storage?.mainAccountId
+  quotaManager.seedMainFromStorage(storage, mainAccountId)
   quotaManager.seedFallbacksFromAccounts(
     (storage?.accounts ?? []).filter(isOAuthAccount),
   )
@@ -480,7 +517,7 @@ async function executeWithFallback(options: {
   }
 
   async function buildStickyRoutes(modelId: string) {
-    const mainEntry = quotaManager.getMain(options.primaryAccessToken)
+    const mainEntry = quotaManager.getMain(mainAccountId)
     let mainQuota = mainEntry?.quota
     if (
       !stickyQuotaSnapshotIsFresh(
@@ -491,7 +528,10 @@ async function executeWithFallback(options: {
       )
     ) {
       try {
-        mainQuota = await quotaManager.refreshMain(options.primaryAccessToken)
+        mainQuota = await quotaManager.refreshMain(
+          mainAccountId,
+          options.primaryAccessToken,
+        )
       } catch {}
     }
     const usableFallbacks = await manager.getUsableFallbackAccounts(storage, {
@@ -515,8 +555,7 @@ async function executeWithFallback(options: {
       if (!account.access || isPermanentRefreshError(account.lastRefreshError))
         continue
       let accountQuota =
-        quotaManager.getFallback(account.id, account.access)?.quota ??
-        account.quota
+        quotaManager.getFallback(account.id, account)?.quota ?? account.quota
       if (
         !stickyQuotaSnapshotIsFresh(accountQuota, storage, Date.now(), modelId)
       ) {
@@ -524,6 +563,7 @@ async function executeWithFallback(options: {
           accountQuota = await quotaManager.refreshFallback(
             account.id,
             account.access,
+            account,
           )
         } catch {}
       }
@@ -570,20 +610,34 @@ async function executeWithFallback(options: {
     )
     const usableIds = new Set(usableFallbacks.map((account) => account.id))
     const candidates: StickyRouteCandidate[] = allRoutes.flatMap((route) => {
-      if (!route.quota) return []
+      const quota = quotaSnapshotHasStandardWindows(route.quota)
+        ? route.quota
+        : undefined
       const accountId =
         route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ? undefined : route.id
+      const quotaState: QuotaState = quota
+        ? { kind: 'known', quota }
+        : { kind: 'unknown' }
+      const passesKillswitch =
+        !isKillswitchEnabled(storage) ||
+        killswitchPassesPolicy(
+          quotaState.kind === 'known' ? quotaState.quota : undefined,
+          storage,
+          accountId,
+          modelId,
+        )
       const passes =
-        quotaSnapshotPassesPolicy(route.quota, storage) &&
-        quotaSnapshotPassesModelScope(route.quota, modelId) &&
-        (!isKillswitchEnabled(storage) ||
-          killswitchPassesPolicy(route.quota, storage, accountId, modelId)) &&
-        (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID || usableIds.has(route.id))
+        passesKillswitch &&
+        (quotaState.kind === 'unknown' ||
+          (quotaSnapshotPassesPolicy(quotaState.quota, storage) &&
+            quotaSnapshotPassesModelScope(quotaState.quota, modelId) &&
+            (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+              usableIds.has(route.id))))
       return passes
         ? [
             {
               accountId: route.id,
-              quota: route.quota,
+              quota: quotaState,
               order: route.order,
             },
           ]
@@ -594,8 +648,11 @@ async function executeWithFallback(options: {
 
   async function primaryQuotaRefreshConfirmsExhausted() {
     try {
-      const quota = await quotaManager.refreshMain(options.primaryAccessToken)
-      const entry = quotaManager.getMain(options.primaryAccessToken)
+      const quota = await quotaManager.refreshMain(
+        mainAccountId,
+        options.primaryAccessToken,
+      )
+      const entry = quotaManager.getMain(mainAccountId)
       return Boolean(
         entry &&
           entry.refreshAfter > Date.now() &&
@@ -608,8 +665,11 @@ async function executeWithFallback(options: {
 
   async function primaryQuotaRefreshConfirmsModelScopeExhausted() {
     try {
-      const quota = await quotaManager.refreshMain(options.primaryAccessToken)
-      const entry = quotaManager.getMain(options.primaryAccessToken)
+      const quota = await quotaManager.refreshMain(
+        mainAccountId,
+        options.primaryAccessToken,
+      )
+      const entry = quotaManager.getMain(mainAccountId)
       return Boolean(
         entry &&
           entry.refreshAfter > Date.now() &&
@@ -621,7 +681,7 @@ async function executeWithFallback(options: {
   }
 
   function primaryCachedModelScopeExhausted() {
-    const entry = quotaManager.getMain(options.primaryAccessToken)
+    const entry = quotaManager.getMain(mainAccountId)
     return Boolean(
       entry &&
         quotaSnapshotModelScopeIsExhausted(entry.quota, options.model.id),
@@ -629,7 +689,7 @@ async function executeWithFallback(options: {
   }
 
   function primaryFreshModelScopeExhausted() {
-    const entry = quotaManager.getMain(options.primaryAccessToken)
+    const entry = quotaManager.getMain(mainAccountId)
     return Boolean(
       entry &&
         !quotaManager.isMainStale(options.model.id) &&
@@ -648,16 +708,59 @@ async function executeWithFallback(options: {
     )
     for (const configured of storage?.accounts ?? []) {
       let response: Response | null = null
-      const account = isOAuthAccount(configured)
+      let account: OAuthAccount | ApiKeyAccount | undefined = isOAuthAccount(
+        configured,
+      )
         ? usableOAuthById.get(configured.id)
         : configured
-      if (!account) continue
+      if (!account) {
+        if (
+          !isOAuthAccount(configured) ||
+          !configured.access ||
+          (configured.expires !== undefined &&
+            configured.expires <= Date.now()) ||
+          isPermanentRefreshError(configured.lastRefreshError) ||
+          refreshBackoffActive(
+            configured.lastRefreshError,
+            configured.id,
+            Date.now(),
+          )
+        )
+          continue
+        account = configured
+        const quota =
+          quotaManager.getFallback(configured.id, configured)?.quota ??
+          configured.quota
+        if (quotaSnapshotHasStandardWindows(quota)) continue
+        if (
+          isKillswitchEnabled(storage) &&
+          !killswitchPassesPolicy(
+            quota,
+            storage,
+            configured.id,
+            options.model.id,
+          )
+        )
+          continue
+      } else if (
+        isOAuthAccount(account) &&
+        isKillswitchEnabled(storage) &&
+        !killswitchPassesPolicy(
+          quotaManager.getFallback(account.id, account)?.quota ?? account.quota,
+          storage,
+          account.id,
+          options.model.id,
+        )
+      ) {
+        continue
+      }
 
       if (isOAuthAccount(account)) {
         if (routeOptions.apiOnly === true || !account.access) continue
         response = await sendAnthropicRequest({
           ...options,
           accessToken: account.access,
+          oauthAccountId: account.id,
         })
       } else if (
         routeOptions.includeApiRoutes === true &&
@@ -857,8 +960,12 @@ async function executeWithFallback(options: {
         try {
           quota =
             route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
-              ? await quotaManager.refreshMain(route.access)
-              : await quotaManager.refreshFallback(route.id, route.access)
+              ? await quotaManager.refreshMain(mainAccountId, route.access)
+              : await quotaManager.refreshFallback(
+                  route.id,
+                  route.access,
+                  route.account,
+                )
         } catch {
           // Retain affinity when the quota probe itself is unavailable.
           quota = undefined
@@ -976,9 +1083,46 @@ async function executeWithFallback(options: {
     if (fallback) return fallback
   }
 
+  if (isKillswitchEnabled(storage)) {
+    let mainQuota = quotaManager.getMain(mainAccountId)?.quota
+    if (!mainQuota || quotaManager.isMainStale(options.model.id)) {
+      try {
+        mainQuota = await quotaManager.refreshMain(
+          mainAccountId,
+          options.primaryAccessToken,
+        )
+      } catch {}
+    }
+    if (
+      !killswitchPassesPolicy(mainQuota, storage, undefined, options.model.id)
+    ) {
+      if (!fallbackFirst) {
+        const fallback = await tryFallbackAccounts()
+        if (fallback) return fallback
+      }
+      return new Response(
+        JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'Killswitch blocked all OAuth routes',
+          },
+        }),
+        {
+          status: 429,
+          headers: {
+            'content-type': 'application/json',
+            'retry-after': '60',
+          },
+        },
+      )
+    }
+  }
+
   const primary = await sendAnthropicRequest({
     ...options,
     accessToken: options.primaryAccessToken,
+    oauthAccountId: STICKY_ROUTING_MAIN_ACCOUNT_ID,
   })
   const primaryPreflight = await firstStreamingError(primary)
   if (primaryPreflight instanceof Response) {
