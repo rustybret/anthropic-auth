@@ -4,11 +4,19 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Minor Changes
+
+- Keep quota, profile, refresh-backoff, Prime-lineage, and routing state attached to stable Claude account identities across OAuth token rotation, while treating unknown identity or quota as distinct from an absent account.
+- Add an opt-in OpenCode host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
+
 ### Patch Changes
 
+- Coalesce main OAuth refreshes across OpenCode project plugin instances and let sticky 401 recovery adopt a concurrently rotated valid credential instead of refreshing it again.
 - Prevent Pi from replaying foreign thinking signatures to Anthropic while preserving visible reasoning as text, and round-trip Anthropic `redacted_thinking` blocks for valid same-model continuation.
 - Keep the OpenCode plugin entrypoint limited to the plugin factory so the host cannot invoke internal request-policy helpers as plugins.
 - Update OpenTUI Core and Solid together to 0.5.7 and `@tsconfig/bun` to 1.0.11.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity and the host-local quota feed.
 
 ## 1.20.0
 

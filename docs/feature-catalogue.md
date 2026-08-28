@@ -63,8 +63,10 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   rate-limit/auth failure; main-first, fallback-first, or quota-weighted sticky-balanced routing.
 - **How:** `core/accounts.ts` — two-file sidecar store (config `anthropic-auth.json` + runtime
   `anthropic-auth-state.json`), atomic temp+rename writes, cross-process file lock. `FallbackAccount`
-  Manager` orchestrates per-account background refresh + quota. `getUsableFallbackAccounts()` FILTERS
-  (never ranks) by quota policy + killswitch + `enabled`. `core/sticky-routing.ts` persists hashed
+  Manager` orchestrates per-account background refresh + quota. Main state uses a persisted slot identity plus
+  Anthropic's bootstrapped account UUID so rotating OAuth tokens do not invalidate account state.
+  `getUsableFallbackAccounts()` FILTERS (never ranks) by quota policy + killswitch + `enabled`.
+  `core/sticky-routing.ts` persists hashed
   session assignments and allocates cold sessions by reset-normalized spendable quota headroom plus
   weighted initial-prompt deficit. `shouldFallbackStatus()` = [401,403,429].
   Ingestion is **CLI-only** (`upsertAccount` called only from `cli.ts` login/api routes).
@@ -74,14 +76,18 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 
 ## D. Quota management — [G+A]
 
-- **What:** Track usage % per account across two windows; force-refresh display via `/claude-quota`.
-- **How:** `core/quota-manager.ts` `QuotaManager` — dedup, 1s serial gate, per-route 429 backoff,
-  token-fingerprint binding, staleness. ACTIVE-PULL from `api.anthropic.com/api/oauth/usage`
-  (`fetchOAuthQuotaSnapshot`, module import — NO injection point today). Windows: `five_hour`,
-  `seven_day` (`{usedPercent, resetsAt}`).
-- **Coupling:** the class machinery (dedup/backoff/fingerprint/staleness/`setMain`/`setFallback`) **[G]**;
-  the pull source + window names **[A]**. openai-auth flips this to PASSIVE-PUSH (x-codex-* headers via
-  `setMain`) — same class, pull machinery dormant. memory #398.
+- **What:** Track usage per account across five-hour, seven-day, and model-scoped windows; force-refresh
+  display via `/claude-quota`; passively harvest genuine response headers; optionally publish sanitized
+  observations for another host-local process.
+- **How:** `core/quota-manager.ts` `QuotaManager` — stable-account-identity binding, dedup, 1s serial gate,
+  per-route 429 backoff, explicit clear/replacement generations, and model-aware staleness. ACTIVE-PULL from
+  `api.anthropic.com/api/oauth/usage` (`fetchOAuthQuotaSnapshot`) merges with PASSIVE-PUSH
+  `anthropic-ratelimit-unified-*` observations from direct and relay responses without dropping poll-owned
+  scoped/binding/extra-usage fields. `core/quota-header-feed.ts` can project successful OpenCode header
+  observations into owner-only, three-minute lease files containing a fixed quota-only allowlist.
+- **Coupling:** cache/backoff/identity/staleness machinery and the sanitized lease pattern **[G]**; Anthropic's
+  pull source, header names, and window schema **[A]**. openai-auth uses the same passive-push seam for its
+  provider-specific headers. memory #398.
 
 ## E. Killswitch — [G+A]
 

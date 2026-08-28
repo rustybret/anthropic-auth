@@ -37,6 +37,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
 - **Fable/Opus 5 safety fallback (OpenCode)**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
+- **Host-local quota feed (OpenCode)**: optionally publish sanitized response-header quota observations so another local CortexKit process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
 - **Quota sidebar widget**: register the OpenCode TUI plugin in `tui.json` to render a live sidebar with per-account quota, routing, cache, and health state.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
@@ -182,6 +183,9 @@ Example:
     "failClosedOnUnknownQuota": true,
     "showToasts": false
   },
+  "quotaHeaderFeed": {
+    "enabled": false
+  },
   "killswitch": {
     "enabled": false,
     "main": { "five_hour": 5, "seven_day": 10, "scoped": 0 },
@@ -218,6 +222,8 @@ Example:
 ```
 
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. Killswitch `scoped` thresholds apply to matching model-scoped quota windows such as Fable weekly quota. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
+
+`quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. `sticky-balanced` session assignments use a separate `anthropic-auth-routing-state.json`; session IDs are SHA-256 hashed in that file. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 

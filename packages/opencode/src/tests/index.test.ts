@@ -736,6 +736,122 @@ describe('quota header feed integration', () => {
     }
   })
 
+  test('same-account token rotation preserves poll-owned quota during header harvest', async () => {
+    const originalNow = Date.now
+    const clock = 1_000_000
+    Date.now = () => clock
+    try {
+      const mainAccountId = 'rotated-token-main'
+      const pollAccessToken = 'sk-ant-oat-poll-token'
+      const rotatedAccessToken = 'sk-ant-oat-rotated-token'
+      const pollCheckedAt = 900_000
+      const scoped = [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 55,
+          remainingPercent: 45,
+          checkedAt: pollCheckedAt,
+        },
+      ]
+      const extraUsage = {
+        used: { amountMinor: 1261, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        utilizationPercent: 12.61,
+        severity: 'normal',
+        exhausted: false,
+      }
+      const initialPollQuota: OAuthQuotaSnapshot = {
+        source: 'poll',
+        accountIdentity: mainAccountId,
+        checkedAt: pollCheckedAt,
+        five_hour: {
+          usedPercent: 4,
+          remainingPercent: 96,
+          checkedAt: pollCheckedAt,
+        },
+        seven_day: {
+          usedPercent: 52,
+          remainingPercent: 48,
+          checkedAt: pollCheckedAt,
+        },
+        scoped,
+        extraUsage,
+        bindingWindow: 'claude-weekly-scoped-fable',
+        bindingWindowSource: 'poll',
+      }
+      const storage = createFallbackStorage({
+        mainAccountId,
+        accounts: [],
+        quota: {
+          ...createFallbackStorage().quota,
+          mainQuota: initialPollQuota,
+          mainQuotaCheckedAt: pollCheckedAt,
+          mainQuotaToken: tokenFingerprint(pollAccessToken),
+        },
+      })
+      await useTempAccountFile(storage)
+      await saveAccountState(
+        storage,
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+        { mainQuota: true },
+      )
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+      globalThis.fetch = mock((input: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/claude_cli/bootstrap')) {
+          return Promise.resolve(
+            Response.json({ oauth_account: { account_uuid: mainAccountId } }),
+          )
+        }
+        if (url.includes('/v1/messages')) {
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: {
+                'anthropic-ratelimit-unified-5h-utilization': '0.11',
+                'anthropic-ratelimit-unified-7d-utilization': '0.22',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(Response.json({}))
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: rotatedAccessToken,
+            refresh: 'rotated-refresh-token',
+            expires: clock + 5 * 60 * 60 * 1000,
+          }),
+        { models: {} },
+      )
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await response.text()
+
+      const persisted = await waitForAccountStorage(
+        (candidate) => candidate?.quota?.mainQuota?.checkedAt === clock,
+      )
+      expect(persisted?.quota?.mainQuota?.five_hour?.usedPercent).toBe(11)
+      expect(persisted?.quota?.mainQuota?.seven_day?.usedPercent).toBe(22)
+      expect(persisted?.quota?.mainQuota?.scoped).toEqual(scoped)
+      expect(persisted?.quota?.mainQuota?.extraUsage).toEqual(extraUsage)
+      expect(persisted?.quota?.mainQuota?.bindingWindow).toBe(
+        'claude-weekly-scoped-fable',
+      )
+      expect(persisted?.quota?.mainQuotaToken).toBe(
+        tokenFingerprint(pollAccessToken),
+      )
+    } finally {
+      Date.now = originalNow
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    }
+  })
+
   test('stale fallback headers do not persist or publish after re-login', async () => {
     const fallbackAccess = 'fallback-lineage-a-access'
     const fallbackCheckedAt = Date.now()

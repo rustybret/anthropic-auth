@@ -4,10 +4,18 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Minor Changes
+
+- Keep quota, profile, refresh-backoff, Prime-lineage, and routing state attached to stable Claude account identities across OAuth token rotation, while treating unknown identity or quota as distinct from an absent account.
+- Add an opt-in host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
+
 ### Patch Changes
 
+- Coalesce main OAuth refreshes across project plugin instances and let sticky 401 recovery adopt a concurrently rotated valid credential instead of refreshing it again.
 - Keep the plugin entrypoint limited to the plugin factory so OpenCode cannot invoke internal request-policy helpers as plugins.
 - Update OpenTUI Core and Solid together to 0.5.7.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity and the host-local quota feed.
 
 ## 1.20.0
 
