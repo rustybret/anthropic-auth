@@ -2,7 +2,15 @@
 # Format: <action>: <glob>
 #
 # keep-deleted: files removed in this fork that upstream might re-introduce
-# take-theirs: regenerable files where upstream's version is always preferred
+# take-theirs: pure checkout — upstream's version is always preferred as-is
+# regenerate:  checkout upstream's version, run the rebuild command for THAT
+#              FILE'S ecosystem, then stage the result INTO the merge commit
+#              (never a follow-up commit)
+#
+# `regenerate` dispatches on the matched file's BASENAME, not on the glob that
+# matched it, so one rule can cover several ecosystems in a polyglot fork. An
+# unrecognized basename is a hard error: the sync refuses to guess a rebuild
+# command and leaves the conflict intact for manual review.
 
 # Arcus packaging outputs and transient local directories
 keep-deleted: dist-arcus/*
@@ -13,4 +21,7 @@ keep-deleted: scripts/release.sh
 keep-deleted: scripts/wait-release.sh
 keep-deleted: scripts/version-sync.mjs
 keep-deleted: .github/workflows/release.yaml
+keep-deleted: .github/workflows/release.yml
 
+# Lockfile
+regenerate: bun.lock
