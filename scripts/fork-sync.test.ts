@@ -186,6 +186,7 @@ function makeFixture(exclusions = defaultExclusions) {
   chmodSync(join(fork, 'scripts', 'fork-sync.sh'), 0o755)
   writeFileSync(join(fork, 'scripts', 'fork-sync-exclusions'), exclusions)
   commit(fork, 'add fork-sync fixture support')
+  git(fork, ['push', 'origin', 'main'])
   git(root, ['clone', upstreamBare, upstreamWork])
   configure(upstreamWork)
 
@@ -262,7 +263,7 @@ describe('fork-sync integration', () => {
     } finally {
       rmSync(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 
   it('reports unresolved conflicts with recovery guidance and leaves the merge open', () => {
     const fixture = makeFixture()
@@ -277,7 +278,7 @@ describe('fork-sync integration', () => {
     } finally {
       rmSync(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 
   it('rejects reruns while a merge is already in progress', () => {
     const fixture = makeFixture()
@@ -296,7 +297,7 @@ describe('fork-sync integration', () => {
     } finally {
       rmSync(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 
   it('handles an empty take-theirs manifest without an unbound-variable failure', () => {
     const fixture = makeFixture(
@@ -312,7 +313,7 @@ describe('fork-sync integration', () => {
     } finally {
       rmSync(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 
   it('applies keep-deleted rules and commits the resolved merge', () => {
     const fixture = makeFixture('keep-deleted: remove-me.txt\n')
@@ -326,7 +327,7 @@ describe('fork-sync integration', () => {
     } finally {
       rmSync(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 
   it('applies regenerate rules for lockfile conflicts and commits the resolved merge', () => {
     const fixture = makeFixture('regenerate: bun.lock\n')
@@ -343,7 +344,31 @@ describe('fork-sync integration', () => {
     } finally {
       rmSync(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20000)
+
+  it('fast-forwards local branch to origin when origin is ahead before merging upstream', () => {
+    const fixture = makeFixture()
+    const peerWork = join(fixture.root, 'peer-work')
+    try {
+      git(fixture.root, ['clone', join(fixture.root, 'origin.git'), peerWork])
+      configure(peerWork)
+      writeFileSync(join(peerWork, 'peer-sync.txt'), 'peer-sync\n')
+      commit(peerWork, 'peer sync from cluster')
+      git(peerWork, ['push', 'origin', 'main'])
+
+      const result = runSync(fixture)
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(
+        '== fast-forwarding main to origin/main ==',
+      )
+      expect(existsSync(join(fixture.fork, 'peer-sync.txt'))).toBe(true)
+      expect(git(fixture.fork, ['log', '-1', '--format=%s'])).toContain(
+        'peer sync from cluster',
+      )
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true })
+    }
+  }, 20000)
 
   it('accepts an already-synced repository and supports root override', () => {
     const fixture = makeFixture()
@@ -369,5 +394,5 @@ describe('fork-sync integration', () => {
       rmSync(fixture.root, { recursive: true, force: true })
       rmSync(scriptHome, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 })

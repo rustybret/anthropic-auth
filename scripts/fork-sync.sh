@@ -4,6 +4,7 @@
 # Syncs this fork (rustybret/anthropic-auth) with upstream (cortexkit/anthropic-auth)
 # without ever rebasing or force-pushing:
 #   1. fetch upstream and origin
+#   1b. fast-forward to origin if origin is ahead
 #   2. merge upstream/<branch> into current branch (default: main)
 #   3. auto-resolve standing conflict classes from scripts/fork-sync-exclusions
 #   4. reconcile regenerated artifacts (lockfiles) into the merge commit
@@ -142,6 +143,19 @@ regenerate_targets() {
 echo "== fetch $REMOTE and origin =="
 git -C "$ROOT" fetch "$REMOTE" "$BRANCH"
 git -C "$ROOT" fetch origin "$LOCAL_BRANCH" || true
+
+# --- 1b. fast-forward to origin if ahead --------------------------------------
+if git -C "$ROOT" rev-parse -q --verify "origin/$LOCAL_BRANCH" >/dev/null 2>&1; then
+  ORIGIN_HEAD="$(git -C "$ROOT" rev-parse "origin/$LOCAL_BRANCH")"
+  LOCAL_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
+
+  if [[ "$LOCAL_HEAD" != "$ORIGIN_HEAD" ]]; then
+    if git -C "$ROOT" merge-base --is-ancestor HEAD "origin/$LOCAL_BRANCH" 2>/dev/null; then
+      echo "== fast-forwarding $LOCAL_BRANCH to origin/$LOCAL_BRANCH =="
+      git -C "$ROOT" merge --ff-only "origin/$LOCAL_BRANCH"
+    fi
+  fi
+fi
 
 # --- 2. merge ------------------------------------------------------------------
 echo "== merge $REMOTE/$BRANCH into $LOCAL_BRANCH =="
