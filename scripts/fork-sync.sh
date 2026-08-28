@@ -34,7 +34,7 @@ if git -C "$ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
   echo "error: a merge is already in progress. Resolve conflicts and run 'git commit --no-edit', or run 'git merge --abort', then re-run." >&2
   exit 2
 fi
-if [[ -n "$(git -C "$ROOT" status --porcelain | grep -v '^?? dist-arcus/' | grep -v '^?? captures/')" ]]; then
+if git -C "$ROOT" status --porcelain | grep -v '^?? dist-arcus/' | grep -v '^?? captures/' | grep -q .; then
   echo "error: working tree is not clean. Commit or stash before syncing." >&2
   exit 2
 fi
