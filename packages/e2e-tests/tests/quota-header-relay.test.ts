@@ -1,8 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from 'bun:test'
-import { readFile } from 'node:fs/promises'
-import { readdir } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { E2EHarness } from '../src/harness.ts'
 
@@ -46,9 +45,11 @@ async function readFeedFiles(harness: E2EHarness) {
   try {
     const names = await readdir(harness.opencode.env.quotaFeedDir)
     return Promise.all(
-            names.filter((name) => name.endsWith('.json')).map(async (name) =>
-        readFile(join(harness.opencode.env.quotaFeedDir, name), 'utf8'),
-      ),
+      names
+        .filter((name) => name.endsWith('.json'))
+        .map(async (name) =>
+          readFile(join(harness.opencode.env.quotaFeedDir, name), 'utf8'),
+        ),
     )
   } catch {
     return []
@@ -91,9 +92,12 @@ describe('quota headers through relay', () => {
 
     const sessionId = await harness.createSession()
     await harness.sendPrompt(sessionId, 'return the relay response')
-    await harness.waitFor(() => (harness?.relay?.acceptedRequests() ?? 0) >= 1, {
-      label: 'relay request accepted',
-    })
+    await harness.waitFor(
+      () => (harness?.relay?.acceptedRequests() ?? 0) >= 1,
+      {
+        label: 'relay request accepted',
+      },
+    )
 
     const state = await waitForHeaderQuotaState(harness)
 
@@ -106,7 +110,9 @@ describe('quota headers through relay', () => {
 
   it('writes one equivalent schema-v2 feed record for an HTTP relay response', async () => {
     harness = await E2EHarness.create({ relay: 'http', quotaFeed: true })
-    harness.script([{ type: 'text', text: 'http relay response', headers: quotaHeaders }])
+    harness.script([
+      { type: 'text', text: 'http relay response', headers: quotaHeaders },
+    ])
     const sessionId = await harness.createSession()
     await harness.sendPrompt(sessionId, 'return the http relay response')
     await harness.waitFor(() => (harness?.relay?.acceptedRequests() ?? 0) >= 1)
@@ -127,9 +133,14 @@ describe('quota headers through relay', () => {
       quotaFeed: true,
       relayResponseStartDelayMs: 250,
     })
-    harness.script([{ type: 'text', text: 'delayed relay response', headers: quotaHeaders }])
+    harness.script([
+      { type: 'text', text: 'delayed relay response', headers: quotaHeaders },
+    ])
     const sessionId = await harness.createSession()
-    const prompt = harness.sendPrompt(sessionId, 'return the delayed relay response')
+    const prompt = harness.sendPrompt(
+      sessionId,
+      'return the delayed relay response',
+    )
     await harness.waitFor(() => (harness?.relay?.acceptedRequests() ?? 0) >= 1)
     await Bun.sleep(50)
     // The optimistic envelope has no quota-bearing headers, so this pins that
@@ -158,9 +169,12 @@ describe('quota headers through relay', () => {
     const sessionId = await harness.createSession()
     await harness.sendPrompt(sessionId, 'return the relay response')
     await harness.waitForSessionText(sessionId, 'relay response without quota')
-    await harness.waitFor(() => (harness?.relay?.acceptedRequests() ?? 0) >= 1, {
-      label: 'relay request accepted',
-    })
+    await harness.waitFor(
+      () => (harness?.relay?.acceptedRequests() ?? 0) >= 1,
+      {
+        label: 'relay request accepted',
+      },
+    )
 
     const state = await readQuotaState(harness)
     expect(state?.main?.quota).toBeUndefined()

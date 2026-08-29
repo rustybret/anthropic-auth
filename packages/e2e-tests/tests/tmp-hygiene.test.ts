@@ -28,7 +28,9 @@ import {
 const roots: string[] = []
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+  )
 })
 
 async function createRoot() {
@@ -60,11 +62,7 @@ describe('e2e temporary directory hygiene', () => {
     const staleTime = new Date('2026-07-15T00:00:00.000Z')
     const now = new Date('2026-07-17T00:00:00.000Z')
 
-    await Promise.all([
-      mkdir(oldDir),
-      mkdir(newDir),
-      mkdir(symlinkTarget),
-    ])
+    await Promise.all([mkdir(oldDir), mkdir(newDir), mkdir(symlinkTarget)])
     await symlink(symlinkTarget, join(root, 'anthropic-auth-e2e-link'))
     await utimes(oldDir, staleTime, staleTime)
     await utimes(newDir, now, now)
@@ -130,9 +128,7 @@ describe('e2e temporary directory hygiene', () => {
     await Promise.all([mkdir(removedDir), mkdir(keptDir)])
 
     expect(await removeE2ETempDir(removedDir, { root })).toBe(true)
-    expect(
-      await removeE2ETempDir(keptDir, { root, keep: true }),
-    ).toBe(false)
+    expect(await removeE2ETempDir(keptDir, { root, keep: true })).toBe(false)
     expect((await readdir(root)).sort()).toEqual(['anthropic-auth-e2e-keep'])
   })
 
@@ -161,11 +157,11 @@ describe('e2e temporary directory hygiene', () => {
     }
     let resolved = false
 
-    const termination = terminateChildProcess(child as unknown as ChildProcess).then(
-      () => {
-        resolved = true
-      },
-    )
+    const termination = terminateChildProcess(
+      child as unknown as ChildProcess,
+    ).then(() => {
+      resolved = true
+    })
     await Bun.sleep(0)
 
     expect(child.killSignals).toEqual(['SIGTERM'])
@@ -192,10 +188,13 @@ describe('e2e temporary directory hygiene', () => {
     }
     let resolved = false
 
-    const termination = terminateChildProcess(child as unknown as ChildProcess, {
-      termTimeoutMs: 5,
-      killExitTimeoutMs: 100,
-    }).then(() => {
+    const termination = terminateChildProcess(
+      child as unknown as ChildProcess,
+      {
+        termTimeoutMs: 5,
+        killExitTimeoutMs: 100,
+      },
+    ).then(() => {
       resolved = true
     })
     await Bun.sleep(20)
@@ -218,10 +217,13 @@ describe('e2e temporary directory hygiene', () => {
     child.signalCode = null
     child.kill = () => true
 
-    const exited = await terminateChildProcess(child as unknown as ChildProcess, {
-      termTimeoutMs: 5,
-      killExitTimeoutMs: 5,
-    })
+    const exited = await terminateChildProcess(
+      child as unknown as ChildProcess,
+      {
+        termTimeoutMs: 5,
+        killExitTimeoutMs: 5,
+      },
+    )
 
     expect(exited).toBe(false)
   })
