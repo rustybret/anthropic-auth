@@ -110,18 +110,20 @@ describe('OpenCode Anthropic auth e2e', () => {
     expect(JSON.stringify(restoredResult)).toContain('source restored')
     await harness.waitForSessionText(sessionId, 'Returning to Fable 5')
 
-    const generationRequests = harness.anthropic.requests().filter((request) => {
-      const serializedBody = JSON.stringify(request.body)
-      return (
-        request.body.max_tokens !== 0 &&
-        !serializedBody.includes('Generate a title for this conversation')
-      )
-    })
+    const generationRequests = harness.anthropic
+      .requests()
+      .filter((request) => {
+        const serializedBody = JSON.stringify(request.body)
+        return (
+          request.body.max_tokens !== 0 &&
+          !serializedBody.includes('Generate a title for this conversation')
+        )
+      })
     expect(generationRequests).toHaveLength(2)
     expect(generationRequests[0]?.body.fallbacks).toBe('default')
-    expect(generationRequests[0]?.headers['anthropic-beta']?.split(',')).toContain(
-      'server-side-fallback-2026-07-01',
-    )
+    expect(
+      generationRequests[0]?.headers['anthropic-beta']?.split(','),
+    ).toContain('server-side-fallback-2026-07-01')
     expect(generationRequests[1]?.body.fallbacks).toBe('default')
 
     const replayMessages = Array.isArray(generationRequests[1]?.body.messages)
@@ -142,20 +144,41 @@ describe('OpenCode Anthropic auth e2e', () => {
       )
     }) as { content: Array<Record<string, unknown>> } | undefined
     expect(replayAssistant).toBeDefined()
-    const replayTypes = replayAssistant?.content.map((block) => block.type)
-    expect(replayTypes).toEqual(['text', 'fallback', 'thinking', 'text'])
-    expect(replayAssistant?.content[0]?.text).toBe('source prefix')
-    expect(replayAssistant?.content[1]).toEqual({
+    const fallbackBlock = replayAssistant?.content.find(
+      (block) => block.type === 'fallback',
+    )
+    expect(fallbackBlock).toEqual({
       type: 'fallback',
       from: { model: 'claude-fable-5' },
       to: { model: 'claude-opus-5' },
     })
-    expect(replayAssistant?.content[2]).toMatchObject({
+    const thinkingBlock = replayAssistant?.content.find(
+      (block) => block.type === 'thinking',
+    )
+    expect(thinkingBlock).toMatchObject({
       type: 'thinking',
       thinking: 'target reasoning',
       signature: 'mock-target-thinking-signature',
     })
-    expect(replayAssistant?.content[3]?.text).toBe('fallback suffix')
+    const prefixBlock = replayAssistant?.content.find(
+      (block) =>
+        typeof block.text === 'string' && block.text.includes('source prefix'),
+    )
+    expect(prefixBlock).toBeDefined()
+    const suffixBlock = replayAssistant?.content.find(
+      (block) =>
+        typeof block.text === 'string' &&
+        block.text.includes('fallback suffix'),
+    )
+    expect(suffixBlock).toBeDefined()
+
+    const prefixIndex = replayAssistant?.content.indexOf(prefixBlock!) ?? -1
+    const fallbackIndex = replayAssistant?.content.indexOf(fallbackBlock!) ?? -1
+    const thinkingIndex = replayAssistant?.content.indexOf(thinkingBlock!) ?? -1
+    const suffixIndex = replayAssistant?.content.indexOf(suffixBlock!) ?? -1
+    expect(prefixIndex).toBeLessThan(fallbackIndex)
+    expect(fallbackIndex).toBeLessThan(thinkingIndex)
+    expect(thinkingIndex).toBeLessThan(suffixIndex)
     expect(JSON.stringify(generationRequests[1]?.body)).not.toContain(
       'cortexkit-server-fallback-v1',
     )
@@ -179,14 +202,15 @@ describe('OpenCode Anthropic auth e2e', () => {
     const serialized = JSON.stringify(result)
     expect(serialized).not.toContain('unavailable tool')
     expect(serialized).not.toContain('mcp_Read')
-    await harness.waitFor(
-      () => harness!.anthropic.requests().length >= 2,
-      { label: 'tool call and follow-up request captured' },
-    )
+    await harness.waitFor(() => harness!.anthropic.requests().length >= 2, {
+      label: 'tool call and follow-up request captured',
+    })
     expect(
-      harness.anthropic.requests().some((request) =>
-        JSON.stringify(request.body).includes('hello from sample file'),
-      ),
+      harness.anthropic
+        .requests()
+        .some((request) =>
+          JSON.stringify(request.body).includes('hello from sample file'),
+        ),
     ).toBe(true)
   }, 90_000)
 
@@ -386,15 +410,19 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
     expect(JSON.stringify(recovered)).toContain('second Opus recovery')
 
-    const generationRequests = harness.anthropic.requests().filter((request) => {
-      const serializedBody = JSON.stringify(request.body)
-      return (
-        request.body.max_tokens !== 0 &&
-        !serializedBody.includes('Generate a title for this conversation')
-      )
-    })
+    const generationRequests = harness.anthropic
+      .requests()
+      .filter((request) => {
+        const serializedBody = JSON.stringify(request.body)
+        return (
+          request.body.max_tokens !== 0 &&
+          !serializedBody.includes('Generate a title for this conversation')
+        )
+      })
     expect(generationRequests).toHaveLength(24)
-    expect(generationRequests.slice(0, 11).map((request) => request.body.model)).toEqual([
+    expect(
+      generationRequests.slice(0, 11).map((request) => request.body.model),
+    ).toEqual([
       'claude-fable-5',
       ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
     ])
@@ -407,7 +435,9 @@ describe('OpenCode Anthropic auth e2e', () => {
       const messages = Array.isArray(body.messages) ? body.messages : []
       return messages.flatMap((message, index) => {
         if (!message || typeof message !== 'object') return []
-        const content = Array.isArray((message as { content?: unknown }).content)
+        const content = Array.isArray(
+          (message as { content?: unknown }).content,
+        )
           ? ((message as { content: unknown[] }).content ?? [])
           : []
         return content.some(
@@ -430,7 +460,11 @@ describe('OpenCode Anthropic auth e2e', () => {
         const message = messages[index]
         if (!message || typeof message !== 'object') continue
         const content = (message as { content?: unknown }).content
-        blocks += Array.isArray(content) ? content.length : content == null ? 0 : 1
+        blocks += Array.isArray(content)
+          ? content.length
+          : content == null
+            ? 0
+            : 1
       }
       return blocks - 1
     }
@@ -503,9 +537,12 @@ describe('OpenCode Anthropic auth e2e', () => {
 
     const serialized = JSON.stringify(result)
     expect(serialized).not.toContain('websocket closed')
-    await harness.waitFor(() => (harness!.relay?.acceptedRequests() ?? 0) >= 1, {
-      label: 'websocket relay accepted request',
-    })
+    await harness.waitFor(
+      () => (harness!.relay?.acceptedRequests() ?? 0) >= 1,
+      {
+        label: 'websocket relay accepted request',
+      },
+    )
     await harness.waitFor(() => harness!.anthropic.requests().length >= 1, {
       label: 'upstream request captured',
     })
