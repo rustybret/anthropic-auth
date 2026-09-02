@@ -43,11 +43,13 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 - **What:** Rewrites every Anthropic request so an OAuth/Claude-Code-identity call is accepted and
   billed correctly; reverses tool-name munging on the streamed response.
 - **How:** `opencode/transform.ts` — `rewriteUrl()` (adds `?beta=true`, base-URL override);
-  `rewriteRequestBody()` pipeline: strip trailing assistant msgs → normalize Fable/Mythos thinking →
-  inject billing header → sanitize system prompt (remove OpenCode identity, prepend Claude Code
-  identity; `sanitize-memo.ts` memoized + `prompt-context.ts`) → apply cache strategy → add fast mode
-  → prefix tool names `mcp_` → opt eligible Fable 5/Opus 5 OAuth calls into server-side safety fallback
-  → restore fallback boundary markers → sign body with `cch` (xxhash). `createStrippedStream()` reverses
+  `rewriteRequestBody()` pipeline: strip trailing assistant msgs and foreign thinking → opt eligible
+  Fable 5/5.1 or Opus 5 OAuth calls into server-side safety fallback and restore boundary markers →
+  normalize Fable/Mythos 5/5.1 thinking → conditionally attach Fable 5.1 thinking-prefix recovery for
+  replayed signed/redacted blocks → inject the Claude Code 2.1.258 billing header with a session-pinned
+  suffix → sanitize system prompt (remove OpenCode identity, prepend Claude Code identity;
+  `sanitize-memo.ts` memoized + `prompt-context.ts`) → apply cache strategy → add fast mode → prefix tool
+  names `mcp_` → sign the final body with `cch` (xxhash). `createStrippedStream()` reverses
   the tool prefix in SSE events and rewrites Anthropic `fallback` blocks into hidden signed markers that
   OpenCode can persist. `server-fallback.ts` classifies handoff/sticky/restored outcomes and preserves
   completed tool calls when a served fallback later refuses. An unabsorbed server-policy refusal activates

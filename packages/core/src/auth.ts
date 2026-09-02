@@ -7,6 +7,7 @@ import {
   REFRESH_SCOPE,
   TOKEN_URL,
 } from './constants.ts'
+import { isTransientNetworkError } from './network-errors.ts'
 import { generatePKCE } from './pkce.ts'
 
 type CallbackParams = {
@@ -60,20 +61,6 @@ export type ClaudeOAuthRefreshResult = {
 }
 
 export const TOKEN_REFRESH_TIMEOUT_MS = 30_000
-
-function isTransientNetworkError(error: unknown) {
-  const name = (error as { name?: unknown }).name
-  if (name === 'TimeoutError' || name === 'AbortError') return true
-  if (!(error instanceof Error)) return false
-  const code = (error as Error & { code?: unknown }).code
-  return (
-    error.message.includes('fetch failed') ||
-    code === 'ECONNRESET' ||
-    code === 'ECONNREFUSED' ||
-    code === 'ETIMEDOUT' ||
-    code === 'UND_ERR_CONNECT_TIMEOUT'
-  )
-}
 
 export async function refreshClaudeOAuthToken(input: {
   refreshToken: string

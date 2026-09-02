@@ -35,9 +35,9 @@ anthropic-auth/
 ## Directory Purposes
 
 **`packages/core/src/`:**
-- Purpose: All reusable OAuth, account management, quota, host-local quota feeds, cache, relay, dump, signing, routing, and command execution logic
+- Purpose: All reusable OAuth, account management, model metadata, quota, host-local quota feeds, cache, relay, dump, signing, thinking-binding, routing, and command execution logic
 - Contains: TypeScript modules, each focused on one concern, plus core unit tests in `tests/`
-- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API + prime opt-in and runtime counters), `auth.ts` (OAuth authorization + token exchange + refresh), `oauth-profile.ts` (OAuth profile fetch + rate limit tier formatting), `quota-headers.ts` (passive quota header extraction and normalization), `quota-header-feed.ts` (sanitized host-local quota observation leases), `token-fingerprint.ts` (SHA-256 token fingerprinting for legacy migration and credential lineage), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cachekeep-registry.ts` (cross-process tracked-session lease registry), `prime.ts` (opt-in five-hour quota priming and cross-process scheduler), `start.ts` (explicit lane-start command parsing and text), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs and Haiku prime pricing), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
+- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API + prime opt-in and runtime counters), `auth.ts` (OAuth authorization + token exchange + refresh), `oauth-profile.ts` (OAuth profile fetch + rate limit tier formatting), `quota-headers.ts` (passive quota header extraction and normalization), `quota-header-feed.ts` (sanitized host-local quota observation leases), `token-fingerprint.ts` (SHA-256 token fingerprinting for legacy migration and credential lineage), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cachekeep-registry.ts` (cross-process tracked-session lease registry), `prime.ts` (opt-in five-hour quota priming and cross-process scheduler), `start.ts` (explicit lane-start command parsing and text), `cch.ts` (body signing and bounded process-local Claude Code version-suffix pinning), `claude-code.ts` (Claude Code identity + billing headers), `thinking-binding.ts` (conditional Fable 5.1 thinking-prefix controls), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs and Haiku prime pricing), `logger.ts` (structured logger), `network-errors.ts` (transient network and DNS error classification), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
@@ -56,7 +56,7 @@ anthropic-auth/
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, origin-aware thinking-signature filtering, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, conditional Fable 5.1 prefix recovery, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers
@@ -94,7 +94,7 @@ anthropic-auth/
 - `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, stable main-account slot identity, account-identity-bound quota/profile state, observation-fenced quota-error clears, refresh-token-hash-bound error/backoff state, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling), prime opt-in, auth-lineage bindings, and per-account runtime usage counters
 - `packages/core/src/quota-manager.ts`: Stable-account-identity-keyed quota cache with backoff, replacement generations, staleness, and fresh-result metadata for quota priming
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
-- `packages/core/src/cch.ts`: XXH64-based request body signing
+- `packages/core/src/cch.ts`: XXH64-based final-body signing plus Claude Code 2.1.258 billing suffix extraction and bounded per-session pinning
 - `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager with local-window and process-lifetime `always` schedules
 - `packages/core/src/cachekeep-registry.ts`: Temporary lease registry for cross-process tracked-session status
 - `packages/core/src/prime.ts`: Opt-in five-hour quota priming command, eligibility gates, minimal Haiku request body, and cross-process marker-claim scheduler
@@ -108,14 +108,16 @@ anthropic-auth/
 - `packages/core/src/cache1h.ts`: 1h prompt cache configuration and commands
 - `packages/core/src/fast.ts`: Fast mode configuration and commands
 - `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, same-session on-disk byte-diff baseline recovery after restart, CacheKeep/Prime prewarm tagging, and commands
-- `packages/core/src/models.ts`: Supported Claude models and specs, including the Haiku 4.5 prime model and pricing constants
+- `packages/core/src/models.ts`: Supported Claude models and specs, including Fable/Mythos 5.1 release metadata and pricing plus the Haiku 4.5 prime model
+- `packages/core/src/thinking-binding.ts`: Shared detection and conditional `drop_block` controls for replayed Fable 5.1 signed/redacted thinking
 - `packages/core/src/logger.ts`: Shared structured logger
+- `packages/core/src/network-errors.ts`: Shared transient DNS and transport error classification for OAuth refresh and quota recovery
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping and cache diagnostics opt-in), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping, Fable/Mythos 5.1 adaptive-thinking normalization, conditional Fable 5.1 binding controls, Claude Code 2.1.258 billing suffix pinning, and cache diagnostics opt-in), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
 - `packages/opencode/src/cache-diagnostics.ts`: Cache diagnosis beta request opt-in (`diagnostics.previous_message_id`), session message ID tracking, schema v:2 record construction with TTL token breakdown, and beta header hash deduplication
-- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
+- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/5.1 and Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
 - `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state, source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
 - `packages/opencode/src/prime-manager-registry.ts`: Process-wide registry that shares PrimeManager instances by account-storage identity and releases managers when project slots move
 - `packages/opencode/src/request-policy.ts`: Internal killswitch block classification and user-facing request-policy messages kept outside the plugin entrypoint so OpenCode invokes only `AnthropicAuthPlugin`
@@ -125,7 +127,7 @@ anthropic-auth/
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
-- `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including same-origin thinking-signature replay and `redacted_thinking` mapping
+- `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including session-stable Claude Code billing suffixes, same-origin thinking-signature replay, Fable 5.1 compaction recovery, and `redacted_thinking` mapping
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation, including preservation of Anthropic redacted-thinking blocks for later replay
 
 **Tests:**

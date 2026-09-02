@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto'
 import xxhashInit from 'xxhash-wasm'
-import { CLAUDE_CODE_BUILD_HASH, CLAUDE_CODE_VERSION } from './constants.ts'
+import { CCH_POSITIONS, CCH_SALT, CLAUDE_CODE_VERSION } from './constants.ts'
 
 type Message = {
   role?: string
   content?: string | Array<{ type?: string; text?: string }>
 }
 
-const CCH_SEED = 0x6e52736ac806831en
+const CCH_SEED = 0x4d659218e32a3268n
 const CCH_PLACEHOLDER = 'cch=00000;'
 export const CCH_PATTERN = /\bcch=([0-9a-f]{5});/
 const BILLING_HEADER_CCH_PATTERN =
@@ -28,8 +28,8 @@ async function ensureXxhash() {
 }
 
 /**
- * Extract text from the first user message's first text block.
- * Kept for diagnostics/backward-compatible tests; CCH signing no longer uses it.
+ * Extract the visible prompt from the first user message. Claude Code prepends
+ * reminder blocks and derives its version suffix from the final text block.
  */
 export function extractFirstUserMessageText(messages: Message[]): string {
   const userMsg = messages.find((message) => message.role === 'user')
@@ -39,11 +39,58 @@ export function extractFirstUserMessageText(messages: Message[]): string {
   if (typeof content === 'string') return content
 
   if (Array.isArray(content)) {
-    const textBlock = content.find((block) => block.type === 'text')
-    if (textBlock?.text) return textBlock.text
+    const textBlocks = content.filter(
+      (block): block is { type: 'text'; text?: string } =>
+        block.type === 'text',
+    )
+    const commandBlock = textBlocks.find((block) =>
+      block.text?.includes('<command-name>'),
+    )
+    if (commandBlock?.text) {
+      return commandBlock.text.slice(
+        commandBlock.text.indexOf('<command-name>'),
+      )
+    }
+    const visibleBlock = textBlocks.findLast(
+      (block) => typeof block.text === 'string' && block.text.length > 0,
+    )
+    if (visibleBlock?.text) return visibleBlock.text
   }
 
   return ''
+}
+
+export class ClaudeCodeFirstUserTextTracker {
+  readonly #values = new Map<string, string>()
+
+  constructor(readonly limit = 1_000) {}
+
+  resolve(sessionId: string, messages: Message[], pin = true) {
+    const existing = this.#values.get(sessionId)
+    if (existing !== undefined) {
+      this.#values.delete(sessionId)
+      this.#values.set(sessionId, existing)
+      return existing
+    }
+
+    const value = extractFirstUserMessageText(messages)
+    if (pin) {
+      if (!this.#values.has(sessionId) && this.#values.size >= this.limit) {
+        const oldest = this.#values.keys().next().value
+        if (oldest !== undefined) this.#values.delete(oldest)
+      }
+      this.#values.set(sessionId, value)
+    }
+    return value
+  }
+
+  has(sessionId: string) {
+    return this.#values.has(sessionId)
+  }
+
+  clear() {
+    this.#values.clear()
+  }
 }
 
 /**
@@ -76,7 +123,15 @@ export async function signRequestBody(bodyString: string): Promise<string> {
   if (!BILLING_HEADER_CCH_PATTERN.test(bodyString)) return bodyString
 
   const unsignedBodyString = resetBillingHeaderCCH(bodyString)
-  const token = await computeCCH(new TextEncoder().encode(unsignedBodyString))
+  const canonicalBody = JSON.parse(unsignedBodyString) as Record<
+    string,
+    unknown
+  >
+  if ('model' in canonicalBody) canonicalBody.model = ''
+  delete canonicalBody.max_tokens
+  const token = await computeCCH(
+    new TextEncoder().encode(JSON.stringify(canonicalBody)),
+  )
   return unsignedBodyString.replace(
     BILLING_HEADER_CCH_PLACEHOLDER_PATTERN,
     `$1cch=${token};`,
@@ -84,18 +139,19 @@ export async function signRequestBody(bodyString: string): Promise<string> {
 }
 
 /**
- * Compute a stable 3-character suffix for cc_version.
- *
- * The captured Claude Code version uses its observed build hash. Custom/future
- * versions get a deterministic version-only suffix so date changes never rotate
- * the billing header and bust prompt-cache prefixes.
+ * Compute Claude Code's 3-character suffix for cc_version.
  */
-export function computeVersionSuffix(
+export function computeCcVersionSuffix(
+  firstUserText: string,
   version: string = CLAUDE_CODE_VERSION,
-  _date: Date = new Date(),
 ): string {
-  if (version === CLAUDE_CODE_VERSION) return CLAUDE_CODE_BUILD_HASH
-  return createHash('sha256').update(version).digest('hex').slice(0, 3)
+  const sampledText = CCH_POSITIONS.map(
+    (position) => firstUserText[position] ?? '0',
+  ).join('')
+  return createHash('sha256')
+    .update(`${CCH_SALT}${sampledText}${version}`)
+    .digest('hex')
+    .slice(0, 3)
 }
 
 /**
@@ -103,12 +159,15 @@ export function computeVersionSuffix(
  * signRequestBody() must run after final request serialization to replace it.
  */
 export function buildBillingHeaderValue(
-  _messages: Message[],
+  messages: Message[],
   version: string = CLAUDE_CODE_VERSION,
   entrypoint: string,
-  date: Date = new Date(),
+  pinnedFirstUserText?: string,
 ): string {
-  const suffix = computeVersionSuffix(version, date)
+  const suffix = computeCcVersionSuffix(
+    pinnedFirstUserText ?? extractFirstUserMessageText(messages),
+    version,
+  )
 
   return (
     'x-anthropic-billing-header: ' +

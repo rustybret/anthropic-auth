@@ -33,13 +33,13 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
 - **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
-- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
+- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5/5.1, Mythos 5/5.1, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
 - **Fable/Opus 5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **Host-local quota feed**: optionally publish sanitized response-header quota observations so another local CortexKit process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
-- **Claude-compatible request hardening**: final-body billing signing, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
+- **Claude-compatible request hardening**: Claude Code 2.1.258 identity and final-body billing signing, live-session-stable billing suffixes, Fable 5.1 thinking-prefix recovery, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
 
 ## What these integrations do
 
@@ -302,7 +302,7 @@ Reset times are rendered as relative durations, such as `resets in 10m` or `rese
 
 ## Safety fallback
 
-Eligible Fable 5 and Opus 5 OAuth requests try Anthropic's server-side safety fallback first. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
+Eligible Fable 5/5.1 and Opus 5 OAuth requests try Anthropic's server-side safety fallback first. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
 
 If an eligible OAuth response still ends in refusal, CortexKit automatically starts its deterministic 10-successful-response Opus 4.8 recovery, prewarms the selected source model without the server-fallback opt-in, and then restores that model. If the refused response already completed a tool call, the plugin preserves that call and continues with its existing tool result instead of replaying the tool.
 
@@ -314,7 +314,7 @@ To bypass Anthropic's server policy and use deterministic client recovery from t
 OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy opencode
 ```
 
-Legacy mode routes a refused Fable 5 or Opus 5 session through Opus 4.8 for 10 successful responses, prewarms the selected source model's cache, and then restores that model without first opting into Anthropic's server policy. Unset the variable and restart OpenCode to return to the default server-first policy with the same client recovery as a backstop.
+Legacy mode routes a refused Fable 5/5.1 or Opus 5 session through Opus 4.8 for 10 successful responses, prewarms the selected source model's cache, and then restores that model without first opting into Anthropic's server policy. Unset the variable and restart OpenCode to return to the default server-first policy with the same client recovery as a backstop.
 
 ## Killswitch
 
@@ -520,7 +520,7 @@ Both OpenCode and Pi packages can persistently request Anthropic fast mode for s
 /claude-fast off
 ```
 
-When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, and `claude-opus-5`; Claude Fable 5 and Mythos 5 are not fast-mode models.
+When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, and `claude-opus-5`; Claude Fable and Mythos 5/5.1 are not fast-mode models.
 
 Fast and standard speeds do not share prompt-cache prefixes, so switching this setting can cause cache misses.
 
@@ -666,7 +666,7 @@ For Claude Pro/Max OAuth requests, the plugin works at the final Anthropic wire-
 4. Prepends Claude Code identity and billing-header blocks.
 5. Rewrites cache controls according to `/claude-cache` mode.
 6. Renames MCP tool names into Claude-compatible PascalCase form.
-7. Opts eligible Fable 5 and Opus 5 OAuth requests into Anthropic's server-side safety fallback, restores stored fallback boundaries, and activates replay-safe client recovery if the response still refuses.
+7. Opts eligible Fable 5/5.1 and Opus 5 OAuth requests into Anthropic's server-side safety fallback, restores stored fallback boundaries, and activates replay-safe client recovery if the response still refuses.
 8. Computes final-body `cch` over the fully serialized request body.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation or source anchors, performs a small set of inline replacements, and preserves the rest of the prompt including user/project instructions, tool policy, environment context, and file paths.

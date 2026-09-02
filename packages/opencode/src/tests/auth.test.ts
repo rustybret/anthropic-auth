@@ -279,6 +279,40 @@ describe('refreshClaudeOAuthToken', () => {
     expect(Date.now() - start).toBeLessThan(2_000)
   })
 
+  test('retries DNS lookup failures in the shared refresh helper', async () => {
+    let calls = 0
+    const setTimeoutMock = mock((handler: () => unknown) => {
+      handler()
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+
+    const result = await refreshClaudeOAuthToken({
+      refreshToken: 'old-refresh',
+      baseDelayMs: 25,
+      setTimeoutImpl: setTimeoutMock,
+      fetchImpl: mock(() => {
+        calls += 1
+        if (calls === 1) {
+          throw Object.assign(
+            new Error('getaddrinfo ENOTFOUND platform.claude.com'),
+            { code: 'ENOTFOUND' },
+          )
+        }
+        return Promise.resolve(
+          Response.json({
+            access_token: 'new-access',
+            refresh_token: 'new-refresh',
+            expires_in: 3600,
+          }),
+        )
+      }) as unknown as typeof fetch,
+    })
+
+    expect(calls).toBe(2)
+    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 25)
+    expect(result.refresh).toBe('new-refresh')
+  })
+
   test('does not retry OAuth refresh rate limits or invalid grants', async () => {
     for (const status of [400, 429]) {
       let calls = 0

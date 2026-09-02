@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { computeCcVersionSuffix } from '@cortexkit/anthropic-auth-core'
 import type { Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 
@@ -441,6 +442,50 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     expect(body.system).toHaveLength(2)
     expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
   })
+
+  test('pins the Claude Code suffix by Pi session across compacted history', async () => {
+    const buildForSession = async (text: string, sessionId: string) =>
+      (
+        await buildAnthropicRequest(
+          TEST_MODEL_ID,
+          { messages: [userMsg(text)], systemPrompt: '', tools: [] } as any,
+          { sessionId } as any,
+          defaultCache,
+        )
+      ).body
+
+    const first = await buildForSession('messCage', 'pi-suffix-session')
+    const compacted = await buildForSession(
+      'replacement compaction summary',
+      'pi-suffix-session',
+    )
+    const other = await buildForSession(
+      'replacement compaction summary',
+      'pi-suffix-other-session',
+    )
+
+    const firstHeader = String(first.system?.[0]?.text)
+    expect(String(compacted.system?.[0]?.text)).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+    )
+    expect(String(compacted.system?.[0]?.text)).toBe(firstHeader)
+    expect(String(other.system?.[0]?.text)).not.toBe(firstHeader)
+  })
+
+  test('recomputes the Claude Code suffix from changing first-user text without a session id', async () => {
+    const first = await buildBody([userMsg('messCage')])
+    const changed = await buildBody([userMsg('messDage')])
+    const firstHeader = String(first.system?.[0]?.text)
+    const changedHeader = String(changed.system?.[0]?.text)
+
+    expect(firstHeader).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+    )
+    expect(changedHeader).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messDage', '2.1.258')};`,
+    )
+    expect(changedHeader).not.toBe(firstHeader)
+  })
 })
 
 describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
@@ -466,6 +511,82 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
 
     expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(body.output_config).toBeUndefined()
+  })
+
+  test('adds Fable 5.1 binding controls when compacted history replays signed thinking', async () => {
+    const identity = {
+      deviceId: 'd'.repeat(64),
+      accountIdentity: 'main',
+      accountUuid: 'account-uuid',
+      sessionId: 'identity-session',
+    }
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      {
+        messages: [
+          userMsg('compaction summary'),
+          thinkingToolMsg('reason', 'signature', 'tool_1', {
+            model: 'claude-fable-5-1',
+          }),
+          toolResultMsg('tool_1', 'result'),
+          userMsg('continue'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any,
+      { sessionId: 'pi-fable-5-1-binding' } as any,
+      defaultCache,
+      false,
+      identity,
+    )
+
+    expect(body.thinking as Record<string, unknown>).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+      block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    })
+  })
+
+  test('does not add Fable 5.1 binding controls to an API-key request', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      {
+        messages: [
+          userMsg('compaction summary'),
+          thinkingToolMsg('reason', 'signature', 'tool_1', {
+            model: 'claude-fable-5-1',
+          }),
+          toolResultMsg('tool_1', 'result'),
+          userMsg('continue'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any,
+      { sessionId: 'pi-fable-5-1-api-route' } as any,
+      defaultCache,
+    )
+
+    expect(
+      (body.thinking as Record<string, unknown>).block_binding,
+    ).toBeUndefined()
+  })
+
+  test('does not add Fable 5.1 binding controls on a first turn', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { sessionId: 'pi-fable-5-1-first-turn' } as any,
+      defaultCache,
+      false,
+      {
+        deviceId: 'd'.repeat(64),
+        accountIdentity: 'main',
+        accountUuid: 'account-uuid',
+        sessionId: 'identity-session',
+      },
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
   })
 
   test('keeps manual thinking budgets for non-Fable models', async () => {

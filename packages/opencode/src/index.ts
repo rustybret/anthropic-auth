@@ -17,11 +17,11 @@ import {
   CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
+  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_FABLE_MYTHOS_5_PRICING,
-  CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
@@ -57,6 +57,7 @@ import {
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getClaudeFableMythos5ReleaseDate,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getKillswitchConfig,
@@ -78,6 +79,7 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
+  isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
@@ -656,6 +658,10 @@ function buildSwitchedToOpusNotice(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) {
     return 'Opus 5 content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Opus 5 cache warm.'
   }
+  if (isClaudeFableOrMythos51Model(modelId)) {
+    const label = fallbackModelLabel(modelId)
+    return `${label} content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the ${label} cache warm.`
+  }
   return FABLE_SWITCHED_TO_OPUS_NOTICE
 }
 
@@ -663,11 +669,18 @@ function buildRestoredNotice(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) {
     return 'Opus 5 recovery window complete. Returning to Opus 5.'
   }
+  if (isClaudeFableOrMythos51Model(modelId)) {
+    return `Recovery window complete. Returning to ${fallbackModelLabel(modelId)}.`
+  }
   return FABLE_RESTORED_NOTICE
 }
 
 function fallbackModelLabel(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) return 'Opus 5'
+  if (isClaudeFableOrMythos51Model(modelId)) {
+    if (modelId.startsWith('claude-mythos-5-1')) return 'Mythos 5.1'
+    if (modelId.startsWith('claude-fable-5-1')) return 'Fable 5.1'
+  }
   if (modelId === 'claude-fable-5' || modelId.startsWith('claude-fable-5-'))
     return 'Fable 5'
   if (modelId === 'claude-opus-4-8' || modelId.startsWith('claude-opus-4-8-')) {
@@ -710,35 +723,40 @@ function addFableMythos5Models<
   return {
     ...models,
     ...Object.fromEntries(
-      Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((spec) => [
-        spec.id,
-        {
-          ...base,
-          id: spec.id,
-          name: spec.name,
-          api: base.api ? { ...base.api, id: spec.id } : undefined,
-          cost: {
-            input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
-            output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
-            cache: {
-              read: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
-              write: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
+      Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((spec) => {
+        const pricing = isClaudeFableOrMythos51Model(spec.id)
+          ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
+          : CLAUDE_FABLE_MYTHOS_5_PRICING
+        return [
+          spec.id,
+          {
+            ...base,
+            id: spec.id,
+            name: spec.name,
+            api: base.api ? { ...base.api, id: spec.id } : undefined,
+            cost: {
+              input: pricing.input,
+              output: pricing.output,
+              cache: {
+                read: pricing.cacheRead,
+                write: pricing.cacheWrite5m,
+              },
             },
+            limit: {
+              ...(base.limit ?? {}),
+              context: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
+              output: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+            },
+            capabilities: {
+              ...(base.capabilities ?? {}),
+              reasoning: true,
+              attachment: true,
+              toolcall: true,
+            },
+            release_date: getClaudeFableMythos5ReleaseDate(spec.id),
           },
-          limit: {
-            ...(base.limit ?? {}),
-            context: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-            output: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
-          },
-          capabilities: {
-            ...(base.capabilities ?? {}),
-            reasoning: true,
-            attachment: true,
-            toolcall: true,
-          },
-          release_date: CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
-        },
-      ]),
+        ]
+      }),
     ),
   } as T
 }
@@ -4448,6 +4466,7 @@ const anthropicAuthPlugin = async (
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
+                sessionId: directAffinity || undefined,
                 perf: (stage, data) =>
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
@@ -4625,6 +4644,8 @@ const anthropicAuthPlugin = async (
                 cache1hMode: cacheMode,
                 fastModeEnabled: fastModeRequested,
                 identity,
+                sessionId: relayAffinity || undefined,
+                thinkingBindingControlsEnabled: true,
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
                 laneStart: laneStartRequest,
@@ -5073,6 +5094,9 @@ const anthropicAuthPlugin = async (
               })
             }
 
+            const usableIds = new Set(
+              usableFallbacks.map((account) => account.id),
+            )
             const retainAccountIds = new Set(
               allRoutes.flatMap((route) => {
                 const refreshError =
@@ -5089,7 +5113,9 @@ const anthropicAuthPlugin = async (
                     refreshError,
                     accountIdentity,
                     Date.now(),
-                  )
+                  ) &&
+                  (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+                    !usableIds.has(route.id))
                 )
                   return []
                 if (
@@ -5122,9 +5148,6 @@ const anthropicAuthPlugin = async (
                 return [route.id]
               }),
             )
-            const usableIds = new Set(
-              usableFallbacks.map((account) => account.id),
-            )
             const candidates: StickyRouteCandidate[] = allRoutes.flatMap(
               (route) => {
                 const refreshError =
@@ -5137,11 +5160,13 @@ const anthropicAuthPlugin = async (
                     : undefined
                 if (
                   isPermanentRefreshError(refreshError) ||
-                  refreshBackoffActive(
+                  (refreshBackoffActive(
                     refreshError,
                     accountIdentity,
                     Date.now(),
-                  )
+                  ) &&
+                    (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+                      !usableIds.has(route.id)))
                 )
                   return []
                 const accountId =

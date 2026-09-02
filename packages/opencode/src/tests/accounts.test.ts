@@ -2496,6 +2496,126 @@ describe('FallbackAccountManager', () => {
     ).toBe(true)
   })
 
+  test('classifies DNS lookup failures as transient refresh errors', () => {
+    const dnsError = Object.assign(
+      new Error('getaddrinfo ENOTFOUND platform.claude.com'),
+      { code: 'ENOTFOUND' },
+    )
+    const error = buildRefreshOperationError({
+      error: dnsError,
+      now: 1_000,
+      accountIdentity: 'fallback-1',
+    })
+
+    expect(error.permanent).toBe(false)
+    expect(error.nextRetryAt).toBe(1_000 + 5 * 60_000)
+
+    const persistedLongBackoff = {
+      ...error,
+      nextRetryAt: 1_000 + 24 * 60 * 60_000,
+      retryCount: 7,
+    }
+    expect(
+      refreshBackoffActive(
+        persistedLongBackoff,
+        'fallback-1',
+        1_000 + 5 * 60_000 - 1,
+      ),
+    ).toBe(true)
+    expect(
+      refreshBackoffActive(
+        persistedLongBackoff,
+        'fallback-1',
+        1_000 + 5 * 60_000,
+      ),
+    ).toBe(false)
+
+    const repeatedError = buildRefreshOperationError({
+      error: dnsError,
+      previous: persistedLongBackoff,
+      now: 2_000,
+      accountIdentity: 'fallback-1',
+    })
+    expect(repeatedError.retryCount).toBe(8)
+    expect(repeatedError.nextRetryAt).toBe(2_000 + 5 * 60_000)
+  })
+
+  test('uses relevant cached quota while a valid token has an active DNS refresh backoff', async () => {
+    const now = 10 * 60_000
+    const cachedAt = now - 60 * 60_000
+    const storage = baseStorage()
+    storage.quota = {
+      enabled: true,
+      checkIntervalMinutes: 5,
+      minimumRemaining: { five_hour: 1, seven_day: 1 },
+      failClosedOnUnknownQuota: true,
+    }
+    storage.accounts.push({
+      id: 'dns-backed-off',
+      type: 'oauth',
+      access: 'still-valid-access',
+      refresh: 'refresh-token',
+      expires: now + 3 * 60 * 60_000,
+      lastRefreshError: {
+        message: 'getaddrinfo ENOTFOUND platform.claude.com',
+        checkedAt: now,
+        nextRetryAt: now + 24 * 60 * 60_000,
+        retryCount: 1,
+        accountIdentity: 'dns-backed-off',
+        permanent: false,
+      },
+      quota: {
+        checkedAt: cachedAt,
+        five_hour: {
+          usedPercent: 4,
+          remainingPercent: 96,
+          checkedAt: cachedAt,
+          resetsAt: new Date(now + 60 * 60_000).toISOString(),
+        },
+        seven_day: {
+          usedPercent: 18,
+          remainingPercent: 82,
+          checkedAt: cachedAt,
+          resetsAt: new Date(now + 3 * 24 * 60 * 60_000).toISOString(),
+        },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 36,
+            remainingPercent: 64,
+            checkedAt: cachedAt,
+            resetsAt: new Date(now + 3 * 24 * 60 * 60_000).toISOString(),
+          },
+        ],
+      },
+    })
+    await saveAccounts(storage)
+    const fetchImpl = mock(() => {
+      throw new Error('active backoff must not retry token refresh')
+    }) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({ fetchImpl, now: () => now })
+
+    const usable = await manager.getUsableFallbackAccounts(undefined, {
+      modelId: 'claude-fable-5',
+    })
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(usable.map((account) => account.id)).toEqual(['dns-backed-off'])
+
+    const backedOffAccount = storage.accounts[0]
+    if (backedOffAccount?.type !== 'oauth') {
+      throw new Error('expected OAuth fallback fixture')
+    }
+    backedOffAccount.expires = now - 1
+    await saveAccounts(storage)
+    const expired = await manager.getUsableFallbackAccounts(undefined, {
+      modelId: 'claude-fable-5',
+    })
+    expect(expired).toEqual([])
+  })
+
   test('stable identity backoff upgrades legacy token-hash errors on the next failure', () => {
     const legacy = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
@@ -4220,7 +4340,13 @@ describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
     expect(getScopedQuotaWindowForModel(quota, 'claude-fable-5')?.title).toBe(
       'Fable only',
     )
+    expect(getScopedQuotaWindowForModel(quota, 'claude-fable-5-1')?.title).toBe(
+      'Fable only',
+    )
     expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5')).toBe(
+      true,
+    )
+    expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5-1')).toBe(
       true,
     )
     expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)

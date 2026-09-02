@@ -11,6 +11,7 @@ import {
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
 import { type LogLevel, log, logger } from './logger.ts'
+import { isTransientNetworkError } from './network-errors.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -2471,15 +2472,7 @@ function isTransientRefreshError(error: unknown) {
   if (typeof status === 'number' && Number.isFinite(status)) {
     return status === 429 || status >= 500
   }
-  if (!(error instanceof Error)) return false
-  return (
-    error.message.includes('fetch failed') ||
-    ('code' in error &&
-      (error.code === 'ECONNRESET' ||
-        error.code === 'ECONNREFUSED' ||
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'UND_ERR_CONNECT_TIMEOUT'))
-  )
+  return isTransientNetworkError(error)
 }
 
 export function buildRefreshOperationError(input: {
@@ -2498,6 +2491,8 @@ export function buildRefreshOperationError(input: {
   let delay: number
   if (typeof retryAfterFromError === 'number' && retryAfterFromError > 0) {
     delay = retryAfterFromError * 1000
+  } else if (isTransientNetworkError(input.error)) {
+    delay = MIN_REFRESH_RETRY_DELAY_MS
   } else if (isTransientRefreshError(input.error)) {
     delay = Math.min(
       MAX_REFRESH_RETRY_DELAY_MS,
@@ -2514,9 +2509,10 @@ export function buildRefreshOperationError(input: {
   const message = formatErrorMessage(input.error)
   // A token is permanently dead ONLY on 400 invalid_grant. The OAuth spec allows
   // other 400s (invalid_client / invalid_request / unsupported_grant_type) that
-  // re-login does NOT fix — those, like a retry-exhausted / network / 429 / 5xx
-  // error, get a long backoff but must stay permanent=false so they are not
-  // falsely flagged "needs re-login". ClaudeOAuthRefreshError carries the raw
+  // re-login does NOT fix — those must stay permanent=false so they are not
+  // falsely flagged "needs re-login". Network failures use a fixed five-minute
+  // retry interval so connectivity recovery cannot inherit an hour-long backoff.
+  // ClaudeOAuthRefreshError carries the raw
   // OAuth body, and its message embeds it (`...: 400 — <body>`), so check both.
   const body =
     typeof (input.error as { body?: unknown }).body === 'string'
@@ -2556,6 +2552,7 @@ export function isPermanentRefreshError(
   if (!error) return false
   if (typeof error.permanent === 'boolean') return error.permanent
   if (typeof error.status === 'number') return error.status === 400
+  if (isTransientNetworkError(error)) return false
   if (typeof error.nextRetryAt === 'number') {
     return (
       error.nextRetryAt - error.checkedAt >=
@@ -2565,12 +2562,25 @@ export function isPermanentRefreshError(
   return false
 }
 
+function effectiveRefreshRetryAt(error: AccountOperationError) {
+  const persistedRetryAt = error.nextRetryAt
+  if (!persistedRetryAt || !isTransientNetworkError(error)) {
+    return persistedRetryAt
+  }
+  return Math.min(
+    persistedRetryAt,
+    error.checkedAt + MIN_REFRESH_RETRY_DELAY_MS,
+  )
+}
+
 export function refreshBackoffActive(
   error: AccountOperationError | undefined,
   accountIdentity: string | undefined,
   now: number,
 ) {
-  if (!error?.nextRetryAt || error.nextRetryAt <= now) return false
+  if (!error) return false
+  const retryAt = effectiveRefreshRetryAt(error)
+  if (!retryAt || retryAt <= now) return false
   if (!error.accountIdentity) return true
   if (!accountIdentity) return true
   return error.accountIdentity === accountIdentity
@@ -2582,7 +2592,7 @@ export function formatRefreshBackoffMessage(
 ) {
   const seconds = Math.max(
     1,
-    Math.ceil(((error.nextRetryAt ?? now) - now) / 1000),
+    Math.ceil(((effectiveRefreshRetryAt(error) ?? now) - now) / 1000),
   )
   return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
 }
@@ -3125,19 +3135,7 @@ function isTransientQuotaError(error: unknown) {
     return true
   }
 
-  const name = (error as { name?: unknown }).name
-  if (name === 'TimeoutError' || name === 'AbortError') return true
-
-  if (!(error instanceof Error)) return false
-  const message = error.message
-  const code = (error as Error & { code?: unknown }).code
-  return (
-    message.includes('fetch failed') ||
-    code === 'ECONNRESET' ||
-    code === 'ECONNREFUSED' ||
-    code === 'ETIMEDOUT' ||
-    code === 'UND_ERR_CONNECT_TIMEOUT'
-  )
+  return isTransientNetworkError(error)
 }
 
 function canUseCachedQuotaAfterRefreshError(
@@ -3147,6 +3145,7 @@ function canUseCachedQuotaAfterRefreshError(
   now: number,
 ) {
   return (
+    Boolean(account.access && account.expires && account.expires > now) &&
     isTransientQuotaError(error) &&
     quotaSnapshotPassesPolicy(account.quota, storage) &&
     cachedQuotaSnapshotStillRelevant(account.quota, now)

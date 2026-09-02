@@ -16,6 +16,7 @@ import {
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
+  hasThinkingBindingControls,
   isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
@@ -47,6 +48,7 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -175,13 +177,16 @@ const cacheKeepManager = new CacheKeepManager({
         target.oauthAccountId ?? storage?.mainAccountId,
       )
       headers.delete('anthropic-beta')
-      applyClaudeCodeHeaders(headers, accessToken, { body, identity })
-      headers.set(
-        'anthropic-beta',
-        mergeAnthropicBetas(headers.get('anthropic-beta'), [
+      applyClaudeCodeHeaders(headers, accessToken, {
+        body,
+        identity,
+        extraBetas: [
           CACHE_KEEP_EXTENDED_TTL_BETA,
-        ]),
-      )
+          ...(hasThinkingBindingControls(body)
+            ? [THINKING_BINDING_CONTROLS_BETA]
+            : []),
+        ],
+      })
       if (body.speed === 'fast') {
         headers.set(
           'anthropic-beta',
@@ -379,6 +384,9 @@ async function sendAnthropicRequest(options: {
     : applyClaudeCodeHeaders(new Headers(), options.accessToken ?? '', {
         body,
         identity,
+        extraBetas: hasThinkingBindingControls(body)
+          ? [THINKING_BINDING_CONTROLS_BETA]
+          : [],
       })
   if (!options.apiAccount && fastMode) {
     headers.set(

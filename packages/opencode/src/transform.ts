@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -10,9 +11,12 @@ import {
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
+  ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
+  hasThinkingBindingControls,
   isClaudeFableOrMythos5Model,
+  isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
@@ -25,6 +29,7 @@ import {
   selectClaudeCodeBetas,
   signRequestBody,
   TEXT_REPLACEMENTS,
+  THINKING_BINDING_CONTROLS_BETA,
   TOOL_PREFIX,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -40,7 +45,6 @@ import {
 } from './server-fallback'
 
 export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
-
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
  * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
@@ -159,10 +163,14 @@ export function setOAuthHeaders(
 ): Headers {
   return applyClaudeCodeHeaders(headers, accessToken, {
     ...options,
-    extraBetas:
-      options.body?.fallbacks === 'default'
+    extraBetas: [
+      ...(options.body?.fallbacks === 'default'
         ? [SERVER_SIDE_FALLBACK_BETA]
-        : undefined,
+        : []),
+      ...(options.body && hasThinkingBindingControls(options.body)
+        ? [THINKING_BINDING_CONTROLS_BETA]
+        : []),
+    ],
   })
 }
 
@@ -962,6 +970,15 @@ function normalizeFableMythosRequest(
   if (!isClaudeFableOrMythos5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   parsed.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  if (isClaudeFableOrMythos51Model(parsed.model)) {
+    const toolChoice = parsed.tool_choice
+    if (
+      isRecord(toolChoice) &&
+      (toolChoice.type === 'any' || toolChoice.type === 'tool')
+    ) {
+      delete parsed.tool_choice
+    }
+  }
   return { replacedExisting: hadThinking }
 }
 
@@ -1136,6 +1153,27 @@ type RewritePerfCallback = (
   data?: Record<string, unknown>,
 ) => void
 
+export const CC_VERSION_SUFFIX_SESSION_LIMIT = 1_000
+const firstUserTextTracker = new ClaudeCodeFirstUserTextTracker(
+  CC_VERSION_SUFFIX_SESSION_LIMIT,
+)
+
+export function resetPinnedFirstUserTextsForTest() {
+  firstUserTextTracker.clear()
+}
+
+export function hasPinnedFirstUserTextForTest(sessionId: string) {
+  return firstUserTextTracker.has(sessionId)
+}
+
+function firstUserTextForSession(
+  sessionId: string,
+  messages: Parameters<typeof buildBillingHeaderValue>[0],
+  laneStart: boolean,
+): string {
+  return firstUserTextTracker.resolve(sessionId, messages, !laneStart)
+}
+
 function rewriteNowMs() {
   return performance.now()
 }
@@ -1181,6 +1219,8 @@ export async function rewriteRequestBody(
     cache1hMode?: Cache1hMode
     fastModeEnabled?: boolean
     identity?: ClaudeCodeIdentity
+    sessionId?: string
+    thinkingBindingControlsEnabled?: boolean
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1250,6 +1290,10 @@ export async function rewriteRequestBody(
       delete parsed.thinking
     }
 
+    if (options.thinkingBindingControlsEnabled === true) {
+      applyThinkingBindingControls(parsed)
+    }
+
     const billingStart = rewriteNowMs()
     const billingHeader =
       Array.isArray(parsed.messages) &&
@@ -1260,6 +1304,13 @@ export async function rewriteRequestBody(
             parsed.messages,
             undefined,
             CLAUDE_CODE_ENTRYPOINT,
+            options.sessionId
+              ? firstUserTextForSession(
+                  options.sessionId,
+                  parsed.messages,
+                  options.laneStart === true,
+                )
+              : undefined,
           )
         : null
     options.perf?.('billing_header', {

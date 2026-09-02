@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
   CLAUDE_CODE_IDENTITY,
+  computeCcVersionSuffix,
   FAST_MODE_BETA,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
@@ -16,9 +17,11 @@ import {
 } from '../server-fallback'
 import {
   addFastModeBetaHeader,
+  CC_VERSION_SUFFIX_SESSION_LIMIT,
   createStrippedStream,
   extractLatestHybridMessageCacheAnchor,
   getSanitizeMemoStats,
+  hasPinnedFirstUserTextForTest,
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
@@ -26,6 +29,7 @@ import {
   prefixToolNames,
   prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
+  resetPinnedFirstUserTextsForTest,
   rewriteRequestBody,
   rewriteUrl,
   sanitizeSystemText,
@@ -156,6 +160,122 @@ describe('lane start request shaping', () => {
   })
 })
 
+describe('conversation-start billing suffix pinning', () => {
+  beforeEach(() => resetPinnedFirstUserTextsForTest())
+
+  const rewriteForSession = (text: string, sessionId?: string) =>
+    rewriteRequestBody(
+      JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: text }],
+        system: [],
+      }),
+      { sessionId } as Parameters<typeof rewriteRequestBody>[1],
+    )
+  const versionSuffix = (body: string) =>
+    JSON.parse(body).system[0].text.match(/cc_version=2\.1\.258\.([^;]+);/)?.[1]
+
+  test('pins the first suffix for a session while allowing a different session to freeze independently', async () => {
+    const first = JSON.parse(
+      await rewriteForSession('messAage', 'cc-suffix-test-session-a'),
+    )
+    const changed = JSON.parse(
+      await rewriteForSession('messBage', 'cc-suffix-test-session-a'),
+    )
+    const other = JSON.parse(
+      await rewriteForSession('messBage', 'cc-suffix-test-session-b'),
+    )
+
+    expect(versionSuffix(JSON.stringify(first))).toBe(
+      versionSuffix(JSON.stringify(changed)),
+    )
+    expect(versionSuffix(JSON.stringify(first))).toBe(
+      computeCcVersionSuffix('messAage', '2.1.258'),
+    )
+    expect(versionSuffix(JSON.stringify(other))).toBe(
+      computeCcVersionSuffix('messBage', '2.1.258'),
+    )
+    expect(versionSuffix(JSON.stringify(other))).not.toBe(
+      versionSuffix(JSON.stringify(first)),
+    )
+  })
+
+  test('tracks changing first-user text without a session pin', async () => {
+    const first = JSON.parse(await rewriteForSession('messCage'))
+    const changed = JSON.parse(await rewriteForSession('messDage'))
+
+    expect(first.system[0].text).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+    )
+    expect(changed.system[0].text).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messDage', '2.1.258')};`,
+    )
+    expect(changed.system[0].text).not.toBe(first.system[0].text)
+  })
+
+  test('keeps an empty first-user text as the pinned conversation sample', async () => {
+    await rewriteForSession('', 'cc-suffix-empty-session')
+    const changed = JSON.parse(
+      await rewriteForSession('messBage', 'cc-suffix-empty-session'),
+    )
+
+    expect(changed.system[0].text).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('', '2.1.258')};`,
+    )
+  })
+
+  test('reset clears pinned suffix state for isolated sessions', async () => {
+    await rewriteForSession('messAage', 'cc-suffix-reset-session')
+    resetPinnedFirstUserTextsForTest()
+    const reset = JSON.parse(
+      await rewriteForSession('messBage', 'cc-suffix-reset-session'),
+    )
+
+    expect(reset.system[0].text).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messBage', '2.1.258')};`,
+    )
+  })
+
+  test('does not pin a blank-session lane start before the first real turn', async () => {
+    const sessionId = 'cc-suffix-lane-start-blank'
+    const laneStart = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [
+            { role: 'user', content: '<command-name>start</command-name>' },
+          ],
+          system: [],
+        }),
+        { laneStart: true, sessionId },
+      ),
+    )
+    expect(laneStart.system[0].text).toContain('cc_version=2.1.258.')
+
+    const realTurn = JSON.parse(await rewriteForSession('messAage', sessionId))
+    expect(realTurn.system[0].text).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messAage', '2.1.258')};`,
+    )
+  })
+
+  test('keeps an active session recent when the pin map reaches its bound', async () => {
+    await rewriteForSession('messAage', 'cc-suffix-lru-active')
+
+    for (let index = 0; index < CC_VERSION_SUFFIX_SESSION_LIMIT; index++) {
+      await rewriteForSession(`mess${index}age`, `cc-suffix-lru-other-${index}`)
+      await rewriteForSession('messBage', 'cc-suffix-lru-active')
+    }
+    expect(hasPinnedFirstUserTextForTest('cc-suffix-lru-other-0')).toBe(false)
+
+    const later = JSON.parse(
+      await rewriteForSession('messCage', 'cc-suffix-lru-active'),
+    )
+    expect(later.system[0].text).toContain(
+      `cc_version=2.1.258.${computeCcVersionSuffix('messAage', '2.1.258')};`,
+    )
+  })
+})
+
 describe('mergeBetaHeaders', () => {
   test('includes required betas when no incoming betas', () => {
     const headers = new Headers()
@@ -250,6 +370,158 @@ describe('setOAuthHeaders', () => {
     expect(disabled.get('anthropic-beta')?.split(',')).not.toContain(
       SERVER_SIDE_FALLBACK_BETA,
     )
+  })
+
+  test('adds Fable 5.1 thinking binding controls only when replaying signed thinking', async () => {
+    const firstTurnBody = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          thinking: { type: 'adaptive' },
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+        { thinkingBindingControlsEnabled: true },
+      ),
+    )
+    expect(firstTurnBody.thinking).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+    })
+    const firstTurnHeaders = new Headers()
+    setOAuthHeaders(firstTurnHeaders, 'token', { body: firstTurnBody })
+    expect(firstTurnHeaders.get('anthropic-beta')).not.toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
+
+    const signedHistory = [
+      { role: 'user', content: 'hello' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'reasoning', signature: 'signature' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'continue' },
+    ]
+    const fableBody = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          thinking: { type: 'adaptive' },
+          messages: signedHistory,
+        }),
+        { thinkingBindingControlsEnabled: true },
+      ),
+    )
+    expect(fableBody.thinking).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+      block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    })
+    const fableHeaders = new Headers()
+    setOAuthHeaders(fableHeaders, 'token', { body: fableBody })
+    expect(fableHeaders.get('anthropic-beta')).toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
+
+    for (const model of ['claude-fable-5', 'claude-mythos-5-1']) {
+      const body = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            thinking: { type: 'adaptive' },
+            messages: signedHistory,
+          }),
+          { thinkingBindingControlsEnabled: true },
+        ),
+      )
+      expect(body.thinking.block_binding).toBeUndefined()
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', { body })
+      expect(headers.get('anthropic-beta')).not.toContain(
+        'thinking-binding-controls-2026-08-01',
+      )
+    }
+
+    const apiKeyBody = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          thinking: { type: 'adaptive' },
+          messages: signedHistory,
+        }),
+      ),
+    )
+    expect(apiKeyBody.thinking.block_binding).toBeUndefined()
+    expect(mergeBetaHeaders(new Headers())).not.toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
+  })
+})
+
+describe('Fable/Mythos 5.1 request normalization', () => {
+  test.each([
+    ['claude-fable-5-1', { type: 'any' }],
+    ['claude-fable-5-1', { type: 'tool', name: 'lookup' }],
+    ['claude-mythos-5-1', { type: 'any' }],
+    ['claude-mythos-5-1', { type: 'tool', name: 'lookup' }],
+  ])(
+    '%s maps manual thinking to adaptive and strips forced tool choice',
+    async (model, toolChoice) => {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            max_tokens: 1024,
+            stream: true,
+            thinking: { type: 'enabled', budget_tokens: 4096 },
+            output_config: { effort: 'xhigh' },
+            tool_choice: toolChoice,
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        ),
+      )
+
+      expect(result.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+      expect(result.output_config).toEqual({ effort: 'xhigh' })
+      expect(result.tool_choice).toBeUndefined()
+    },
+  )
+
+  test('passes every supported effort variant through unchanged', async () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5-1',
+            max_tokens: 1024,
+            stream: true,
+            output_config: { effort },
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        ),
+      )
+      expect(result.output_config).toEqual({ effort })
+    }
+  })
+
+  test('does not strip forced tool choice from legacy Fable 5', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5',
+          max_tokens: 1024,
+          stream: true,
+          tool_choice: { type: 'any' },
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      ),
+    )
+    expect(result.tool_choice).toEqual({ type: 'any' })
   })
 })
 
@@ -598,6 +870,38 @@ describe('createStrippedStream', () => {
     }).text()
 
     expect(text).toBe(body)
+  })
+
+  test('passes through dropped-thinking input transformations', async () => {
+    const body = [
+      sse('message_start', {
+        type: 'message_start',
+        message: {
+          id: 'msg_drop_block',
+          type: 'message',
+          input_transformations: [
+            {
+              type: 'thinking_dropped',
+              path: 'messages.1.content.0',
+              reason: 'prefix_binding_mismatch',
+            },
+          ],
+        },
+      }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        input_transformations: [
+          {
+            type: 'thinking_dropped',
+            path: 'messages.1.content.0',
+            reason: 'prefix_binding_mismatch',
+          },
+        ],
+      }),
+    ].join('')
+
+    expect(await createStrippedStream(new Response(body)).text()).toBe(body)
   })
 
   test('leaves max_tokens bytes unchanged without the lane-start marker', async () => {
@@ -1616,6 +1920,20 @@ describe('prepareFableCacheWarmSource', () => {
     expect(selectClaudeCodeBetas(body).split(',')).not.toContain(
       'server-side-fallback-2026-07-01',
     )
+  })
+
+  test('preserves the requested Fable 5.1 model when warming its source cache', () => {
+    const source = prepareFableCacheWarmSource(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'same input' }],
+      }),
+      'claude-fable-5-1',
+    )
+
+    expect(source.ok).toBe(true)
+    if (!source.ok) throw new Error(source.reason)
+    expect(JSON.parse(source.bodyText).model).toBe('claude-fable-5-1')
   })
 })
 

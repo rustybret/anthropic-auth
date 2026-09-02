@@ -1,3 +1,4 @@
+import { isClaudeFable51Model } from '@cortexkit/anthropic-auth-core'
 import {
   isRecoverableRefusalModel,
   recoverableRefusalFamily,
@@ -144,7 +145,9 @@ export function applyServerSideFallbackToBody(
   restoredMarkers: number
   droppedMarkers: number
 } {
-  const enabled = requested && isRecoverableRefusalModel(body.model)
+  const enabled =
+    requested &&
+    (isRecoverableRefusalModel(body.model) || isClaudeFable51Model(body.model))
   const markerResult = rewriteStoredMarkers(body, enabled)
   if (enabled) {
     body.fallbacks = 'default'

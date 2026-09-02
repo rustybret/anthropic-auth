@@ -87,6 +87,91 @@ describe('Pi API fallback routing helpers', () => {
     )
   })
 
+  test('sends Fable 5.1 thinking binding controls after compacted signed history', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-fable-51-binding-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      },
+      storagePath,
+    )
+
+    let requestHeaders: Headers | undefined
+    let requestBody: Record<string, any> | undefined
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input.toString()
+        if (url.includes('/api/claude_cli/bootstrap')) {
+          return new Response(
+            JSON.stringify({
+              oauth_account: { account_uuid: 'pi-fable-51-account' },
+            }),
+          )
+        }
+        requestHeaders = new Headers(init?.headers)
+        requestBody = JSON.parse(String(init?.body))
+        return new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200 },
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const context = {
+      systemPrompt: 'test',
+      tools: [],
+      messages: [
+        { role: 'user', content: 'compaction summary', timestamp: 0 },
+        {
+          role: 'assistant',
+          provider: 'anthropic',
+          api: 'cortexkit-anthropic-messages',
+          model: 'claude-fable-5-1',
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'reasoning',
+              thinkingSignature: 'signature',
+            },
+            { type: 'toolCall', id: 'tool_1', name: 'Bash', arguments: {} },
+          ],
+          timestamp: 0,
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'tool_1',
+          content: [{ type: 'text', text: 'result' }],
+          isError: false,
+          timestamp: 0,
+        },
+        { role: 'user', content: 'continue', timestamp: 0 },
+      ],
+    } as any
+    const stream = streamCortexKitAnthropic(
+      { ...anthropicModel, id: 'claude-fable-5-1', name: 'Claude Fable 5.1' },
+      context,
+      { apiKey: 'sk-ant-oat-pi-fable-51', sessionId: 'ses_pi_fable_51' },
+    )
+    for await (const _event of stream) {
+      // Drain the provider stream.
+    }
+
+    expect(requestBody?.thinking?.block_binding).toEqual({
+      prefix_mismatch_behavior: 'drop_block',
+    })
+    expect(requestHeaders?.get('anthropic-beta')).toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
+  })
+
   test('preserves provider base path when building /v1/messages URL', () => {
     const url = buildExplicitBaseMessagesUrl('https://api.kie.ai/claude')
 

@@ -1,5 +1,6 @@
 import {
   applyClaudeCodeMetadata,
+  applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -7,6 +8,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
+  ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
@@ -31,6 +33,7 @@ import type {
 // that Anthropic currently rejects in system[]. Unknown prompt shapes take the
 // service-preserving fallback below instead of returning the full prompt there.
 const PI_DOCS_ANCHOR = 'Pi documentation'
+const firstUserTextTracker = new ClaudeCodeFirstUserTextTracker()
 const ANTHROPIC_REPLAY_APIS = new Set([
   'anthropic-messages',
   'cortexkit-anthropic-messages',
@@ -477,6 +480,9 @@ export async function buildAnthropicRequest(
         messages,
         undefined,
         CLAUDE_CODE_ENTRYPOINT,
+        options?.sessionId
+          ? firstUserTextTracker.resolve(options.sessionId, messages)
+          : undefined,
       ),
     },
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
@@ -573,7 +579,10 @@ export async function buildAnthropicRequest(
 
   addEphemeralCacheControl(body)
   applyCacheMode(body, cache.enabled, cache.mode)
-  if (identity) applyClaudeCodeMetadata(body, identity)
+  if (identity) {
+    applyThinkingBindingControls(body)
+    applyClaudeCodeMetadata(body, identity)
+  }
 
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
