@@ -1,11 +1,4 @@
-import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  test,
-} from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import {
   hashBody,
   sendViaRelay,
@@ -14,6 +7,9 @@ import {
 import { Miniflare, NoOpLog } from 'miniflare'
 
 const RELAY_TOKEN = 'relay-token'
+const WORKER_STARTUP_TIMEOUT_MS = 90_000
+const WORKER_STARTUP_TIMEOUT_MESSAGE =
+  'Miniflare worker startup timed out under load (issue #176) — not a websocket-logic failure'
 
 type ControlMessage = {
   type: string
@@ -54,6 +50,25 @@ function createUpstream() {
   return { bodies, fetch, url: 'https://upstream.test/messages' }
 }
 
+async function waitForWorkerReady(
+  mf: Pick<Miniflare, 'ready'>,
+  timeoutMs = WORKER_STARTUP_TIMEOUT_MS,
+) {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(
+      () => reject(new Error(WORKER_STARTUP_TIMEOUT_MESSAGE)),
+      timeoutMs,
+    )
+  })
+
+  try {
+    return await Promise.race([mf.ready, timeoutPromise])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
 async function startWorker(upstream: ReturnType<typeof createUpstream>) {
   const mf = new Miniflare({
     script: WORKER_SCRIPT,
@@ -65,7 +80,16 @@ async function startWorker(upstream: ReturnType<typeof createUpstream>) {
     port: 0,
     log: new NoOpLog(),
   })
-  await mf.ready
+  try {
+    await waitForWorkerReady(mf)
+  } catch (error) {
+    try {
+      await mf.dispose()
+    } catch {
+      // Preserve the named startup failure when cleanup also fails.
+    }
+    throw error
+  }
   return mf
 }
 
@@ -73,7 +97,7 @@ async function connectWorkerSocket(
   mf: Miniflare,
   affinity: string,
 ): Promise<WorkerSocket> {
-  const url = new URL(await mf.ready)
+  const url = new URL(await waitForWorkerReady(mf))
   url.protocol = 'ws:'
   url.pathname = '/ws'
   url.searchParams.set('token', RELAY_TOKEN)
@@ -158,24 +182,34 @@ describe('relay Worker under Miniflare', () => {
   let upstream: ReturnType<typeof createUpstream>
   let mf: Miniflare
 
-  beforeAll(async () => {
-    upstream = createUpstream()
-    mf = await startWorker(upstream)
-  })
+  beforeAll(
+    async () => {
+      upstream = createUpstream()
+      mf = await startWorker(upstream)
+    },
+    { timeout: WORKER_STARTUP_TIMEOUT_MS + 10_000 },
+  )
 
   afterAll(async () => {
+    // A startup timeout leaves mf unassigned; disposing undefined would bury
+    // the named startup error under a TypeError.
     await mf?.dispose()
   })
 
-  beforeEach(() => {
-    upstream.bodies.length = 0
+  test('names a worker startup timeout', async () => {
+    const neverReady = { ready: new Promise<URL>(() => {}) } as Miniflare
+
+    await expect(waitForWorkerReady(neverReady, 1)).rejects.toThrow(
+      'Miniflare worker startup timed out under load (issue #176) — not a websocket-logic failure',
+    )
   })
 
   test('HTTP relay forwards upstream unified quota headers', async () => {
+    const startLen = upstream.bodies.length
     const response = await sendViaRelay({
       config: {
         enabled: true,
-        url: (await mf.ready).toString(),
+        url: (await waitForWorkerReady(mf)).toString(),
         token: RELAY_TOKEN,
         fallbackToDirect: false,
         transport: 'http',
@@ -197,14 +231,16 @@ describe('relay Worker under Miniflare', () => {
       'available',
     )
     expect(await response.text()).toBe('upstream-ok')
-    expect(upstream.bodies).toEqual(['{}'])
+    expect(upstream.bodies.slice(startLen)).toEqual(['{}'])
   }, 30_000)
 
   test('client websocket transport reaches Miniflare Worker with byte-exact patch reconstruction', async () => {
+    const startLen = upstream.bodies.length
     const affinity = 'miniflare-client-session'
+
     const firstBody = `client prefix cch=aaaaa; ${'x'.repeat(2048)} tail`
     const secondBody = `client prefix cch=bbbbb; ${'x'.repeat(2048)} tail!`
-    const relayUrl = (await mf.ready).toString()
+    const relayUrl = (await waitForWorkerReady(mf)).toString()
     const relayConfig = {
       enabled: true,
       url: relayUrl,
@@ -243,119 +279,115 @@ describe('relay Worker under Miniflare', () => {
       fallback: async () => new Response('direct'),
     })
     expect(await second.text()).toBe('upstream-ok')
-    expect(upstream.bodies).toEqual([firstBody, secondBody])
+    expect(upstream.bodies.slice(startLen)).toEqual([firstBody, secondBody])
   }, 30_000)
 
   test('websocket full_sync and patch reconstruct byte-exact upstream bodies', async () => {
+    const startLen = upstream.bodies.length
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-byte-exact-session',
     )
 
-    try {
-      const firstBody = `prefix cch=aaaaa; ${'x'.repeat(1024)} tail`
-      const secondBody = `prefix cch=bbbbb; ${'x'.repeat(1024)} tail!`
-      const cchStart = firstBody.indexOf('aaaaa')
+    const firstBody = `prefix cch=aaaaa; ${'x'.repeat(1024)} tail`
+    const secondBody = `prefix cch=bbbbb; ${'x'.repeat(1024)} tail!`
+    const cchStart = firstBody.indexOf('aaaaa')
 
-      sendPayload(workerSocket.socket, {
-        protocol: 2,
-        type: 'request',
-        id: 'req_full_sync',
-        affinity: 'ignored-client-affinity',
-        upstream: { url: upstream.url, method: 'POST', headers: {} },
-        next_hash: hashBody(firstBody),
-        mode: 'full_sync',
-        revision: 1,
-        body: firstBody,
-      })
-      const responseStart = await workerSocket.waitForControl(
-        (message) =>
-          message.type === 'response_start' && message.id === 'req_full_sync',
-      )
-      expect(
-        responseStart.headers?.['anthropic-ratelimit-unified-5h-utilization'],
-      ).toBe('0.78')
-      expect(
-        responseStart.headers?.['anthropic-ratelimit-unified-fallback'],
-      ).toBe('available')
-      await workerSocket.waitForControl(
-        (message) => message.type === 'done' && message.id === 'req_full_sync',
-      )
+    sendPayload(workerSocket.socket, {
+      protocol: 2,
+      type: 'request',
+      id: 'req_full_sync',
+      affinity: 'ignored-client-affinity',
+      upstream: { url: upstream.url, method: 'POST', headers: {} },
+      next_hash: hashBody(firstBody),
+      mode: 'full_sync',
+      revision: 1,
+      body: firstBody,
+    })
+    const responseStart = await workerSocket.waitForControl(
+      (message) =>
+        message.type === 'response_start' && message.id === 'req_full_sync',
+    )
+    expect(
+      responseStart.headers?.['anthropic-ratelimit-unified-5h-utilization'],
+    ).toBe('0.78')
+    expect(
+      responseStart.headers?.['anthropic-ratelimit-unified-fallback'],
+    ).toBe('available')
+    await workerSocket.waitForControl(
+      (message) => message.type === 'done' && message.id === 'req_full_sync',
+    )
 
-      sendPayload(workerSocket.socket, {
-        protocol: 2,
-        type: 'request',
-        id: 'req_patch',
-        affinity: 'ignored-client-affinity',
-        upstream: { url: upstream.url, method: 'POST', headers: {} },
-        base_hash: hashBody(firstBody),
-        next_hash: hashBody(secondBody),
-        mode: 'patch',
-        revision: 2,
-        patch: [
-          { start: cchStart, deleteCount: 5, insert: 'bbbbb' },
-          { start: firstBody.length, deleteCount: 0, insert: '!' },
-        ],
-      })
-      await workerSocket.waitForControl(
-        (message) => message.type === 'done' && message.id === 'req_patch',
-      )
+    sendPayload(workerSocket.socket, {
+      protocol: 2,
+      type: 'request',
+      id: 'req_patch',
+      affinity: 'ignored-client-affinity',
+      upstream: { url: upstream.url, method: 'POST', headers: {} },
+      base_hash: hashBody(firstBody),
+      next_hash: hashBody(secondBody),
+      mode: 'patch',
+      revision: 2,
+      patch: [
+        { start: cchStart, deleteCount: 5, insert: 'bbbbb' },
+        { start: firstBody.length, deleteCount: 0, insert: '!' },
+      ],
+    })
+    await workerSocket.waitForControl(
+      (message) => message.type === 'done' && message.id === 'req_patch',
+    )
 
-      expect(upstream.bodies).toEqual([firstBody, secondBody])
-    } finally {
-      workerSocket.socket.close()
-    }
+    expect(upstream.bodies.slice(startLen)).toEqual([firstBody, secondBody])
+    workerSocket.socket.close()
   }, 30_000)
 
   test('websocket hash mismatch returns 409 before upstream fetch', async () => {
+    const startLen = upstream.bodies.length
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-hash-mismatch-session',
     )
 
-    try {
-      const firstBody = 'stable-prefix stale-tail'
-      const expectedBody = 'stable-prefix expected-tail'
+    const firstBody = 'stable-prefix stale-tail'
+    const expectedBody = 'stable-prefix expected-tail'
 
-      sendPayload(workerSocket.socket, {
-        protocol: 2,
-        type: 'request',
-        id: 'req_seed_state',
-        affinity: 'ignored-client-affinity',
-        upstream: { url: upstream.url, method: 'POST', headers: {} },
-        next_hash: hashBody(firstBody),
-        mode: 'full_sync',
-        revision: 1,
-        body: firstBody,
-      })
-      await workerSocket.waitForControl(
-        (message) => message.type === 'done' && message.id === 'req_seed_state',
-      )
+    sendPayload(workerSocket.socket, {
+      protocol: 2,
+      type: 'request',
+      id: 'req_seed_state',
+      affinity: 'ignored-client-affinity',
+      upstream: { url: upstream.url, method: 'POST', headers: {} },
+      next_hash: hashBody(firstBody),
+      mode: 'full_sync',
+      revision: 1,
+      body: firstBody,
+    })
+    await workerSocket.waitForControl(
+      (message) => message.type === 'done' && message.id === 'req_seed_state',
+    )
 
-      sendPayload(workerSocket.socket, {
-        protocol: 2,
-        type: 'request',
-        id: 'req_bad_patch',
-        affinity: 'ignored-client-affinity',
-        upstream: { url: upstream.url, method: 'POST', headers: {} },
-        base_hash: hashBody(firstBody),
-        next_hash: hashBody(expectedBody),
-        mode: 'patch',
-        revision: 2,
-        patch: {
-          start: 'stable-prefix '.length,
-          deleteCount: 'stale-tail'.length,
-          insert: 'wrong-tail',
-        },
-      })
+    sendPayload(workerSocket.socket, {
+      protocol: 2,
+      type: 'request',
+      id: 'req_bad_patch',
+      affinity: 'ignored-client-affinity',
+      upstream: { url: upstream.url, method: 'POST', headers: {} },
+      base_hash: hashBody(firstBody),
+      next_hash: hashBody(expectedBody),
+      mode: 'patch',
+      revision: 2,
+      patch: {
+        start: 'stable-prefix '.length,
+        deleteCount: 'stale-tail'.length,
+        insert: 'wrong-tail',
+      },
+    })
 
-      const error = await workerSocket.waitForControl(
-        (message) => message.type === 'error' && message.id === 'req_bad_patch',
-      )
-      expect(error).toMatchObject({ status: 409, message: 'hash mismatch' })
-      expect(upstream.bodies).toEqual([firstBody])
-    } finally {
-      workerSocket.socket.close()
-    }
+    const error = await workerSocket.waitForControl(
+      (message) => message.type === 'error' && message.id === 'req_bad_patch',
+    )
+    expect(error).toMatchObject({ status: 409, message: 'hash mismatch' })
+    expect(upstream.bodies.slice(startLen)).toEqual([firstBody])
+    workerSocket.socket.close()
   }, 30_000)
 })

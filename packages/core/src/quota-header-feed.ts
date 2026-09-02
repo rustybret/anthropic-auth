@@ -18,10 +18,14 @@ import {
   isOAuthAccount,
   type OAuthExtraUsageSnapshot,
   type OAuthQuotaSnapshot,
+  QUOTA_FIELD_NAMES,
+  type QuotaFieldName,
+  type QuotaFieldSource,
+  type QuotaFieldSources,
   type QuotaMoney,
 } from './accounts.ts'
 
-export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 2
+export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 3
 export const QUOTA_HEADER_FEED_LEASE_MS = 180_000
 
 export type QuotaHeaderFeedIdentity =
@@ -29,21 +33,41 @@ export type QuotaHeaderFeedIdentity =
   | { identity_source: 'account_ref'; account_ref: string }
   | { identity_source: 'none' }
 
-export type QuotaHeaderFeedEntry = QuotaHeaderFeedIdentity & {
+export type QuotaHeaderFeedProvenance = Partial<
+  Record<QuotaFieldName, QuotaFieldSource>
+>
+
+type QuotaHeaderFeedQuota = Pick<
+  OAuthQuotaSnapshot,
+  | 'five_hour'
+  | 'seven_day'
+  | 'bindingWindow'
+  | 'fallbackAdvised'
+  | 'scoped'
+  | 'extraUsage'
+> & {
+  provenance?: QuotaHeaderFeedProvenance
+}
+
+type QuotaHeaderFeedMetadata = {
   schema_version: typeof QUOTA_HEADER_FEED_SCHEMA_VERSION
   provider: 'anthropic'
   configured_account_count: number
   observed_at_ms: number
-  quota: Pick<
-    OAuthQuotaSnapshot,
-    | 'five_hour'
-    | 'seven_day'
-    | 'bindingWindow'
-    | 'fallbackAdvised'
-    | 'scoped'
-    | 'extraUsage'
-  >
 }
+
+export type QuotaHeaderFeedEntry = QuotaHeaderFeedIdentity &
+  QuotaHeaderFeedMetadata & {
+    quota: QuotaHeaderFeedQuota
+  }
+
+export type QuotaHeaderFeedPublishEntry = QuotaHeaderFeedIdentity &
+  QuotaHeaderFeedMetadata & {
+    quota: Omit<QuotaHeaderFeedQuota, 'provenance'> & {
+      fieldSources?: QuotaFieldSources
+    }
+    accountKey: string
+  }
 
 type FeedRecord = {
   version: typeof QUOTA_HEADER_FEED_SCHEMA_VERSION
@@ -206,7 +230,22 @@ function projectExtraUsage(
   }
 }
 
-function projectQuota(quota: QuotaHeaderFeedEntry['quota']) {
+function projectQuotaProvenance(
+  value: unknown,
+  presentFields: ReadonlySet<QuotaFieldName>,
+): QuotaHeaderFeedProvenance | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  const provenance: QuotaHeaderFeedProvenance = {}
+  for (const field of QUOTA_FIELD_NAMES) {
+    if (!presentFields.has(field)) continue
+    const source = candidate[field]
+    if (source === 'poll' || source === 'headers') provenance[field] = source
+  }
+  return Object.keys(provenance).length > 0 ? provenance : undefined
+}
+
+function projectQuota(quota: QuotaHeaderFeedPublishEntry['quota']) {
   const fiveHour = projectQuotaWindow(quota.five_hour)
   const sevenDay = projectQuotaWindow(quota.seven_day)
   const scoped = Array.isArray(quota.scoped)
@@ -215,6 +254,18 @@ function projectQuota(quota: QuotaHeaderFeedEntry['quota']) {
         .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
     : undefined
   const extraUsage = projectExtraUsage(quota.extraUsage)
+  const presentFields = new Set<QuotaFieldName>()
+  if (fiveHour) presentFields.add('five_hour')
+  if (sevenDay) presentFields.add('seven_day')
+  if (typeof quota.bindingWindow === 'string') {
+    presentFields.add('bindingWindow')
+  }
+  if (typeof quota.fallbackAdvised === 'boolean') {
+    presentFields.add('fallbackAdvised')
+  }
+  if (scoped) presentFields.add('scoped')
+  if (extraUsage) presentFields.add('extraUsage')
+  const provenance = projectQuotaProvenance(quota.fieldSources, presentFields)
   return {
     ...(fiveHour && { five_hour: fiveHour }),
     ...(sevenDay && { seven_day: sevenDay }),
@@ -226,6 +277,7 @@ function projectQuota(quota: QuotaHeaderFeedEntry['quota']) {
     }),
     ...(scoped && { scoped }),
     ...(extraUsage && { extraUsage }),
+    ...(provenance && { provenance }),
   }
 }
 
@@ -248,12 +300,12 @@ export class QuotaHeaderFeedRegistry {
     )
   }
 
-  publish(entry: QuotaHeaderFeedEntry & { accountKey: string }): Promise<void> {
+  publish(entry: QuotaHeaderFeedPublishEntry): Promise<void> {
     const { accountKey, quota, ...entryWithoutQuota } = entry
     const cleanEntry = {
       ...entryWithoutQuota,
       quota: projectQuota(quota),
-    }
+    } as QuotaHeaderFeedEntry
     try {
       validatePublishEntry(cleanEntry)
     } catch (error) {

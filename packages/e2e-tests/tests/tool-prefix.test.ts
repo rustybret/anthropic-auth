@@ -99,13 +99,15 @@ describe('OpenCode Anthropic auth e2e', () => {
       'high',
     )
 
-    const generationRequests = harness.anthropic.requests().filter((request) => {
-      const serializedBody = JSON.stringify(request.body)
-      return (
-        request.body.model === 'claude-fable-5-1' &&
-        !serializedBody.includes('Generate a title for this conversation')
-      )
-    })
+    const generationRequests = harness.anthropic
+      .requests()
+      .filter((request) => {
+        const serializedBody = JSON.stringify(request.body)
+        return (
+          request.body.model === 'claude-fable-5-1' &&
+          !serializedBody.includes('Generate a title for this conversation')
+        )
+      })
     expect(generationRequests).toHaveLength(2)
     expect(generationRequests[0]?.body.output_config).toMatchObject({
       effort: 'low',

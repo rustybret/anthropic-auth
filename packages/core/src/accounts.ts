@@ -22,6 +22,19 @@ export const QUOTA_URL = 'https://api.anthropic.com/api/oauth/usage'
 export const QUOTA_FETCH_TIMEOUT_MS = 30_000
 
 export type QuotaWindowName = 'five_hour' | 'seven_day'
+export const QUOTA_FIELD_NAMES = [
+  'five_hour',
+  'seven_day',
+  'scoped',
+  'extraUsage',
+  'bindingWindow',
+  'fallbackAdvised',
+] as const
+export type QuotaFieldName = (typeof QUOTA_FIELD_NAMES)[number]
+export type QuotaFieldSource = 'poll' | 'headers'
+export type QuotaFieldSources = Partial<
+  Record<QuotaFieldName, QuotaFieldSource>
+>
 
 export type AccountBase = {
   id: string
@@ -156,6 +169,7 @@ export type OAuthQuotaSnapshot = Partial<
   extraUsage?: OAuthExtraUsageSnapshot
   bindingWindow?: string
   bindingWindowSource?: 'poll' | 'headers'
+  fieldSources?: QuotaFieldSources
   fallbackAdvised?: boolean
   source?: 'poll' | 'headers'
   // Top-level freshness stamp for the whole snapshot. mergeAccountRuntimeState
@@ -719,6 +733,20 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     quota.source = value.source
   }
 
+  if (isRecord(value.fieldSources)) {
+    const fieldSources: QuotaFieldSources = {}
+    for (const field of QUOTA_FIELD_NAMES) {
+      if (quota[field] === undefined) continue
+      const source = value.fieldSources[field]
+      if (source === 'poll' || source === 'headers') {
+        fieldSources[field] = source
+      }
+    }
+    if (Object.keys(fieldSources).length > 0) {
+      quota.fieldSources = fieldSources
+    }
+  }
+
   return Object.keys(quota).length ? quota : undefined
 }
 
@@ -1126,19 +1154,76 @@ function mergeHeaderOwnedWindow(
     : incoming
 }
 
+export function quotaFieldSource(
+  snapshot: OAuthQuotaSnapshot | undefined,
+  field: QuotaFieldName,
+): QuotaFieldSource | undefined {
+  if (!snapshot || snapshot[field] === undefined) return undefined
+  return (
+    snapshot.fieldSources?.[field] ??
+    (snapshot.source === 'poll' || snapshot.source === 'headers'
+      ? snapshot.source
+      : undefined)
+  )
+}
+
+function fieldSourcesForMergedQuota(
+  existing: OAuthQuotaSnapshot,
+  incoming: OAuthQuotaSnapshot,
+  merged: OAuthQuotaSnapshot,
+): QuotaFieldSources | undefined {
+  const fieldSources: QuotaFieldSources = {}
+  for (const field of QUOTA_FIELD_NAMES) {
+    if (merged[field] === undefined) continue
+    if (field === 'scoped' || field === 'extraUsage') {
+      fieldSources[field] = 'poll'
+      continue
+    }
+    if (
+      field === 'bindingWindow' &&
+      existing.bindingWindowSource === 'poll' &&
+      existing.bindingWindow === merged.bindingWindow
+    ) {
+      fieldSources[field] = 'poll'
+      continue
+    }
+    if (
+      field === 'fallbackAdvised' &&
+      incoming.fieldSources?.fallbackAdvised === undefined
+    ) {
+      const source = quotaFieldSource(existing, field)
+      if (source) fieldSources[field] = source
+      continue
+    }
+    const source =
+      incoming[field] === merged[field]
+        ? quotaFieldSource(incoming, field)
+        : existing[field] === merged[field]
+          ? quotaFieldSource(existing, field)
+          : (quotaFieldSource(existing, field) ??
+            quotaFieldSource(incoming, field))
+    if (source) fieldSources[field] = source
+  }
+  return Object.keys(fieldSources).length > 0 ? fieldSources : undefined
+}
+
 export function mergeHeaderQuotaForPersistence(
   existing: OAuthQuotaSnapshot | undefined,
   incoming: OAuthQuotaSnapshot,
 ) {
   if (!existing || incoming.source !== 'headers') return incoming
   const preservePollBinding = existing.bindingWindowSource === 'poll'
-  return {
+  const merged = {
     ...existing,
     ...incoming,
     five_hour: mergeHeaderOwnedWindow(existing, incoming, 'five_hour'),
     seven_day: mergeHeaderOwnedWindow(existing, incoming, 'seven_day'),
     scoped: mergeHeaderScopedQuota(existing, incoming),
     extraUsage: existing.extraUsage ?? incoming.extraUsage,
+    fallbackAdvised:
+      incoming.fieldSources?.fallbackAdvised !== undefined
+        ? incoming.fallbackAdvised
+        : (existing.fallbackAdvised ?? incoming.fallbackAdvised),
     bindingWindow: preservePollBinding
       ? existing.bindingWindow
       : (incoming.bindingWindow ?? existing.bindingWindow),
@@ -1146,6 +1231,11 @@ export function mergeHeaderQuotaForPersistence(
       ? 'poll'
       : (incoming.bindingWindowSource ?? existing.bindingWindowSource),
   } satisfies OAuthQuotaSnapshot
+  const fieldSources = fieldSourcesForMergedQuota(existing, incoming, merged)
+  return {
+    ...merged,
+    ...(fieldSources && { fieldSources }),
+  }
 }
 
 /** Returns the latest timestamp carried by a quota snapshot. */
@@ -3320,7 +3410,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   const checkedAt = input.now?.() ?? Date.now()
   const usage = (await response.json()) as OAuthUsageResponse
   const bindingWindow = mapBindingWindow(usage.limits)
-  return {
+  const snapshot = {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),
     seven_day: mapUsageWindow(usage.seven_day, checkedAt),
     scoped: mapScopedWeeklyLimits(usage.limits, checkedAt),
@@ -3332,6 +3422,17 @@ export async function fetchOAuthQuotaSnapshot(input: {
     source: 'poll',
     checkedAt,
   } satisfies OAuthQuotaSnapshot
+  const fieldSources: QuotaFieldSources = {
+    ...(snapshot.five_hour && { five_hour: 'poll' }),
+    ...(snapshot.seven_day && { seven_day: 'poll' }),
+    ...(snapshot.scoped && { scoped: 'poll' }),
+    ...(snapshot.extraUsage && { extraUsage: 'poll' }),
+    ...(snapshot.bindingWindow && { bindingWindow: 'poll' }),
+  }
+  return {
+    ...snapshot,
+    ...(Object.keys(fieldSources).length > 0 && { fieldSources }),
+  }
 }
 
 function updateStoredAccount(

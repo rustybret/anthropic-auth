@@ -1,8 +1,10 @@
 import type {
   AccountQuotaWindow,
   OAuthQuotaSnapshot,
+  QuotaFieldSources,
   QuotaWindowName,
 } from './accounts.ts'
+import { QUOTA_FIELD_NAMES, quotaFieldSource } from './accounts.ts'
 
 const PREFIX = 'anthropic-ratelimit-unified-'
 const WINDOW_KEYS: Record<string, QuotaWindowName> = {
@@ -55,21 +57,31 @@ export function normalizeQuotaHeaders(
   headers: Headers,
   now = Date.now(),
 ): OAuthQuotaSnapshot {
+  const fieldSources: QuotaFieldSources = {}
+  const fallbackHeader = headers.get(`${PREFIX}fallback`)
   const snapshot: OAuthQuotaSnapshot = {
-    fallbackAdvised: headers.get(`${PREFIX}fallback`) === 'available',
+    fallbackAdvised: fallbackHeader === 'available',
     source: 'headers',
     checkedAt: now,
   }
   for (const [suffix, key] of Object.entries(WINDOW_KEYS)) {
     const window = normalizeWindow(headers, suffix, now)
-    if (window) snapshot[key] = window
+    if (window) {
+      snapshot[key] = window
+      fieldSources[key] = 'headers'
+    }
   }
   const representativeClaim = headers.get(`${PREFIX}representative-claim`)
   if (representativeClaim) {
     snapshot.bindingWindow = representativeClaim
     snapshot.bindingWindowSource = 'headers'
+    fieldSources.bindingWindow = 'headers'
   }
-  return snapshot
+  if (fallbackHeader !== null) fieldSources.fallbackAdvised = 'headers'
+  return {
+    ...snapshot,
+    fieldSources,
+  }
 }
 
 export function mergeHeaderQuotaSnapshot(
@@ -79,19 +91,64 @@ export function mergeHeaderQuotaSnapshot(
   const {
     scoped: existingScoped,
     extraUsage: existingExtraUsage,
+    fieldSources: existingFieldSources,
     ...existingWithoutPollOwnedFields
   } = existing ?? {}
   const {
     scoped: _incomingScoped,
     extraUsage: _incomingExtraUsage,
+    fieldSources: incomingFieldSources,
     ...incomingWithoutPollOwnedFields
   } = incoming
+
+  const fieldSources: QuotaFieldSources = {}
+  for (const field of QUOTA_FIELD_NAMES) {
+    const value =
+      field === 'scoped'
+        ? existingScoped
+        : field === 'extraUsage'
+          ? existingExtraUsage
+          : field === 'fallbackAdvised'
+            ? incomingFieldSources?.fallbackAdvised !== undefined
+              ? incoming.fallbackAdvised
+              : (existing?.fallbackAdvised ?? incoming.fallbackAdvised)
+            : field === 'bindingWindow'
+              ? existing?.bindingWindowSource === 'poll'
+                ? existing?.bindingWindow
+                : (incoming.bindingWindow ?? existing?.bindingWindow)
+              : (incoming[field] ?? existing?.[field])
+    if (value === undefined) continue
+    const source =
+      field === 'fallbackAdvised'
+        ? (incomingFieldSources?.fallbackAdvised ??
+          (existing?.fallbackAdvised !== undefined
+            ? existingFieldSources
+              ? existingFieldSources.fallbackAdvised
+              : quotaFieldSource(existing, field)
+            : undefined))
+        : (field === 'scoped' || field === 'extraUsage') && value !== undefined
+          ? 'poll'
+          : field === 'bindingWindow' &&
+              existing?.bindingWindowSource === 'poll' &&
+              existing.bindingWindow !== undefined
+            ? 'poll'
+            : incoming[field] !== undefined
+              ? (incomingFieldSources?.[field] ??
+                quotaFieldSource(incoming, field))
+              : (existingFieldSources?.[field] ??
+                quotaFieldSource(existing, field))
+    if (source) fieldSources[field] = source
+  }
 
   return {
     ...existingWithoutPollOwnedFields,
     ...incomingWithoutPollOwnedFields,
     ...(Array.isArray(existingScoped) && { scoped: existingScoped }),
     ...(existingExtraUsage != null && { extraUsage: existingExtraUsage }),
+    fallbackAdvised:
+      incomingFieldSources?.fallbackAdvised !== undefined
+        ? incoming.fallbackAdvised
+        : (existing?.fallbackAdvised ?? incoming.fallbackAdvised),
     bindingWindow:
       existing?.bindingWindowSource === 'poll'
         ? existing.bindingWindow
@@ -100,7 +157,8 @@ export function mergeHeaderQuotaSnapshot(
       existing?.bindingWindowSource === 'poll'
         ? 'poll'
         : (incoming.bindingWindowSource ?? existing?.bindingWindowSource),
-    // Source tracks 5h/7d freshness; preserved scoped and credit fields remain poll-owned.
+    ...(Object.keys(fieldSources).length > 0 && { fieldSources }),
+    // Top-level source remains headers for compatibility; fieldSources records ownership after partial harvests.
     source: 'headers',
   }
 }
