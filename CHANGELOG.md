@@ -2,25 +2,40 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 1.22.0
+
+### Minor Changes
+
+- Add Claude Fable 5.1 and limited-access Mythos 5.1 across the shared model catalogue, OpenCode request/routing/recovery paths, and Pi provider catalogue.
+- Preserve OAuth Fable 5.1 prompt-cache prefixes across mid-conversation effort changes in OpenCode and Pi, and expose explicit `account-default`, `error`, or `drop_block` thinking-prefix mismatch behavior in sidecar config.
+- Add opt-in OpenCode Claustrum custody for fallback OAuth credentials, with vault-owned refresh, cache-only request-path reads, version-fenced 401 reporting, sidecar failover, and custody status in account UI.
+
+### Patch Changes
+
+- Preserve OpenCode Fable 5.1 effort transitions when host lowering collapses tool-heavy or compacted assistant records, and keep marker correlation stable when later message transforms tag or persist the same user parts.
+- Treat DNS lookup failures as transient OAuth refresh failures with a fixed five-minute retry interval—including already-persisted long backoffs—and keep sticky-balanced fallback routes usable while their current access token remains valid.
+- Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking in OpenCode or Pi.
+- Reject provider-bound Claustrum custody tombstones locally before OAuth refresh without persisting a permanent auth failure, and ensure shutdown closes any replacement transport that finishes connecting after the Claustrum client is closed.
+- Redact malformed JSON parser context before account sidecar and request-dump errors reach logs, preventing secrets from being repeated in diagnostic text while retaining path, line, and column metadata.
+- Bind persisted OAuth refresh backoffs to the refresh-token fingerprint in OpenCode and Pi. Rotated credentials immediately escape stale `invalid_grant` latches, cross-process clears are fenced against stale writers, Claustrum outage fallback uses the same lineage check, and `/claude-account reset-backoff` explicitly clears main refresh and matching quota backoffs.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing Fable/Mythos 5.1 support, Claude Code identity compatibility, Claustrum fallback custody and tombstone guards, parser-error redaction, and refresh-latch recovery.
+
+## 1.21.0
 
 ### Minor Changes
 
 - Keep quota, profile, refresh-backoff, Prime-lineage, and routing state attached to stable Claude account identities across OAuth token rotation, while treating unknown identity or quota as distinct from an absent account.
 - Add an opt-in OpenCode host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
-- Add Claude Fable 5.1 and limited-access Mythos 5.1 across the shared model catalogue, OpenCode request/routing/recovery paths, and Pi provider catalogue.
-- Preserve OAuth Fable 5.1 prompt-cache prefixes across mid-conversation effort changes in OpenCode and Pi, and expose explicit `account-default`, `error`, or `drop_block` thinking-prefix mismatch behavior in sidecar config.
 
 ### Patch Changes
 
 - Coalesce main OAuth refreshes across OpenCode project plugin instances and let sticky 401 recovery adopt a concurrently rotated valid credential instead of refreshing it again.
-- Treat DNS lookup failures as transient OAuth refresh failures with a fixed five-minute retry interval—including already-persisted long backoffs—and keep sticky-balanced fallback routes usable while their current access token remains valid.
 - Prevent Pi from replaying foreign thinking signatures to Anthropic while preserving visible reasoning as text, and round-trip Anthropic `redacted_thinking` blocks for valid same-model continuation.
 - Keep the OpenCode plugin entrypoint limited to the plugin factory so the host cannot invoke internal request-policy helpers as plugins.
 - Update OpenTUI Core and Solid together to 0.5.7 and `@tsconfig/bun` to 1.0.11.
-- Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking in OpenCode or Pi.
 
-Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity, the host-local quota feed, Fable/Mythos 5.1 support, and Claude Code identity compatibility.
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity and the host-local quota feed.
 
 ## 1.20.0
 

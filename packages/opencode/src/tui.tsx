@@ -313,13 +313,24 @@ function AccountBlock(props: {
   active: boolean
   pacingEnabled: boolean
   needsReauth?: boolean
+  vaultReauth?: boolean
   tierLabel?: string
   marginTop?: number
 }) {
   const statusWord = () =>
-    props.needsReauth ? 're-login' : props.active ? 'active' : 'idle'
+    props.needsReauth
+      ? 're-login'
+      : props.vaultReauth
+        ? 'vault reauth'
+        : props.active
+          ? 'active'
+          : 'idle'
   const statusTone = (): Tone =>
-    props.needsReauth ? 'err' : props.active ? 'ok' : 'muted'
+    props.needsReauth || props.vaultReauth
+      ? 'warn'
+      : props.active
+        ? 'ok'
+        : 'muted'
   const pacingFor = (
     window:
       | { usedPercent: number; remainingPercent: number; resetsAt?: string }
@@ -638,7 +649,9 @@ function QuotaSidebar(props: {
   const quotaBackedOff = () => state().main?.quotaBackedOff === true
   const refreshBackedOff = () => state().main?.refreshBackedOff === true
   const needsReauth = () => enabledFallbacks().some((f) => f.needsReauth)
-  const degraded = () => quotaBackedOff() || refreshBackedOff() || needsReauth()
+  const vaultReauth = () => enabledFallbacks().some((f) => f.vaultReauth)
+  const degraded = () =>
+    quotaBackedOff() || refreshBackedOff() || needsReauth() || vaultReauth()
 
   const fableRecoverySummary = () =>
     getFableRecoverySummary(state(), props.sessionId)
@@ -773,6 +786,7 @@ function QuotaSidebar(props: {
                     pacingEnabled={prefs().sections.pacing}
                     tierLabel={fb.tierLabel}
                     needsReauth={fb.needsReauth}
+                    vaultReauth={fb.vaultReauth}
                     marginTop={1}
                   />
                 )}

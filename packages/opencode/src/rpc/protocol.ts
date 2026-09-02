@@ -14,6 +14,23 @@ export const COMMAND_MODAL_NAMES = [
 
 export type CommandModalName = (typeof COMMAND_MODAL_NAMES)[number]
 
+export interface AccountDialogAccount {
+  id: string
+  label: string
+  role: string
+  enabled: boolean
+  quotaPercent: number | null
+  tierLabel?: string
+  claustrumGate: 'on' | 'off' | 'na'
+  vaultServed: boolean
+}
+
+export interface AccountDialogKnobs {
+  accounts: AccountDialogAccount[]
+  claustrumDetection: string
+  [key: string]: unknown
+}
+
 export interface OpenDialogPayload {
   command: CommandModalName
   text: string

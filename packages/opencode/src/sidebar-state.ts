@@ -34,6 +34,8 @@ export interface SidebarAccountState {
   // True when the account's refresh token is permanently dead (400
   // invalid_grant) and it needs a re-login — distinct from a transient backoff.
   needsReauth: boolean
+  // True when the vault copy needs re-importing while the sidecar remains usable.
+  vaultReauth?: boolean
   tierLabel?: string
 }
 
@@ -335,6 +337,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
+          ...(entry.vaultReauth === true && { vaultReauth: true }),
           tierLabel:
             typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
               ? entry.tierLabel.trim()
@@ -715,6 +718,8 @@ export async function setSidebarState(
               lastUpdated: Math.max(current.lastUpdated, state.lastUpdated),
             }
           }
+          // The state file is a cross-process artifact; future account fields must fail closed.
+          stateToWrite = normalizeSidebarState(stateToWrite)
           result = await writeSidebarStateAtomic(
             stateFile,
             stateToWrite,

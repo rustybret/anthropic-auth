@@ -2,4 +2,6 @@ pre-commit:
   commands:
     biome:
       glob: "*.{ts,js,json}"
-      run: bunx biome check {staged_files}
+      # --no-errors-on-unmatched: a commit touching only biome-ignored paths
+      # (e.g. the byte-pinned claustrum golden fixtures) must not fail the hook.
+      run: bunx biome check --no-errors-on-unmatched {staged_files}

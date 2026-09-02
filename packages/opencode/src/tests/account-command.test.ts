@@ -312,6 +312,10 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('Disabled account')
     expect(result.text).toContain('42%')
     expect(result.text).toContain('(disabled)')
+    expect(result.text).toContain(
+      '**OpenCode anthropic** [main] 42% · gate n/a (OpenCode managed)',
+    )
+    expect(result.text).toContain('**Work account** [fallback] · gate off')
   })
 
   test('usage returns usage text', () => {

@@ -128,7 +128,7 @@ describe('QuotaManager', () => {
             five_hour: {
               usedPercent: 0,
               remainingPercent: 100,
-              checkedAt: now,
+              checkedAt: now - 2_000,
             },
             seven_day: {
               usedPercent: 0,
@@ -266,6 +266,52 @@ describe('QuotaManager', () => {
       )
       expect(fetched.fetched).toBe(true)
       expect(fetchCalls).toBe(2)
+    })
+
+    test('seeds an active persisted fallback 429 backoff before polling', async () => {
+      const fetchMock = mock(() => {
+        throw new Error('persisted fallback backoff must prevent a quota poll')
+      }) as unknown as typeof fetch
+      const qm = new QuotaManager({
+        storage: {
+          quota: { checkIntervalMinutes: 5 },
+        } as AccountStorage,
+        fetchImpl: fetchMock,
+        now: () => now,
+      })
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback-persisted-backoff',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'fallback-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now - 2_000,
+            },
+          },
+          lastQuotaRefreshError: {
+            message: 'Claude quota check failed: 429 — rate limited',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+            accountIdentity: 'fallback-persisted-backoff',
+          },
+        },
+      ])
+
+      expect(qm.isFallbackBackedOff('fallback-persisted-backoff')).toBe(true)
+      await expect(
+        qm.refreshFallbackWithMetadata(
+          'fallback-persisted-backoff',
+          'fallback-token',
+          undefined,
+        ),
+      ).resolves.toMatchObject({ fetched: false })
+      expect(fetchMock).not.toHaveBeenCalled()
     })
 
     test('main refresh metadata also distinguishes cached backoff from a network fetch', async () => {

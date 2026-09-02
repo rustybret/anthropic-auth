@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/anthropic-auth-core",
-  "version": "1.21.3",
+  "version": "1.22.0",
   "type": "module",
   "repository": {
     "type": "git",
@@ -27,6 +27,7 @@
     "types": "tsc"
   },
   "dependencies": {
+    "@cortexkit/subc-client": "^0.8.1",
     "xxhash-wasm": "^1.1.0"
   }
 }

@@ -209,6 +209,49 @@ describe('claude-account persistence', () => {
     expect(storage.accounts[0].enabled).toBe(true)
   })
 
+  test('reset-backoff clears and persists main refresh and quota errors', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        mainAccountId: 'main-account-id',
+        refresh: {
+          mainLastRefreshError: {
+            message: 'invalid_grant',
+            checkedAt: 1,
+            nextRetryAt: 2,
+            accountIdentity: 'main-account-id',
+            permanent: true,
+          },
+        },
+        quota: {
+          mainLastQuotaApiError: {
+            message: 'quota unavailable',
+            checkedAt: 1,
+            nextRetryAt: 2,
+            accountIdentity: 'main-account-id',
+          },
+        },
+        accounts: [],
+      }),
+      'utf8',
+    )
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-account')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('reset-backoff', ctx)
+
+    expect(notified[0]).toContain(
+      'Main OAuth refresh and quota backoff cleared.',
+    )
+    const state = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(state.main.lastRefreshError).toBeUndefined()
+    expect(state.main.lastQuotaApiError).toBeUndefined()
+  })
+
   test('status is display-only (no mutation)', async () => {
     const original = {
       version: 1,

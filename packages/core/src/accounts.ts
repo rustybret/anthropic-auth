@@ -4,14 +4,17 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
+import { CustodyTombstoneRefreshError } from './claustrum.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
   CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
+import { parseJsonRedacted } from './json.ts'
 import { type LogLevel, log, logger } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -47,6 +50,7 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
+  claustrumHandle?: string
   access?: string
   refresh: string
   expires?: number
@@ -70,6 +74,14 @@ export type ApiKeyAccount = AccountBase & {
 }
 
 export type FallbackAccount = OAuthAccount | ApiKeyAccount
+
+export type ClaustrumAccountGate = {
+  enabled?: boolean
+}
+
+export type ClaustrumConfig = {
+  accounts?: Record<string, ClaustrumAccountGate>
+}
 
 export function isOAuthAccount(
   account: FallbackAccount,
@@ -105,6 +117,8 @@ export type AccountOperationError = {
   retryCount?: number
   accountIdentity?: string
   tokenHash?: string
+  /** Fingerprint of the refresh token that produced this error. */
+  refreshTokenFingerprint?: string
   /**
    * HTTP status of the underlying refresh/quota failure, when known. Lets
    * consumers distinguish a permanently-dead token (400 invalid_grant →
@@ -235,6 +249,7 @@ export type AccountStorage = {
     intervalMinutes?: number
     refreshBeforeExpiryMinutes?: number
     mainLastRefreshError?: AccountOperationError
+    mainRefreshErrorClearedAt?: number
     mainRefreshLeaseId?: string
     mainRefreshLeaseUntil?: number
     mainRefreshLeaseTokenHash?: string
@@ -308,6 +323,7 @@ export type AccountStorage = {
     fallbackToDirect?: boolean
     transport?: 'http' | 'websocket'
   }
+  claustrum?: ClaustrumConfig
   killswitch?: KillswitchConfig
   accounts: FallbackAccount[]
 }
@@ -328,6 +344,7 @@ export type AccountRuntimeEntry = Partial<
     OAuthAccount,
     | 'access'
     | 'authLineageId'
+    | 'claustrumHandle'
     | 'refresh'
     | 'expires'
     | 'lastUsed'
@@ -353,6 +370,7 @@ export type AccountRuntimeState = {
     quotaErrorGeneration?: number
     quotaErrorClearedAt?: number
     lastRefreshError?: AccountOperationError
+    refreshErrorClearedAt?: number
     refreshLeaseId?: string
     refreshLeaseUntil?: number
     refreshLeaseTokenHash?: string
@@ -416,6 +434,19 @@ export type AccountManagerOptions = {
   fetchImpl?: typeof fetch
   configPath?: string
   quotaManager?: import('./quota-manager.ts').QuotaManager
+  isFallbackAccountVaultServed?: (
+    accountId: string,
+    storage: AccountStorage,
+  ) => boolean
+  isFallbackAccountVaultEnabled?: (
+    accountId: string,
+    storage: AccountStorage,
+  ) => boolean
+  resolveFallbackAccessToken?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => { token: string; source: 'vault' | 'sidecar' } | undefined
+  onBackgroundRefresh?: (initial?: boolean) => Promise<void> | void
   // Invoked after a background quota pass persists at least one fallback storage
   // change (token refresh, quota update, or error recording), so consumers
   // (e.g. the OpenCode sidebar) can re-render without a request flowing through
@@ -446,7 +477,7 @@ const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
   seven_day: 0,
 }
 const DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA = true
-const BACKGROUND_TICK_MS = 60_000
+export const FALLBACK_BACKGROUND_TICK_MS = 60_000
 const BACKGROUND_TICK_JITTER_MS = 60_000
 const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
 const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
@@ -522,6 +553,10 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
       typeof value.authLineageId === 'string' && value.authLineageId.trim()
         ? value.authLineageId
         : undefined,
+    claustrumHandle:
+      typeof value.claustrumHandle === 'string' && value.claustrumHandle.trim()
+        ? value.claustrumHandle.trim()
+        : undefined,
     access: typeof value.access === 'string' ? value.access : undefined,
     refresh: value.refresh,
     expires: typeof value.expires === 'number' ? value.expires : undefined,
@@ -587,6 +622,11 @@ function normalizeOperationError(
         : undefined,
     tokenHash:
       typeof value.tokenHash === 'string' ? value.tokenHash : undefined,
+    refreshTokenFingerprint:
+      typeof value.refreshTokenFingerprint === 'string' &&
+      value.refreshTokenFingerprint.trim()
+        ? value.refreshTokenFingerprint.trim()
+        : undefined,
     // Preserve the dead-token discriminators across save/load. Without these,
     // a retry-exhausted transient (permanent=false, 24h backoff) would lose its
     // flag on reload and the 24h-delay heuristic would wrongly re-classify it
@@ -812,6 +852,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
+    claustrum: normalizeClaustrumConfig(value.claustrum),
     logging: isRecord(value.logging) ? value.logging : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     prime: (() => {
@@ -853,12 +894,35 @@ function normalizeStorage(value: unknown): AccountStorage | null {
   }
 }
 
+function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
+  if (!isRecord(value) || !isRecord(value.accounts)) return undefined
+  const accounts = Object.fromEntries(
+    Object.entries(value.accounts).flatMap(([id, entry]) => {
+      if (!isRecord(entry)) return []
+      return [
+        [
+          id,
+          {
+            ...(typeof entry.enabled === 'boolean' && {
+              enabled: entry.enabled,
+            }),
+          },
+        ],
+      ]
+    }),
+  )
+  return Object.keys(accounts).length > 0 ? { accounts } : undefined
+}
+
 async function readJsonIfPresent(path: string): Promise<{
   exists: boolean
   value: unknown
 }> {
   try {
-    return { exists: true, value: JSON.parse(await readFile(path, 'utf8')) }
+    return {
+      exists: true,
+      value: parseJsonRedacted(await readFile(path, 'utf8')),
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { exists: false, value: null }
@@ -882,6 +946,15 @@ function numericField(value: unknown): number {
 
 // A clear is a monotonic tombstone; older or absent writes must not reopen backoff.
 export function mergeMainQuotaErrorClearedAt(
+  existing: number | undefined,
+  incoming: number | undefined,
+): number | undefined {
+  if (incoming === undefined || !Number.isFinite(incoming)) return existing
+  if (existing === undefined || !Number.isFinite(existing)) return incoming
+  return Math.max(existing, incoming)
+}
+
+export function mergeMainRefreshErrorClearedAt(
   existing: number | undefined,
   incoming: number | undefined,
 ): number | undefined {
@@ -977,6 +1050,12 @@ function mergeConfigAndState(
     mainState.quotaErrorClearedAt >= 0
       ? mainState.quotaErrorClearedAt
       : undefined
+  const mainRefreshErrorClearedAt =
+    typeof mainState?.refreshErrorClearedAt === 'number' &&
+    Number.isFinite(mainState.refreshErrorClearedAt) &&
+    mainState.refreshErrorClearedAt >= 0
+      ? mainState.refreshErrorClearedAt
+      : undefined
   const configQuotaError = quotaConfig.mainLastQuotaApiError
   const mainLastQuotaApiError =
     mainState?.lastQuotaApiError ??
@@ -986,6 +1065,15 @@ function mergeConfigAndState(
     configQuotaError.checkedAt <= mainQuotaErrorClearedAt
       ? undefined
       : configQuotaError)
+  const configRefreshError = refreshConfig.mainLastRefreshError
+  const mainLastRefreshError =
+    mainState?.lastRefreshError ??
+    (mainRefreshErrorClearedAt !== undefined &&
+    isRecord(configRefreshError) &&
+    typeof configRefreshError.checkedAt === 'number' &&
+    configRefreshError.checkedAt <= mainRefreshErrorClearedAt
+      ? undefined
+      : configRefreshError)
 
   const accounts = Array.isArray(configValue.accounts)
     ? configValue.accounts.map((account) => {
@@ -1010,7 +1098,8 @@ function mergeConfigAndState(
     },
     refresh: objectWithDefinedEntries({
       ...refreshConfig,
-      mainLastRefreshError: mainRefreshSource.lastRefreshError,
+      mainLastRefreshError,
+      mainRefreshErrorClearedAt: mainRefreshSource.refreshErrorClearedAt,
       mainRefreshLeaseId: mainRefreshSource.refreshLeaseId,
       mainRefreshLeaseUntil: mainRefreshSource.refreshLeaseUntil,
       mainRefreshLeaseTokenHash: mainRefreshSource.refreshLeaseTokenHash,
@@ -1109,6 +1198,7 @@ function accountRuntimeState(account: FallbackAccount) {
   }
   return objectWithDefinedEntries({
     authLineageId: account.authLineageId,
+    claustrumHandle: account.claustrumHandle,
     access: account.access,
     refresh: account.refresh,
     expires: account.expires,
@@ -1294,6 +1384,20 @@ function mergeAccountRuntimeState(
           ),
         }
       : incoming
+  const preferredRefreshError = (() => {
+    const existingError = existingEntry.lastRefreshError
+    const incomingError = effectiveIncoming.lastRefreshError
+    if (!existingError) return incomingError
+    if (incomingError) {
+      return incomingError.checkedAt >= existingError.checkedAt
+        ? incomingError
+        : existingError
+    }
+    return (effectiveIncoming.lastRefreshedAt ?? 0) >
+      (existingEntry.lastRefreshedAt ?? 0)
+      ? undefined
+      : existingError
+  })()
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(effectiveIncoming.quota)
   const existingQuotaWinsEqualTimestamp = Boolean(
@@ -1335,9 +1439,7 @@ function mergeAccountRuntimeState(
       if (!('lastQuotaRefreshError' in effectiveIncoming)) {
         delete merged.lastQuotaRefreshError
       }
-      if (!('lastRefreshError' in effectiveIncoming)) {
-        delete merged.lastRefreshError
-      }
+      merged.lastRefreshError = preferredRefreshError
       return merged
     }
 
@@ -1345,6 +1447,7 @@ function mergeAccountRuntimeState(
       ...merged,
       quota: existingEntry.quota,
       lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
+      lastRefreshError: preferredRefreshError,
     }
   }
   const merged: AccountRuntimeEntry = {
@@ -1358,9 +1461,7 @@ function mergeAccountRuntimeState(
   if (!('lastQuotaRefreshError' in effectiveIncoming)) {
     delete merged.lastQuotaRefreshError
   }
-  if (!('lastRefreshError' in effectiveIncoming)) {
-    delete merged.lastRefreshError
-  }
+  merged.lastRefreshError = preferredRefreshError
   return merged
 }
 
@@ -1400,6 +1501,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     costZeroing: storage.costZeroing,
     cacheKeep: storage.cacheKeep,
     relay: storage.relay,
+    claustrum: storage.claustrum,
     killswitch: storage.killswitch,
     prime: (() => {
       // Config side carries ONLY the `enabled` flag — runtime counters and
@@ -1411,6 +1513,13 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     })(),
     accounts: storage.accounts.map(accountConfig),
   })
+}
+
+export function isClaustrumEnabledForAccount(
+  storage: AccountStorage,
+  accountId: string,
+): boolean {
+  return storage.claustrum?.accounts?.[accountId]?.enabled === true
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,7 +1799,12 @@ function applyMainQuotaStatePatch(
     ) {
       state.main.quotaErrorGeneration = incomingGeneration
     }
-  } else if (incomingError) {
+  } else if (
+    incomingError &&
+    typeof incomingError.checkedAt === 'number' &&
+    Number.isFinite(incomingError.checkedAt) &&
+    incomingError.checkedAt > existingObservedAt
+  ) {
     const acceptsByObservation =
       incomingErrorObservedAt !== undefined &&
       incomingErrorObservedAt > existingObservedAt
@@ -1765,7 +1879,32 @@ function applyMainRefreshStatePatch(
   storage: AccountStorage,
 ) {
   state.main = state.main ?? {}
-  state.main.lastRefreshError = storage.refresh?.mainLastRefreshError
+  const incomingError = storage.refresh?.mainLastRefreshError
+  const incomingClearedAt = storage.refresh?.mainRefreshErrorClearedAt
+  const existingErrorObservedAt = state.main.lastRefreshError?.checkedAt
+  const existingClearedAt = state.main.refreshErrorClearedAt
+  const existingObservedAt = Math.max(
+    existingErrorObservedAt ?? 0,
+    existingClearedAt ?? 0,
+  )
+  if (
+    incomingError === undefined &&
+    incomingClearedAt !== undefined &&
+    incomingClearedAt >= existingObservedAt
+  ) {
+    state.main.lastRefreshError = undefined
+    state.main.refreshErrorClearedAt = mergeMainRefreshErrorClearedAt(
+      existingClearedAt,
+      incomingClearedAt,
+    )
+  } else if (
+    incomingError &&
+    typeof incomingError.checkedAt === 'number' &&
+    Number.isFinite(incomingError.checkedAt) &&
+    incomingError.checkedAt > existingObservedAt
+  ) {
+    state.main.lastRefreshError = incomingError
+  }
   state.main.refreshLeaseId = storage.refresh?.mainRefreshLeaseId
   state.main.refreshLeaseUntil = storage.refresh?.mainRefreshLeaseUntil
   state.main.refreshLeaseTokenHash = storage.refresh?.mainRefreshLeaseTokenHash
@@ -1945,6 +2084,52 @@ export function saveOAuthProfileState(
         }
 
         await writeJsonAtomic(statePath, pruneUndefined(next))
+        return true
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
+}
+
+export function clearClaustrumRefreshErrorPersistent(
+  accountId: string,
+  handle: string,
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        // Re-read under both locks so this field-scoped clear cannot write a stale credential or config snapshot.
+        const storage = await loadAccounts(path)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId && isOAuthAccount(candidate),
+        )
+        if (
+          !storage ||
+          !account ||
+          account.claustrumHandle !== handle ||
+          !isClaustrumEnabledForAccount(storage, accountId) ||
+          !account.lastRefreshError
+        ) {
+          return false
+        }
+        account.lastRefreshError = undefined
+        await saveAccountStateUnlocked(storage, path, { accounts: [accountId] })
+        const statePath = getAccountStatePath(path)
+        const state = (await readJsonIfPresent(statePath)).value
+        if (isRecord(state) && isRecord(state.accounts)) {
+          const entry = state.accounts[accountId]
+          if (isRecord(entry)) {
+            delete entry.lastRefreshError
+            await writeJsonAtomic(statePath, pruneUndefined(state))
+          }
+        }
         return true
       } finally {
         await stateLock.release()
@@ -2623,6 +2808,10 @@ function refreshBeforeExpiryMs(storage: AccountStorage | null) {
   return Math.max(MIN_REFRESH_BEFORE_EXPIRY_MINUTES, minutes) * 60_000
 }
 
+export function getRefreshBeforeExpiryMs(storage: AccountStorage | null) {
+  return refreshBeforeExpiryMs(storage)
+}
+
 export function getRefreshIntervalMs(storage: AccountStorage | null) {
   const minutes =
     storage?.refresh?.intervalMinutes ?? DEFAULT_REFRESH_INTERVAL_MINUTES
@@ -2645,10 +2834,12 @@ export function buildRefreshOperationError(input: {
   error: unknown
   now: number
   accountIdentity: string | undefined
+  refreshTokenFingerprint?: string
   previous?: AccountOperationError
 }): AccountOperationError {
   const previousRetryCount =
-    input.previous?.accountIdentity === input.accountIdentity
+    input.previous?.accountIdentity === input.accountIdentity &&
+    input.previous?.refreshTokenFingerprint === input.refreshTokenFingerprint
       ? (input.previous?.retryCount ?? 0)
       : 0
   const retryCount = previousRetryCount + 1
@@ -2692,6 +2883,7 @@ export function buildRefreshOperationError(input: {
     nextRetryAt: input.now + delay,
     retryCount,
     accountIdentity: input.accountIdentity,
+    refreshTokenFingerprint: input.refreshTokenFingerprint,
     status,
     permanent: status === 400 && isInvalidGrant,
   }
@@ -2743,10 +2935,18 @@ export function refreshBackoffActive(
   error: AccountOperationError | undefined,
   accountIdentity: string | undefined,
   now: number,
+  currentRefreshTokenFingerprint: string | undefined,
 ) {
   if (!error) return false
   const retryAt = effectiveRefreshRetryAt(error)
   if (!retryAt || retryAt <= now) return false
+  if (
+    error.refreshTokenFingerprint &&
+    currentRefreshTokenFingerprint &&
+    error.refreshTokenFingerprint !== currentRefreshTokenFingerprint
+  ) {
+    return false
+  }
   if (!error.accountIdentity) return true
   if (!accountIdentity) return true
   return error.accountIdentity === accountIdentity
@@ -3576,6 +3776,7 @@ function recordRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (error instanceof CustodyTombstoneRefreshError) return
   const existing = existingRefreshBackoffError(error)
   if (existing) {
     account.lastRefreshError = existing
@@ -3585,6 +3786,7 @@ function recordRefreshError(
     error,
     now,
     accountIdentity: account.id,
+    refreshTokenFingerprint: tokenFingerprint(account.refresh),
     previous: account.lastRefreshError,
   })
 }
@@ -3594,6 +3796,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (error instanceof CustodyTombstoneRefreshError) return
   if (isQuotaPolicyAuthError(error) || existingRefreshBackoffError(error))
     return
   account.lastQuotaRefreshError = buildQuotaOperationError({
@@ -3621,6 +3824,21 @@ export class FallbackAccountManager {
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
+  private readonly isFallbackAccountVaultServed: (
+    accountId: string,
+    storage: AccountStorage,
+  ) => boolean
+  private readonly isFallbackAccountVaultEnabled: (
+    accountId: string,
+    storage: AccountStorage,
+  ) => boolean
+  private readonly resolveFallbackAccessToken: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => { token: string; source: 'vault' | 'sidecar' } | undefined
+  private readonly onBackgroundRefresh:
+    | ((initial?: boolean) => Promise<void> | void)
+    | undefined
   private readonly onFallbackStorageChanged: (() => void) | undefined
   private readonly setIntervalImpl: typeof globalThis.setInterval
   private readonly clearIntervalImpl: typeof globalThis.clearInterval
@@ -3630,6 +3848,23 @@ export class FallbackAccountManager {
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
+    this.isFallbackAccountVaultServed =
+      options.isFallbackAccountVaultServed ?? (() => false)
+    this.isFallbackAccountVaultEnabled =
+      options.isFallbackAccountVaultEnabled ?? (() => false)
+    this.resolveFallbackAccessToken =
+      options.resolveFallbackAccessToken ??
+      ((account) => {
+        if (
+          !account.access ||
+          account.expires === undefined ||
+          account.expires <= this.now()
+        ) {
+          return undefined
+        }
+        return { token: account.access, source: 'sidecar' }
+      })
+    this.onBackgroundRefresh = options.onBackgroundRefresh
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
     this.setIntervalImpl = options.setIntervalImpl ?? globalThis.setInterval
     this.clearIntervalImpl =
@@ -3673,15 +3908,17 @@ export class FallbackAccountManager {
   }
 
   startBackgroundRefresh() {
-    const run = async () => {
+    const run = async (initial = false) => {
+      await this.onBackgroundRefresh?.(initial)
       await this.refreshDueAccounts()
       await this.refreshQuotaForDueAccounts()
     }
-    const initialRun = run().catch(() => {})
+    const initialRun = run(true).catch(() => {})
     if (!this.refreshTimer) {
-      this.refreshTimer = this.setIntervalImpl(() => {
-        void run().catch(() => {})
-      }, BACKGROUND_TICK_MS + jitterMs(BACKGROUND_TICK_JITTER_MS))
+      this.refreshTimer = this.setIntervalImpl(
+        () => run().catch(() => {}),
+        FALLBACK_BACKGROUND_TICK_MS + jitterMs(BACKGROUND_TICK_JITTER_MS),
+      )
       if ('unref' in this.refreshTimer) this.refreshTimer.unref()
     }
     return initialRun
@@ -3708,11 +3945,28 @@ export class FallbackAccountManager {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       let next = account
       try {
-        if (tokenNeedsRefresh(next, storage, this.now())) {
+        if (
+          tokenNeedsRefresh(next, storage, this.now()) &&
+          (!this.isFallbackAccountVaultEnabled(next.id, storage) ||
+            next.expires === undefined ||
+            next.expires <= this.now()) &&
+          !this.isFallbackAccountVaultServed(next.id, storage)
+        ) {
+          if (this.isFallbackAccountVaultEnabled(next.id, storage)) {
+            logger.warn('refresh', 'custody override: local fallback refresh', {
+              accountId: next.id,
+              reason: 'vault credential unavailable',
+            })
+          }
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
-            refreshBackoffActive(refreshError, next.id, this.now())
+            refreshBackoffActive(
+              refreshError,
+              next.id,
+              this.now(),
+              tokenFingerprint(next.refresh),
+            )
           ) {
             throw createRefreshBackoffActiveError(refreshError, this.now())
           }
@@ -3736,8 +3990,9 @@ export class FallbackAccountManager {
           stale &&
           !quotaBackoffActive(next.lastQuotaRefreshError, this.now())
         ) {
-          next = (await this.refreshAccountQuota(next, storage)).account
-          changed = true
+          const result = await this.refreshAccountQuota(next, storage)
+          next = result.account
+          changed ||= result.changed
         }
         // Single source of truth: evaluate quota policy from the unified
         // QuotaManager cache (the same source as the staleness check above) so
@@ -3776,7 +4031,12 @@ export class FallbackAccountManager {
           }
         } else if (
           !failClosedOnUnknownQuota(storage) &&
-          !refreshBackoffActive(next.lastRefreshError, next.id, this.now()) &&
+          !refreshBackoffActive(
+            next.lastRefreshError,
+            next.id,
+            this.now(),
+            tokenFingerprint(next.refresh),
+          ) &&
           quotaSnapshotPassesModelScope(next.quota, options.modelId)
         ) {
           usable.push(next)
@@ -3828,9 +4088,19 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
-      if (!tokenNeedsRefresh(account, storage, this.now())) continue
       if (
-        refreshBackoffActive(account.lastRefreshError, account.id, this.now())
+        !tokenNeedsRefresh(account, storage, this.now()) ||
+        this.isFallbackAccountVaultEnabled(account.id, storage) ||
+        this.isFallbackAccountVaultServed(account.id, storage)
+      )
+        continue
+      if (
+        refreshBackoffActive(
+          account.lastRefreshError,
+          account.id,
+          this.now(),
+          tokenFingerprint(account.refresh),
+        )
       ) {
         // Backoff skips are steady-state while a fallback account is waiting for
         // its next retry. Logging every background tick from every OpenCode
@@ -3870,9 +4140,18 @@ export class FallbackAccountManager {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       let next = account
       try {
-        if (tokenNeedsRefresh(next, storage, this.now())) {
+        if (
+          tokenNeedsRefresh(next, storage, this.now()) &&
+          !this.isFallbackAccountVaultEnabled(next.id, storage) &&
+          !this.isFallbackAccountVaultServed(next.id, storage)
+        ) {
           if (
-            refreshBackoffActive(next.lastRefreshError, next.id, this.now())
+            refreshBackoffActive(
+              next.lastRefreshError,
+              next.id,
+              this.now(),
+              tokenFingerprint(next.refresh),
+            )
           ) {
             continue
           }
@@ -3889,8 +4168,8 @@ export class FallbackAccountManager {
           ? this.quotaManager.isFallbackStale(next.id, next.access)
           : quotaIsStale(next, storage, this.now())
         if (!stale) continue
-        await this.refreshAccountQuota(next, storage)
-        changed = true
+        const result = await this.refreshAccountQuota(next, storage)
+        changed ||= result.changed
       } catch (error) {
         recordQuotaRefreshError(account, error, this.now())
         updateStoredAccount(storage, account)
@@ -3914,11 +4193,20 @@ export class FallbackAccountManager {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       let next = account
       try {
-        if (tokenNeedsRefresh(next, storage, this.now())) {
+        if (
+          tokenNeedsRefresh(next, storage, this.now()) &&
+          !this.isFallbackAccountVaultServed(next.id, storage) &&
+          !this.isFallbackAccountVaultEnabled(next.id, storage)
+        ) {
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
-            refreshBackoffActive(refreshError, next.id, this.now())
+            refreshBackoffActive(
+              refreshError,
+              next.id,
+              this.now(),
+              tokenFingerprint(next.refresh),
+            )
           ) {
             throw createRefreshBackoffActiveError(refreshError, this.now())
           }
@@ -3936,8 +4224,8 @@ export class FallbackAccountManager {
           }
           continue
         }
-        await this.refreshAccountQuota(next, storage)
-        changed = true
+        const result = await this.refreshAccountQuota(next, storage)
+        changed ||= result.changed
       } catch (error) {
         recordQuotaRefreshError(account, error, this.now())
         updateStoredAccount(storage, account)
@@ -3955,8 +4243,9 @@ export class FallbackAccountManager {
   async refreshAccount(
     account: OAuthAccount,
     storage: AccountStorage,
-    options: { force?: boolean } = {},
+    options: { force?: boolean; persistError?: boolean } = {},
   ): Promise<OAuthAccount> {
+    if (this.isFallbackAccountVaultServed(account.id, storage)) return account
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
       const refreshed = await existing
@@ -3970,9 +4259,18 @@ export class FallbackAccountManager {
       },
     )
     this.refreshPromises.set(account.id, promise)
-    const refreshed = await promise
-    updateStoredAccount(storage, refreshed)
-    return refreshed
+    try {
+      const refreshed = await promise
+      updateStoredAccount(storage, refreshed)
+      return refreshed
+    } catch (error) {
+      if (options.persistError) {
+        recordRefreshError(account, error, this.now())
+        updateStoredAccount(storage, account)
+        await this.save(storage)
+      }
+      throw error
+    }
   }
 
   private async waitForConcurrentFallbackRefresh(
@@ -4015,7 +4313,12 @@ export class FallbackAccountManager {
       const refreshError = latestAccount.lastRefreshError
       if (
         refreshError &&
-        refreshBackoffActive(refreshError, latestAccount.id, this.now())
+        refreshBackoffActive(
+          refreshError,
+          latestAccount.id,
+          this.now(),
+          tokenFingerprint(latestAccount.refresh),
+        )
       ) {
         updateStoredAccount(storage, latestAccount)
         throw createRefreshBackoffActiveError(refreshError, this.now())
@@ -4118,9 +4421,28 @@ export class FallbackAccountManager {
   }
 
   async refreshAccountQuota(account: OAuthAccount, storage: AccountStorage) {
+    const initialQuotaState = JSON.stringify([
+      account.quota,
+      account.lastQuotaRefreshError,
+    ])
+    let changed = false
     let target = account
-    if (!target.access) {
-      throw new Error(`Fallback account ${account.id} has no access token`)
+    const vaultEnabled = this.isFallbackAccountVaultEnabled(target.id, storage)
+    let access = this.resolveFallbackAccessToken(target, storage)
+    if (!access && !vaultEnabled) {
+      target = await this.refreshAccount(account, storage, { force: true })
+      changed = true
+      access = this.resolveFallbackAccessToken(target, storage)
+    }
+    if (!access) {
+      log('[quota] fallback quota poll skipped: no usable credential', {
+        accountId: target.id,
+      })
+      return {
+        account: target,
+        fetched: false,
+        changed,
+      }
     }
     // Unify on the shared QuotaManager when present: it adds inflight
     // deduplication and 429 backoff gating around the same quota API. Fall back
@@ -4140,18 +4462,38 @@ export class FallbackAccountManager {
     const fetchStartedAt = this.now()
     let fetched = false
     try {
-      const result = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(access.token)
       target.quota = result.quota
       fetched = result.fetched
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (!message.includes('Claude quota check failed: 401')) throw error
+      if (
+        !message.includes('Claude quota check failed: 401') ||
+        vaultEnabled ||
+        access.source !== 'sidecar'
+      ) {
+        throw error
+      }
       target = await this.refreshAccount(account, storage, {
         force: true,
       })
-      if (!target.access) throw error
+      changed = true
+      access = this.resolveFallbackAccessToken(target, storage)
+      if (!access) {
+        log(
+          '[quota] fallback quota poll skipped after refresh: no usable credential',
+          {
+            accountId: target.id,
+          },
+        )
+        return {
+          account: target,
+          fetched: false,
+          changed,
+        }
+      }
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
-      const result = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(access.token)
       target.quota = result.quota
       fetched = result.fetched
     }
@@ -4168,18 +4510,19 @@ export class FallbackAccountManager {
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return { account: latestAccount, fetched: false }
+      return { account: latestAccount, fetched: false, changed: false }
     }
     if (
       latestStorage &&
-      latestAccount?.access === target.access &&
+      latestAccount &&
+      latestAccount.access === target.access &&
       latestAccount.quota &&
       quotaSnapshotCheckedAt(latestAccount.quota) >= fetchStartedAt &&
       quotaSnapshotIsFresh(latestAccount.quota, latestStorage, this.now())
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return { account: latestAccount, fetched }
+      return { account: latestAccount, fetched, changed: false }
     }
 
     target.lastQuotaRefreshError = undefined
@@ -4199,6 +4542,13 @@ export class FallbackAccountManager {
         target,
       )
     }
-    return { account: target, fetched }
+    return {
+      account: target,
+      fetched,
+      changed:
+        changed ||
+        JSON.stringify([target.quota, target.lastQuotaRefreshError]) !==
+          initialQuotaState,
+    }
   }
 }

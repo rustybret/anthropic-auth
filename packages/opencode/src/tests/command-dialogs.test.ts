@@ -42,12 +42,44 @@ describe('buildAccountDialogOption', () => {
         enabled: true,
         quotaPercent: 22,
         tierLabel: 'Team · Max 5x',
+        claustrumGate: 'on',
+        vaultServed: true,
       }),
     ).toEqual({
-      title: 'Work [fallback] 22%',
+      title: 'Work [fallback] 22% · gate on · vault served',
       value: 'work',
       description: 'Team · Max 5x',
     })
+  })
+
+  test('renders gate and vault markers without exposing credentials', () => {
+    const option = buildAccountDialogOption({
+      id: 'work',
+      label: 'Work',
+      role: 'fallback',
+      enabled: true,
+      quotaPercent: null,
+      claustrumGate: 'off',
+      vaultServed: false,
+    })
+    expect(option.title).toContain('gate off')
+    expect(option.title).toContain('vault cold')
+    expect(option.title).not.toContain('handle')
+  })
+
+  test('renders the main account gate placeholder as n/a', () => {
+    const option = buildAccountDialogOption({
+      id: 'main',
+      label: 'Main',
+      role: 'main',
+      enabled: true,
+      quotaPercent: null,
+      claustrumGate: 'na',
+      vaultServed: false,
+    })
+
+    expect(option.title).toContain('gate n/a')
+    expect(option.title).toContain('vault n/a')
   })
 })
 

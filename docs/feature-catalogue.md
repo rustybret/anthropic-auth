@@ -46,7 +46,7 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   `rewriteRequestBody()` pipeline: strip trailing assistant msgs and foreign thinking → opt eligible
   Fable 5/5.1 or Opus 5 OAuth calls into server-side safety fallback and restore boundary markers →
   normalize Fable/Mythos 5/5.1 thinking → preserve Fable 5.1 per-turn effort changes with cache-stable
-  empty system markers → conditionally attach configured Fable 5.1 thinking-prefix behavior for replayed
+  empty system markers recovered from request-correlated user-boundary markers that survive OpenCode host lowering and downstream transform persistence → conditionally attach configured Fable 5.1 thinking-prefix behavior for replayed
   signed/redacted blocks → inject the Claude Code 2.1.258 billing header with a session-pinned
   suffix → sanitize system prompt (remove OpenCode identity, prepend Claude Code identity;
   `sanitize-memo.ts` memoized + `prompt-context.ts`) → apply cache strategy → add fast mode → prefix tool
@@ -71,8 +71,13 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   `getUsableFallbackAccounts()` FILTERS (never ranks) by quota policy + killswitch + `enabled`.
   `core/sticky-routing.ts` persists hashed
   session assignments and allocates cold sessions by reset-normalized spendable quota headroom plus
-  weighted initial-prompt deficit. `shouldFallbackStatus()` = [401,403,429].
-  Ingestion is **CLI-only** (`upsertAccount` called only from `cli.ts` login/api routes).
+  weighted initial-prompt deficit. `shouldFallbackStatus()` = [401,403,429]. OpenCode can opt individual
+  fallback OAuth accounts into local Claustrum custody (`core/claustrum.ts`): periodic bounded vault reads
+  keep credentials resident while the request path only peeks, 401 invalidation is response-provenance and
+  record-version bound, transport failures retain sidecar failover, and capability handles never enter dumps,
+  logs, sidebar state, or RPC projections. Provider-bound main custody tombstones fail before OAuth refresh;
+  main-account vault serving is not implemented. Ingestion is **CLI-only** (`upsertAccount` called only from
+  `cli.ts` login/api routes).
 - **Coupling:** store mechanics, file lock, backoff, selection-as-filter, routing modes **[G]**;
   OAuth account shape + the request-time quota pull (Anthropic GET) **[A]**. Provider seam = 2 fns
   (token-refresh, quota-fetch) — see memory #387/#399.

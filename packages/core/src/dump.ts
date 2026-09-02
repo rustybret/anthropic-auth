@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
+import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
@@ -535,7 +536,7 @@ function diffSummary(previousBodyText: string | undefined, bodyText: string) {
 
 function parseBody(bodyText: string): Record<string, unknown> | null {
   try {
-    const parsed = JSON.parse(bodyText)
+    const parsed = parseJsonRedacted(bodyText) as Record<string, unknown> | null
     return parsed != null &&
       typeof parsed === 'object' &&
       !Array.isArray(parsed)

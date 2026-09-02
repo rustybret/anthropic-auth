@@ -1,3 +1,4 @@
+import { assertNotCustodyTombstone } from './claustrum.ts'
 import {
   AUTHORIZE_URLS,
   AXIOS_USER_AGENT,
@@ -72,6 +73,7 @@ export async function refreshClaudeOAuthToken(input: {
   timeoutMs?: number
   setTimeoutImpl?: typeof globalThis.setTimeout
 }): Promise<ClaudeOAuthRefreshResult> {
+  assertNotCustodyTombstone(input.refreshToken, 'anthropic')
   const fetchImpl = input.fetchImpl ?? fetch
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500

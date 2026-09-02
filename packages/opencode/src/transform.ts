@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
-  applyMidConversationOutputConfig,
   applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
@@ -23,7 +22,6 @@ import {
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
-  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
@@ -41,6 +39,10 @@ import {
   applyCacheDiagnosticsOptIn,
   CACHE_DIAGNOSTICS_BETA,
 } from './cache-diagnostics'
+import {
+  applyOpenCodeEffortMarkers,
+  EffortMarkerCorrelationError,
+} from './effort-history'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
@@ -1229,7 +1231,8 @@ export async function rewriteRequestBody(
     identity?: ClaudeCodeIdentity
     sessionId?: string
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
-    effortTransitions?: readonly MidConversationEffortTransition[]
+    midConversationEffortEnabled?: boolean
+    midConversationEffortPlan?: string
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1299,7 +1302,11 @@ export async function rewriteRequestBody(
       delete parsed.thinking
     }
 
-    applyMidConversationOutputConfig(parsed, options.effortTransitions ?? [])
+    applyOpenCodeEffortMarkers(
+      parsed,
+      options.midConversationEffortEnabled === true,
+      options.midConversationEffortPlan,
+    )
     applyThinkingBindingControls(
       parsed,
       options.thinkingPrefixMismatchBehavior ?? 'account-default',
@@ -1395,7 +1402,8 @@ export async function rewriteRequestBody(
     })
 
     return signed
-  } catch {
+  } catch (error) {
+    if (error instanceof EffortMarkerCorrelationError) throw error
     return body
   }
 }
@@ -1840,10 +1848,47 @@ function retryableAnthropicStreamErrorFromRawEvent(
   return retryableAnthropicStreamError(errorType, message)
 }
 
+type RelayUpstreamStatus = {
+  status: number
+  source: 'relay_status_field' | 'relay_message_parse'
+}
+
+function relayUpstreamStatusFromRawEvent(
+  rawEvent: string,
+): RelayUpstreamStatus | undefined {
+  if (!rawEvent.includes('relay_upstream_error')) return undefined
+
+  const dataLines: string[] = []
+  for (const line of rawEvent.split(/\r?\n/)) {
+    if (line.startsWith('data:')) {
+      const value = line.slice('data:'.length)
+      dataLines.push(value.startsWith(' ') ? value.slice(1) : value)
+    }
+  }
+  if (!dataLines.length) return undefined
+
+  try {
+    const data = asDiagnosticRecord(JSON.parse(dataLines.join('\n')))
+    const error = asDiagnosticRecord(data?.error)
+    if (stringField(error, 'type') !== 'relay_upstream_error') return undefined
+    const status = error?.status
+    if (typeof status === 'number' && Number.isInteger(status))
+      return { status, source: 'relay_status_field' }
+    const message = stringField(error, 'message')
+    const match = message?.match(/HTTP\s+(\d{3})\b/i)
+    return match
+      ? { status: Number(match[1]), source: 'relay_message_parse' }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function updateSseErrorState(
   state: SseErrorState,
   text: string,
   maxPendingBytes: number,
+  onRelayUpstreamError?: (status: RelayUpstreamStatus) => void,
 ): RetryableAnthropicStreamError | null {
   if (!text) return null
   if (state.disabled) {
@@ -1867,6 +1912,8 @@ function updateSseErrorState(
 
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
+    const relayStatus = relayUpstreamStatusFromRawEvent(rawEvent)
+    if (relayStatus !== undefined) onRelayUpstreamError?.(relayStatus)
     const error = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
     retryable ??= error
   }
@@ -1919,6 +1966,7 @@ export function createStrippedStream(
       stopReason?: string
     }) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
+    onRelayUpstreamError?: (status: RelayUpstreamStatus) => void
     onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
     laneStart?: boolean
@@ -2124,6 +2172,7 @@ export function createStrippedStream(
                   sseErrors,
                   finalDecoded,
                   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                  options.onRelayUpstreamError,
                 ) ?? updateFinish(laneStartRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
@@ -2203,6 +2252,7 @@ export function createStrippedStream(
                 sseErrors,
                 decoded,
                 NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                options.onRelayUpstreamError,
               ) ?? updateFinish(laneStartRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {

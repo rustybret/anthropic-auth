@@ -186,6 +186,9 @@ Example:
   "quotaHeaderFeed": {
     "enabled": false
   },
+  "claustrum": {
+    "accounts": {}
+  },
   "killswitch": {
     "enabled": false,
     "main": { "five_hour": 5, "seven_day": 10, "scoped": 0 },
@@ -229,6 +232,8 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 `thinkingBinding.prefixMismatchBehavior` controls replayed signed/redacted thinking on OAuth Fable 5.1 requests. `account-default` (the default) sends no explicit prefix-mismatch override. Use `error` to make prefix changes fail deterministically during compaction testing, or `drop_block` to ask Anthropic to discard mismatched thinking blocks. The beta header is added only when an explicit behavior is configured and replayable thinking is present.
 
 `quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
+
+`claustrum.accounts.<fallback-account-id>.enabled` is an OpenCode-only, per-account opt-in for fallback credential custody. It is inert unless that account's capability handle has been provisioned in `anthropic-auth-state.json`; handles are bearer credentials and must not be copied into the public config file.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. `sticky-balanced` session assignments use a separate `anthropic-auth-routing-state.json`; session IDs are SHA-256 hashed in that file. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
@@ -278,9 +283,27 @@ Fallback retries are only attempted when the request body is safely replayable. 
 
 ### Token refresh
 
-Fallback OAuth tokens refresh in the background so idle accounts do not expire before they are needed. Refresh token rotation is persisted immediately. The plugin also re-reads the latest sidecar account before refreshing, which avoids using stale refresh-token snapshots when multiple background paths run close together.
+Fallback OAuth tokens refresh in the background so idle accounts do not expire before they are needed. Refresh token rotation is persisted immediately. The plugin also re-reads the latest sidecar account before refreshing, which avoids using stale refresh-token snapshots when multiple background paths run close together. Persisted refresh backoffs are bound to the refresh token that produced them, so replacing a rejected credential immediately clears its stale latch.
 
-If Anthropic reports `invalid_grant`, that fallback account must be logged in again.
+If Anthropic reports `invalid_grant`, that account must be logged in again. `/claude-account reset-backoff` manually clears the main account's refresh backoff and its matching quota backoff.
+
+### Optional Claustrum custody (OpenCode)
+
+OpenCode can obtain an opted-in fallback OAuth account's access credential from a local [Claustrum](https://github.com/cortexkit/claustrum) daemon instead of refreshing that account independently. After provisioning the account's runtime handle, enable custody by account ID:
+
+```json
+{
+  "claustrum": {
+    "accounts": {
+      "personal-alt": { "enabled": true }
+    }
+  }
+}
+```
+
+The request path reads only a resident in-memory credential. Startup warming and periodic custody ticks perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault falls back to the sidecar credential path. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the OpenCode account modal show the gate, current vault service, and vault reauthentication state without exposing capability handles.
+
+Custody currently applies only to fallback OAuth accounts. Main-account vault service is not implemented. If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state.
 
 ## Quota-aware routing
 
@@ -368,6 +391,7 @@ In the OpenCode TUI, the `/claude-*` commands open interactive modal dialogs ins
 - `/claude-cachekeep` — select `always`, enter a cache keepalive window (`HH-HH`), or turn it `off`.
 - `/claude-prime` — turn quota-window priming on or off, or view its status and usage.
 - `/claude-killswitch` — enable or disable the killswitch, or edit per-account `5h,1w,scoped` thresholds.
+- `/claude-account` — manage fallback routes, inspect sanitized Claustrum custody state, or use `reset-backoff` to clear main OAuth refresh and matching quota backoffs.
 
 Applying a change in a modal persists it through the same configuration the slash arguments use, so the modal and the typed command (`/claude-routing fallback-first`, etc.) are equivalent. Outside the OpenCode TUI (OpenCode desktop or headless), the commands print their text summary as before; Pi is unaffected.
 

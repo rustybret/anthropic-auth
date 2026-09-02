@@ -7,6 +7,7 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
+  detectClaustrumConnection,
   executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
@@ -27,6 +28,9 @@ import {
   isFastModePersistentlyEnabled,
   isPrimePersistentlyEnabled,
   loadAccounts,
+  mergeMainQuotaErrorClearedAt,
+  mergeMainRefreshErrorClearedAt,
+  parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
@@ -35,6 +39,7 @@ import {
   parseRoutingCommandAction,
   removeAccountPersistent,
   reorderAccountsPersistent,
+  saveAccountState,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -264,9 +269,14 @@ export function registerCommands(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const path = getPiAccountStoragePath()
       const storage = await loadAccounts(path)
+      const action = parseAccountCommandAction(args ?? '')
       const result = executeAccountCommand({
         argumentsText: args ?? '',
         storage: storage ?? createEmptyStorage(),
+        claustrum:
+          action.type === 'status'
+            ? await detectClaustrumConnection()
+            : undefined,
       })
 
       if (!result.updated) {
@@ -292,6 +302,40 @@ export function registerCommands(pi: ExtensionAPI) {
         if (newOrder) {
           await reorderAccountsPersistent(newOrder, path)
         }
+      } else if (mutationAction === 'reset-backoff') {
+        const nextStorage = storage ?? createEmptyStorage()
+        nextStorage.refresh = nextStorage.refresh ?? {}
+        nextStorage.refresh.mainLastRefreshError = undefined
+        nextStorage.refresh.mainRefreshErrorClearedAt =
+          mergeMainRefreshErrorClearedAt(
+            nextStorage.refresh.mainRefreshErrorClearedAt,
+            Date.now(),
+          )
+        const mainIdentity = nextStorage.mainAccountId
+        const quotaError = nextStorage.quota?.mainLastQuotaApiError
+        if (
+          !quotaError?.accountIdentity ||
+          !mainIdentity ||
+          quotaError.accountIdentity === mainIdentity
+        ) {
+          nextStorage.quota = nextStorage.quota ?? {}
+          nextStorage.quota.mainLastQuotaApiError = undefined
+          const nextQuotaErrorGeneration =
+            (nextStorage.quota.mainQuotaErrorGeneration ?? 0) + 1
+          nextStorage.quota.mainQuotaErrorGeneration = Math.max(
+            nextStorage.quota.mainQuotaErrorGeneration ?? 0,
+            nextQuotaErrorGeneration,
+          )
+          nextStorage.quota.mainQuotaErrorClearedAt =
+            mergeMainQuotaErrorClearedAt(
+              nextStorage.quota.mainQuotaErrorClearedAt,
+              Date.now(),
+            )
+        }
+        await saveAccountState(nextStorage, path, {
+          mainRefresh: true,
+          mainQuota: true,
+        })
       }
 
       notify(ctx, result.text)

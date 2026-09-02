@@ -1,6 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
+import type { AccountDialogAccount } from '../rpc/protocol'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import { formatPrimeCost, formatPrimeTime } from '../sidebar-state.js'
 
@@ -48,21 +49,19 @@ export function buildKillswitchThresholdSeed(
   return seedParts.join(' ')
 }
 
-export function buildAccountDialogOption(account: {
-  id: string
-  label: string
-  role: string
-  enabled: boolean
-  quotaPercent: number | null
-  tierLabel?: string
-}) {
+export function buildAccountDialogOption(account: AccountDialogAccount) {
   const pct =
     account.quotaPercent != null
       ? ` ${Math.round(account.quotaPercent)}%`
       : ' \u2013%'
   const status = !account.enabled ? ' (disabled)' : ''
+  const gate = ` · gate ${account.claustrumGate === 'na' ? 'n/a' : account.claustrumGate}`
+  const vault =
+    account.role === 'main'
+      ? ' · vault n/a'
+      : ` · vault ${account.vaultServed ? 'served' : 'cold'}`
   return {
-    title: `${account.label} [${account.role}]${status}${pct}`,
+    title: `${account.label} [${account.role}]${status}${pct}${gate}${vault}`,
     value: account.id,
     ...(account.tierLabel && { description: account.tierLabel }),
   }
@@ -379,14 +378,9 @@ export function openCommandDialog(
 
   if (payload.command === 'claude-account') {
     const accounts =
-      (payload.knobs.accounts as Array<{
-        id: string
-        label: string
-        role: string
-        enabled: boolean
-        quotaPercent: number | null
-        tierLabel?: string
-      }>) ?? []
+      (payload.knobs.accounts as AccountDialogAccount[] | undefined) ?? []
+    const claustrumDetection =
+      (payload.knobs.claustrumDetection as string | undefined) ?? 'unknown'
 
     const updateAccounts = (r: {
       text: string
@@ -415,30 +409,35 @@ export function openCommandDialog(
       ]
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
-        <DialogSelect
-          title='Claude accounts'
-          options={l1Options}
-          onSelect={(option) => {
-            if (option.value === '__add__') {
-              openAddType()
-              return
-            }
-            const account = accounts.find((a) => a.id === option.value)
-            if (!account) return
-            if (account.role === 'main') {
-              const pct =
-                account.quotaPercent != null
-                  ? ` ${Math.round(account.quotaPercent)}%`
-                  : ' \u2013%'
-              showText(
-                api,
-                `${account.label}\nRole: main (read-only)\nQuota:${pct}`,
-              )
-              return
-            }
-            openManage(account, false)
-          }}
-        />
+        <box flexDirection='column' padding={1} width='100%'>
+          <text>{`Claustrum: ${claustrumDetection}`}</text>
+          <box marginTop={1}>
+            <DialogSelect
+              title='Claude accounts'
+              options={l1Options}
+              onSelect={(option) => {
+                if (option.value === '__add__') {
+                  openAddType()
+                  return
+                }
+                const account = accounts.find((a) => a.id === option.value)
+                if (!account) return
+                if (account.role === 'main') {
+                  const pct =
+                    account.quotaPercent != null
+                      ? ` ${Math.round(account.quotaPercent)}%`
+                      : ' \u2013%'
+                  showText(
+                    api,
+                    `${account.label}\nRole: main (read-only)\nQuota:${pct}`,
+                  )
+                  return
+                }
+                openManage(account, false)
+              }}
+            />
+          </box>
+        </box>
       ))
     }
 

@@ -79,7 +79,12 @@ describe('OpenCode Anthropic auth e2e', () => {
   it('preserves Fable 5.1 effort history across OpenCode variant changes', async () => {
     harness = await E2EHarness.create()
     harness.script([
-      { type: 'text', text: 'first effort response' },
+      {
+        type: 'tool_use',
+        name: 'mcp_Read',
+        input: { filePath: harness.sampleFilePath() },
+      },
+      { type: 'text', text: 'first effort response after the tool loop' },
       { type: 'text', text: 'second effort response' },
     ])
     const sessionId = await harness.createSession()
@@ -108,20 +113,22 @@ describe('OpenCode Anthropic auth e2e', () => {
           !serializedBody.includes('Generate a title for this conversation')
         )
       })
-    expect(generationRequests).toHaveLength(2)
-    expect(generationRequests[0]?.body.output_config).toMatchObject({
-      effort: 'low',
-    })
-    expect(generationRequests[1]?.body.output_config).toMatchObject({
-      effort: 'low',
-    })
-    const secondMessages = generationRequests[1]?.body.messages
-    expect(Array.isArray(secondMessages) ? secondMessages : []).toContainEqual({
+    expect(generationRequests).toHaveLength(3)
+    for (const request of generationRequests) {
+      expect(request.body.output_config).toMatchObject({ effort: 'low' })
+    }
+    const switchedMessages = generationRequests[2]?.body.messages
+    expect(
+      Array.isArray(switchedMessages) ? switchedMessages : [],
+    ).toContainEqual({
       role: 'system',
       content: [],
       output_config: { effort: 'high' },
     })
+    expect(JSON.stringify(generationRequests[2]?.body)).toContain('tool_result')
     for (const request of generationRequests) {
+      const serialized = JSON.stringify(request.body)
+      expect(serialized).not.toContain('cortexkit-internal-effort')
       expect(request.headers['anthropic-beta']?.split(',')).toContain(
         'mid-conversation-output-config-2026-07-01',
       )

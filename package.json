@@ -19,6 +19,7 @@
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "extract": "bun scripts/extract-system-prompt.ts",
+    "check:claustrum-golden": "bun scripts/check-claustrum-golden.ts",
     "analyze:cache": "node scripts/analyze-cache-usage.mjs",
     "test": "bun run build && cd packages/core && bun test src/tests && cd ../opencode && bun run test && cd ../.. && bun test scripts/pack-arcus.test.ts scripts/fork-sync.test.ts",
     "test:e2e": "cd packages/core && bun run build && cd ../.. && bun run --cwd packages/e2e-tests test",

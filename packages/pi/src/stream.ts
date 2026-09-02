@@ -52,6 +52,7 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   THINKING_BINDING_CONTROLS_BETA,
+  tokenFingerprint,
   usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -749,6 +750,7 @@ async function executeWithFallback(options: {
             configured.lastRefreshError,
             configured.id,
             Date.now(),
+            tokenFingerprint(configured.refresh),
           )
         )
           continue
