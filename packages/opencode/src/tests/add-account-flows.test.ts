@@ -2,9 +2,22 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DEFAULT_FETCH_MOCK } from './test-fetch'
+import {
+  createTimerTracking,
+  type PluginTimerOverrides,
+} from './timer-tracking'
 
 let tempDir: string
 let accountPath: string
+const originalFetch = globalThis.fetch
+const timerTracking = createTimerTracking()
+const {
+  activeIntervals,
+  disabledPluginTimerOverrides,
+  trackedClearInterval,
+  trackedSetInterval,
+} = timerTracking
 
 async function useTempAccountFile() {
   if (tempDir) {
@@ -31,12 +44,21 @@ function createMockClient() {
   }
 }
 
-async function getPlugin() {
+async function getPlugin(timerOverrides?: PluginTimerOverrides) {
   const { AnthropicAuthPlugin } = await import('../index')
-  return (await AnthropicAuthPlugin({
-    // @ts-expect-error: minimal mock for testing
-    client: createMockClient(),
-  })) as Promise<any>
+  const defaultTimerOverrides = disabledPluginTimerOverrides()
+  return (await (
+    AnthropicAuthPlugin as unknown as (
+      ctx: Parameters<typeof AnthropicAuthPlugin>[0],
+      timers?: PluginTimerOverrides,
+    ) => ReturnType<typeof AnthropicAuthPlugin>
+  )(
+    {
+      // @ts-expect-error: minimal mock for testing
+      client: createMockClient(),
+    },
+    { ...defaultTimerOverrides, ...timerOverrides },
+  )) as Promise<any>
 }
 
 async function executeCommand(
@@ -98,6 +120,9 @@ let capturedRecords: Array<{
 }> = []
 
 beforeEach(async () => {
+  timerTracking.reset()
+  const { installDefaultFetchMock } = await import('./test-fetch')
+  installDefaultFetchMock()
   capturedRecords = []
   const { __setLogTestSink } = await import('@cortexkit/anthropic-auth-core')
   __setLogTestSink((record) => {
@@ -107,13 +132,54 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  const { __setLogTestSink } = await import('@cortexkit/anthropic-auth-core')
-  __setLogTestSink(null)
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  if (tempDir) {
-    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+  try {
+    // Restore only the fixture's tagged mock; an untagged custom mock left
+    // installed must reach the preload's leak detector, not be masked here.
+    const currentFetch = globalThis.fetch as
+      | (typeof fetch & { [DEFAULT_FETCH_MOCK]?: true })
+      | undefined
+    if (currentFetch?.[DEFAULT_FETCH_MOCK]) {
+      globalThis.fetch = originalFetch
+    }
+    const { __setLogTestSink } = await import('@cortexkit/anthropic-auth-core')
+    __setLogTestSink(null)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+    }
+    mock.restore()
+  } finally {
+    // Assert last so a detected leak cannot abort the cleanup above.
+    expect(activeIntervals.size).toBe(0)
   }
-  mock.restore()
+})
+
+test('does not retain a background interval unless the helper opts in', async () => {
+  await getPlugin()
+  expect(timerTracking.disabledIntervalCalls).toBe(1)
+  expect(activeIntervals.size).toBe(0)
+
+  let thrown: unknown
+  try {
+    await timerTracking.withTrackedInterval(async () => {
+      await getPlugin({
+        setInterval: trackedSetInterval,
+        clearInterval: trackedClearInterval,
+      })
+      expect(activeIntervals.size).toBe(1)
+      throw new Error('forced timer assertion failure')
+    })
+  } catch (error) {
+    thrown = error
+  }
+  expect((thrown as Error).message).toBe('forced timer assertion failure')
+  expect(activeIntervals.size).toBe(0)
+})
+
+test('partial timer overrides retain disabled interval defaults', async () => {
+  await getPlugin({ clearInterval: trackedClearInterval })
+  expect(timerTracking.disabledIntervalCalls).toBe(1)
+  expect(activeIntervals.size).toBe(0)
 })
 
 // ---------------------------------------------------------------------------
@@ -435,10 +501,13 @@ describe('add-oauth label threading', () => {
   async function getPluginWithClient() {
     const client = createMockClient()
     const { AnthropicAuthPlugin } = await import('../index')
-    const plugin = (await AnthropicAuthPlugin({
-      // @ts-expect-error: minimal mock for testing
-      client,
-    })) as any
+    const plugin = (await AnthropicAuthPlugin(
+      {
+        // @ts-expect-error: minimal mock for testing
+        client,
+      },
+      disabledPluginTimerOverrides(),
+    )) as any
     return { plugin, client }
   }
 

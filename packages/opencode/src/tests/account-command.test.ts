@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from 'bun:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -16,9 +24,23 @@ import {
   setAccountEnabledPersistent,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
+import { DEFAULT_FETCH_MOCK, installDefaultFetchMock } from './test-fetch'
+import {
+  createTimerTracking,
+  type PluginTimerOverrides,
+} from './timer-tracking'
 
 let tempDir: string
 let accountPath: string
+const tempDirs = new Set<string>()
+const originalFetch = globalThis.fetch
+const timerTracking = createTimerTracking()
+const {
+  activeIntervals,
+  disabledPluginTimerOverrides,
+  trackedClearInterval,
+  trackedSetInterval,
+} = timerTracking
 
 const baseStorage = (): AccountStorage => ({
   version: 1,
@@ -68,15 +90,48 @@ const baseStorage = (): AccountStorage => ({
 })
 
 beforeEach(async () => {
+  installDefaultFetchMock()
+  timerTracking.reset()
+  if (tempDir) {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+  }
   tempDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-acct-cmd-'))
+  tempDirs.add(tempDir)
   accountPath = join(tempDir, 'anthropic-auth.json')
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
 })
 
 afterEach(async () => {
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  await rm(tempDir, { recursive: true, force: true })
-  mock.restore()
+  try {
+    // Restore only the fixture's tagged mock; an untagged custom mock left
+    // installed must reach the preload's leak detector, not be masked here.
+    const currentFetch = globalThis.fetch as
+      | (typeof fetch & { [DEFAULT_FETCH_MOCK]?: true })
+      | undefined
+    if (currentFetch?.[DEFAULT_FETCH_MOCK]) {
+      globalThis.fetch = originalFetch
+    }
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    await Promise.all(
+      [...tempDirs].map((directory) =>
+        rm(directory, { recursive: true, force: true }).catch(() => {}),
+      ),
+    )
+    tempDirs.clear()
+    mock.restore()
+  } finally {
+    // Assert last so a detected leak cannot abort the cleanup above.
+    expect(activeIntervals.size).toBe(0)
+  }
+})
+
+afterAll(async () => {
+  await Promise.all(
+    [...tempDirs, tempDir].map((directory) =>
+      rm(directory, { recursive: true, force: true }).catch(() => {}),
+    ),
+  )
+  tempDirs.clear()
 })
 
 // ---------------------------------------------------------------------------
@@ -513,11 +568,22 @@ describe('account command INFO logs (via plugin)', () => {
     }
   }
 
-  async function getPlugin() {
-    return (await AnthropicAuthPlugin({
-      // @ts-expect-error: minimal mock for testing
-      client: createMockClient(),
-    })) as Promise<any>
+  async function getPlugin(timerOverrides?: PluginTimerOverrides) {
+    const defaultTimerOverrides = disabledPluginTimerOverrides()
+    const plugin = (await (
+      AnthropicAuthPlugin as unknown as (
+        ctx: Parameters<typeof AnthropicAuthPlugin>[0],
+        timers?: PluginTimerOverrides,
+      ) => ReturnType<typeof AnthropicAuthPlugin>
+    )(
+      {
+        // @ts-expect-error: minimal mock for testing
+        client: createMockClient(),
+      },
+      { ...defaultTimerOverrides, ...timerOverrides },
+    )) as any
+    await plugin.__fallbackRefreshReady
+    return plugin
   }
 
   async function executeCommand(
@@ -635,5 +701,21 @@ describe('account command INFO logs (via plugin)', () => {
     expect(
       capturedRecords.filter((r) => r.channel === 'commands'),
     ).toHaveLength(0)
+  })
+
+  test('does not retain a background interval unless the helper opts in', async () => {
+    await saveAccounts(baseStorage(), accountPath)
+    await getPlugin()
+    expect(timerTracking.disabledIntervalCalls).toBe(1)
+    expect(activeIntervals.size).toBe(0)
+
+    await timerTracking.withTrackedInterval(async () => {
+      await getPlugin({
+        setInterval: trackedSetInterval,
+        clearInterval: trackedClearInterval,
+      })
+      expect(activeIntervals.size).toBe(1)
+    })
+    expect(activeIntervals.size).toBe(0)
   })
 })

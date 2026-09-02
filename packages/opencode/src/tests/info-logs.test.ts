@@ -9,6 +9,11 @@ import {
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
+import { DEFAULT_FETCH_MOCK, installDefaultFetchMock } from './test-fetch'
+import {
+  createTimerTracking,
+  type PluginTimerOverrides,
+} from './timer-tracking'
 
 function createFallbackStorage(): AccountStorage {
   return {
@@ -31,6 +36,14 @@ function createFallbackStorage(): AccountStorage {
 }
 
 let tempConfigDir: string
+const originalFetch = globalThis.fetch
+const timerTracking = createTimerTracking()
+const {
+  activeIntervals,
+  disabledPluginTimerOverrides,
+  trackedClearInterval,
+  trackedSetInterval,
+} = timerTracking
 
 async function useTempAccountFile(storage: AccountStorage) {
   if (tempConfigDir) {
@@ -53,16 +66,27 @@ function createMockClient() {
   }
 }
 
-async function getPlugin() {
-  return (await AnthropicAuthPlugin({
-    // @ts-expect-error: minimal mock for testing
-    client: createMockClient(),
-  })) as Promise<any>
+async function getPlugin(timerOverrides?: PluginTimerOverrides) {
+  const defaultTimerOverrides = disabledPluginTimerOverrides()
+  return (await (
+    AnthropicAuthPlugin as unknown as (
+      ctx: Parameters<typeof AnthropicAuthPlugin>[0],
+      timers?: PluginTimerOverrides,
+    ) => ReturnType<typeof AnthropicAuthPlugin>
+  )(
+    {
+      // @ts-expect-error: minimal mock for testing
+      client: createMockClient(),
+    },
+    { ...defaultTimerOverrides, ...timerOverrides },
+  )) as Promise<any>
 }
 
 let capturedRecords: LogTestRecord[] = []
 
 beforeEach(() => {
+  timerTracking.reset()
+  installDefaultFetchMock()
   capturedRecords = []
   __setLogTestSink((record) => {
     capturedRecords.push(record)
@@ -70,11 +94,40 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  __setLogTestSink(null)
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  if (tempConfigDir) {
-    await rm(tempConfigDir, { recursive: true, force: true }).catch(() => {})
+  try {
+    // Restore only the fixture's tagged mock; an untagged custom mock left
+    // installed must reach the preload's leak detector, not be masked here.
+    const currentFetch = globalThis.fetch as
+      | (typeof fetch & { [DEFAULT_FETCH_MOCK]?: true })
+      | undefined
+    if (currentFetch?.[DEFAULT_FETCH_MOCK]) {
+      globalThis.fetch = originalFetch
+    }
+    __setLogTestSink(null)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { recursive: true, force: true }).catch(() => {})
+    }
+  } finally {
+    expect(activeIntervals.size).toBe(0)
   }
+})
+
+test('does not retain a background interval unless the helper opts in', async () => {
+  await useTempAccountFile(createFallbackStorage())
+  timerTracking.reset()
+  await getPlugin()
+  expect(timerTracking.disabledIntervalCalls).toBe(1)
+  expect(activeIntervals.size).toBe(0)
+
+  await timerTracking.withTrackedInterval(async () => {
+    await getPlugin({
+      setInterval: trackedSetInterval,
+      clearInterval: trackedClearInterval,
+    })
+    expect(activeIntervals.size).toBe(1)
+  })
+  expect(activeIntervals.size).toBe(0)
 })
 
 async function executeCommand(

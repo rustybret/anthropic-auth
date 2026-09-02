@@ -216,6 +216,92 @@ describe('main account identity', () => {
   })
 })
 
+describe('scoped account-state membership', () => {
+  test('preserves state for a whitespace-padded configured account id', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [{ id: ' fb-1 ', type: 'oauth', enabled: true }],
+      }),
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          ' fb-1 ': {
+            access: 'access-token',
+            refresh: 'valid-refresh',
+            expires: Date.now() + 3_600_000,
+          },
+          x: { refresh: 'removed-refresh' },
+        },
+      }),
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded).not.toBeNull()
+    expect(loaded?.accounts).toHaveLength(1)
+    expect(loaded?.accounts[0]?.id).toBe('fb-1')
+    expect(loaded?.accounts[0]?.type).toBe('oauth')
+    expect((loaded!.accounts[0] as OAuthAccount).refresh).toBe('valid-refresh')
+
+    const scopedStorage = { ...loaded!, accounts: [] }
+    await saveAccountState(scopedStorage, accountPath, { accounts: true })
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(state.accounts).toEqual({
+      ' fb-1 ': {
+        access: 'access-token',
+        refresh: 'valid-refresh',
+        expires: expect.any(Number),
+      },
+    })
+    const loadedAfter = await loadAccounts(accountPath)
+    expect(loadedAfter?.accounts).toHaveLength(1)
+    expect(loadedAfter?.accounts[0]?.id).toBe('fb-1')
+    expect((loadedAfter!.accounts[0] as OAuthAccount).refresh).toBe(
+      'valid-refresh',
+    )
+  })
+
+  test('accepts a trimmed state key for a padded configured account', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [{ id: ' fb-1 ', type: 'oauth', enabled: true }],
+      }),
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          'fb-1': { refresh: 'trimmed-refresh' },
+          x: { refresh: 'removed-refresh' },
+        },
+      }),
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts).toHaveLength(1)
+    expect((loaded!.accounts[0] as OAuthAccount).refresh).toBe(
+      'trimmed-refresh',
+    )
+
+    await saveAccountState(loaded!, accountPath, { accounts: ['fb-1'] })
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(state.accounts).toEqual({
+      'fb-1': { refresh: 'trimmed-refresh' },
+    })
+  })
+})
+
 describe('main quota clear marker', () => {
   test('keeps the newer marker when an older marker arrives', () => {
     expect(mergeMainQuotaErrorClearedAt(2_000, 1_000)).toBe(2_000)
@@ -1176,6 +1262,274 @@ describe('account storage', () => {
     expect(loaded?.accounts.map((account) => account.id)).toEqual(['good-api'])
   })
 
+  test('preserves runtime state when config membership entry is shape-invalid', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'a',
+        type: 'api',
+        apiKey: 'api-key',
+        baseURL: 'https://api.example.com/v1',
+      },
+      {
+        id: 'b',
+        type: 'oauth',
+        access: 'access-b',
+        refresh: 'refresh-b',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+    const staleStorage = await loadAccounts(accountPath)
+    expect(staleStorage?.accounts.map((account) => account.id)).toEqual([
+      'a',
+      'b',
+    ])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [{ id: 'a', type: 'api', baseURL: 'garbage' }],
+      }),
+      'utf8',
+    )
+
+    await saveAccountState(staleStorage!, accountPath, { accounts: true })
+    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(state.accounts).toHaveProperty('a')
+    expect(state.accounts).toHaveProperty('b')
+    expect(state.accounts.a.apiKey).toBe('api-key')
+    expect(state.accounts.b.refresh).toBe('refresh-b')
+  })
+
+  test('prunes runtime state for a fully valid config membership set', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'a',
+        type: 'api',
+        apiKey: 'api-key',
+        baseURL: 'https://api.example.com/v1',
+      },
+      {
+        id: 'b',
+        type: 'oauth',
+        access: 'access-b',
+        refresh: 'refresh-b',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+    const staleStorage = await loadAccounts(accountPath)
+    expect(staleStorage?.accounts.map((account) => account.id)).toEqual([
+      'a',
+      'b',
+    ])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          { id: 'a', type: 'api', baseURL: 'https://api.example.com/v1' },
+        ],
+      }),
+      'utf8',
+    )
+
+    await saveAccountState(staleStorage!, accountPath, { accounts: true })
+    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(state.accounts).toEqual({ a: expect.any(Object) })
+    expect(state.accounts.b).toBeUndefined()
+  })
+
+  test('uses incoming account credentials to establish config membership', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'x',
+        type: 'oauth',
+        access: 'access-x',
+        refresh: 'refresh-x',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts.map((account) => account.id)).toEqual(['x'])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [{ id: 'y', type: 'oauth' }],
+      }),
+      'utf8',
+    )
+
+    const incoming = baseStorage()
+    incoming.accounts = [
+      {
+        id: 'y',
+        type: 'oauth',
+        access: 'access-y',
+        refresh: 'refresh-y',
+      },
+    ]
+    await saveAccountState(incoming, accountPath, { accounts: true })
+    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(state.accounts).toEqual({ y: expect.any(Object) })
+    expect(state.accounts.x).toBeUndefined()
+    expect(state.accounts.y.refresh).toBe('refresh-y')
+  })
+
+  test('does not establish membership from config-owned fields on an incoming api account', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'a',
+        type: 'api',
+        apiKey: 'api-key-a',
+        baseURL: 'https://api.example.com/v1',
+      },
+      {
+        id: 'b',
+        type: 'oauth',
+        access: 'access-b',
+        refresh: 'refresh-b',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [{ id: 'a', type: 'api' }],
+      }),
+      'utf8',
+    )
+
+    const incoming = baseStorage()
+    incoming.accounts = [
+      {
+        id: 'a',
+        type: 'api',
+        apiKey: 'api-key-a-new',
+        baseURL: 'https://api.example.com/v1',
+      },
+    ]
+    await saveAccountState(incoming, accountPath, { accounts: true })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(state.accounts).toHaveProperty('a')
+    expect(state.accounts).toHaveProperty('b')
+  })
+
+  test('keeps runtime state when incoming storage cannot validate config membership', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'x',
+        type: 'oauth',
+        access: 'access-x',
+        refresh: 'refresh-x',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts.map((account) => account.id)).toEqual(['x'])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [{ id: 'y', type: 'oauth' }],
+      }),
+      'utf8',
+    )
+
+    await saveAccountState(loaded!, accountPath, { accounts: true })
+    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(state.accounts.x.refresh).toBe('refresh-x')
+    expect(state.accounts.y).toBeUndefined()
+  })
+
+  test('does not establish membership from an id-less shape-valid config entry', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'a',
+        type: 'oauth',
+        access: 'access-a',
+        refresh: 'refresh-a',
+      },
+      {
+        id: 'b',
+        type: 'oauth',
+        access: 'access-b',
+        refresh: 'refresh-b',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+    const staleStorage = await loadAccounts(accountPath)
+    expect(staleStorage?.accounts.map((account) => account.id)).toEqual([
+      'a',
+      'b',
+    ])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [{ type: 'oauth', refresh: 'new-refresh' }],
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts).toHaveLength(1)
+    await saveAccountState(staleStorage!, accountPath, { accounts: true })
+    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(state.accounts).toHaveProperty('a')
+    expect(state.accounts).toHaveProperty('b')
+  })
+
+  test('prunes runtime state for an explicitly empty config account list', async () => {
+    const seeded = baseStorage()
+    seeded.accounts = [
+      {
+        id: 'a',
+        type: 'oauth',
+        access: 'access-a',
+        refresh: 'refresh-a',
+      },
+    ]
+    await saveAccounts(seeded, accountPath)
+    const staleStorage = await loadAccounts(accountPath)
+    expect(staleStorage?.accounts).toHaveLength(1)
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      }),
+      'utf8',
+    )
+
+    await saveAccountState(staleStorage!, accountPath, { accounts: true })
+    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(state.accounts).toEqual({})
+  })
+
   test('runtime state saves do not rewrite user-editable config', async () => {
     const storage = baseStorage()
     storage.quota = {
@@ -1221,6 +1575,364 @@ describe('account storage', () => {
     expect(loaded?.quota?.checkIntervalMinutes).toBe(20)
     expect(loaded?.quota?.mainQuotaToken).toBe('token-b')
     expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(22)
+  })
+
+  test('runtime state saves preserve accounts when config is missing', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access-before',
+      refresh: 'refresh-before',
+      expires: 1_000,
+      lastRefreshedAt: 100,
+    })
+    await saveAccounts(storage, accountPath)
+    await rm(accountPath)
+    storage.accounts[0] = {
+      ...storage.accounts[0],
+      access: 'access-after',
+      refresh: 'refresh-after',
+      expires: 2_000,
+      lastRefreshedAt: 200,
+    } as OAuthAccount
+
+    await saveAccountState(storage, accountPath)
+
+    const rawState = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(rawState.accounts['fallback-1']).toMatchObject({
+      access: 'access-after',
+      refresh: 'refresh-after',
+      expires: 2_000,
+      lastRefreshedAt: 200,
+    })
+  })
+
+  test('runtime state saves preserve whitespace-padded configured account ids', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          { id: ' fb-1 ', type: 'oauth', refresh: 'refresh-padded' },
+          { id: 'fb-control', type: 'oauth', refresh: 'refresh-control' },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          ' fb-1 ': {
+            access: 'access-padded',
+            refresh: 'refresh-padded',
+            expires: 1_000,
+          },
+          'fb-control': {
+            access: 'access-control',
+            refresh: 'refresh-control',
+            expires: 1_000,
+          },
+        },
+      }),
+      'utf8',
+    )
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded).not.toBeNull()
+    expect(loaded?.accounts.map((account) => account.id)).toEqual([
+      'fb-1',
+      'fb-control',
+    ])
+    expect((loaded!.accounts[0] as OAuthAccount).refresh).toBe('refresh-padded')
+
+    await saveAccountState(loaded!, accountPath, {
+      accounts: ['fb-1', 'fb-control'],
+    })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    ) as { accounts?: Record<string, { refresh?: string }> }
+    expect(Object.keys(state.accounts ?? {}).sort()).toEqual([
+      'fb-1',
+      'fb-control',
+    ])
+    expect(state.accounts?.['fb-1']?.refresh).toBe('refresh-padded')
+    expect(state.accounts?.['fb-control']?.refresh).toBe('refresh-control')
+  })
+
+  test('loads a trimmed legacy state key for a padded configured account', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [{ id: ' fb-1 ', type: 'oauth', enabled: true }],
+      }),
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          'fb-1': {
+            access: 'access-trimmed',
+            refresh: 'refresh-trimmed',
+            expires: Date.now() + 3_600_000,
+          },
+        },
+      }),
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts).toHaveLength(1)
+    expect((loaded!.accounts[0] as OAuthAccount).refresh).toBe(
+      'refresh-trimmed',
+    )
+
+    await saveAccountState({ ...loaded!, accounts: [] }, accountPath, {
+      accounts: true,
+    })
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(state.accounts).toEqual({
+      'fb-1': {
+        access: 'access-trimmed',
+        refresh: 'refresh-trimmed',
+        expires: expect.any(Number),
+      },
+    })
+    expect((await loadAccounts(accountPath))?.accounts).toHaveLength(1)
+  })
+
+  test('persists rotated credentials under the key the padded loader accepts', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [{ id: ' fb-1 ', type: 'oauth' }],
+      }),
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          ' fb-1 ': {
+            access: 'access-old',
+            refresh: 'refresh-old',
+            expires: Date.now() + 3_600_000,
+            lastRefreshedAt: 100,
+          },
+        },
+      }),
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect((loaded!.accounts[0] as OAuthAccount).access).toBe('access-old')
+    const rotated = loaded!.accounts[0] as OAuthAccount
+    rotated.access = 'access-new'
+    rotated.refresh = 'refresh-new'
+    rotated.expires = Date.now() + 7_200_000
+    rotated.lastRefreshedAt = 200
+    await saveAccountState(loaded!, accountPath, { accounts: ['fb-1'] })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(Object.keys(state.accounts ?? {})).toEqual(['fb-1'])
+    expect((await loadAccounts(accountPath))?.accounts[0]).toMatchObject({
+      access: 'access-new',
+      refresh: 'refresh-new',
+    })
+  })
+
+  test('runtime state saves preserve all state when config has a whitespace-only account id', async () => {
+    const seeded = baseStorage()
+    seeded.accounts.push({
+      id: 'fb-1',
+      type: 'oauth',
+      access: 'access-before',
+      refresh: 'refresh-before',
+      expires: 1_000,
+    })
+    await saveAccounts(seeded, accountPath)
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [{ id: '   ' }],
+      }),
+      'utf8',
+    )
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts).toHaveLength(0)
+
+    await saveAccountState(loaded!, accountPath, { accounts: true })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    ) as { accounts?: Record<string, { refresh?: string }> }
+    expect(state.accounts?.['fb-1']?.refresh).toBe('refresh-before')
+  })
+
+  test('runtime state saves preserve accounts when config omits accounts', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access-before',
+      refresh: 'refresh-before',
+      expires: 1_000,
+      lastRefreshedAt: 100,
+    })
+    await saveAccounts(storage, accountPath)
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+      }),
+      'utf8',
+    )
+    storage.accounts[0] = {
+      ...storage.accounts[0],
+      access: 'access-after',
+      refresh: 'refresh-after',
+      expires: 2_000,
+      lastRefreshedAt: 200,
+    } as OAuthAccount
+
+    await saveAccountState(storage, accountPath)
+
+    const rawState = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(rawState.accounts['fallback-1']).toMatchObject({
+      access: 'access-after',
+      refresh: 'refresh-after',
+      expires: 2_000,
+      lastRefreshedAt: 200,
+    })
+  })
+
+  test('treats a partially parseable populated config as unknown membership', async () => {
+    const storage = baseStorage()
+    storage.accounts.push(
+      {
+        id: 'account-a',
+        type: 'oauth',
+        access: 'access-a',
+        refresh: 'refresh-a',
+        expires: 1_000,
+      },
+      {
+        id: 'account-b',
+        type: 'oauth',
+        access: 'access-b',
+        refresh: 'refresh-b',
+        expires: 1_000,
+      },
+    )
+    await saveAccounts(storage)
+    await writeFile(
+      accountPath,
+      JSON.stringify({ version: 1, accounts: [{ id: 'account-a' }, {}] }),
+      'utf8',
+    )
+
+    await saveAccountState(storage, accountPath, { accounts: true })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    ) as { accounts?: Record<string, { refresh?: string }> }
+    expect(Object.keys(state.accounts ?? {}).sort()).toEqual([
+      'account-a',
+      'account-b',
+    ])
+    expect(state.accounts?.['account-a']?.refresh).toBe('refresh-a')
+    expect(state.accounts?.['account-b']?.refresh).toBe('refresh-b')
+  })
+
+  test('scoped saves preserve accounts when populated config membership is unknown', async () => {
+    const storage = baseStorage()
+    storage.accounts.push(
+      {
+        id: 'account-a',
+        type: 'oauth',
+        access: 'access-a',
+        refresh: 'refresh-a',
+        expires: 1_000,
+      },
+      {
+        id: 'account-b',
+        type: 'oauth',
+        access: 'access-b',
+        refresh: 'refresh-b',
+        expires: 1_000,
+      },
+    )
+    await saveAccounts(storage)
+    await writeFile(
+      accountPath,
+      JSON.stringify({ version: 1, accounts: [{ id: 'account-a' }, {}] }),
+      'utf8',
+    )
+
+    storage.accounts[0] = {
+      ...storage.accounts[0],
+      access: 'access-a-updated',
+      refresh: 'refresh-a-updated',
+    } as OAuthAccount
+    await saveAccountState(storage, accountPath, { accounts: ['account-a'] })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    ) as { accounts?: Record<string, { access?: string; refresh?: string }> }
+    expect(state.accounts?.['account-a']).toMatchObject({
+      access: 'access-a-updated',
+      refresh: 'refresh-a-updated',
+    })
+    expect(state.accounts?.['account-b']).toMatchObject({
+      access: 'access-b',
+      refresh: 'refresh-b',
+    })
+  })
+
+  test('a wholly unparseable populated config prunes nothing when storage is loaded from it', async () => {
+    const seeded = baseStorage()
+    seeded.accounts.push({
+      id: 'account-a',
+      type: 'oauth',
+      access: 'access-a',
+      refresh: 'refresh-a',
+      expires: 1_000,
+    })
+    await saveAccounts(seeded)
+
+    // Load drops the unparseable entries too, so the writer's own snapshot is
+    // empty for the same reason membership is unknown. Pruning against it would
+    // delete every credential.
+    await writeFile(
+      accountPath,
+      JSON.stringify({ version: 1, accounts: [{}] }),
+      'utf8',
+    )
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts).toHaveLength(0)
+
+    await saveAccountState(loaded!, accountPath, { accounts: true })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    ) as { accounts?: Record<string, { refresh?: string }> }
+    expect(state.accounts?.['account-a']?.refresh).toBe('refresh-a')
   })
 
   test('generic saves preserve a newer persisted main profile', async () => {
@@ -5330,6 +6042,89 @@ describe('multi-account persistence', () => {
       await readFile(getAccountStatePath(accountPath), 'utf8'),
     )
     expect(Object.keys(state.accounts)).toEqual(['umut', 'yiyi'])
+  })
+
+  test('scoped saves prune state removed by an external config edit', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'keep',
+      type: 'oauth',
+      access: 'keep-access',
+      refresh: 'keep-refresh',
+    })
+    storage.accounts.push({
+      id: 'doomed',
+      type: 'oauth',
+      access: 'doomed-access',
+      refresh: 'doomed-refresh',
+    })
+    await saveAccounts(storage, accountPath)
+
+    const staleSnapshot = (await loadAccounts(accountPath))!
+    const statePath = getAccountStatePath(accountPath)
+    const before = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(before.accounts?.keep).toBeDefined()
+    expect(before.accounts?.doomed).toBeDefined()
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    config.accounts = config.accounts.filter(
+      (account: { id?: string }) => account.id !== 'doomed',
+    )
+    await writeFile(accountPath, `${JSON.stringify(config)}\n`, 'utf8')
+
+    await saveAccountState(staleSnapshot, accountPath, {
+      accounts: ['keep'],
+    })
+    const afterStaleSave = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(afterStaleSave.accounts?.doomed).toBeUndefined()
+    expect(afterStaleSave.accounts?.keep).toBeDefined()
+  })
+
+  test('scoped saves preserve state for configured accounts outside the scope', async () => {
+    const storage = baseStorage()
+    storage.accounts.push(
+      {
+        id: 'keep',
+        type: 'oauth',
+        access: 'keep-access',
+        refresh: 'keep-refresh',
+      },
+      {
+        id: 'update',
+        type: 'oauth',
+        access: 'update-access',
+        refresh: 'update-refresh',
+      },
+    )
+    await saveAccounts(storage, accountPath)
+
+    const scopedStorage = {
+      ...storage,
+      accounts: storage.accounts.map((account) =>
+        account.id === 'update'
+          ? {
+              ...account,
+              access: 'update-access-new',
+              refresh: 'update-refresh-new',
+            }
+          : account,
+      ),
+    }
+    await saveAccountState(scopedStorage, accountPath, {
+      accounts: ['update'],
+    })
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(state.accounts?.keep).toMatchObject({
+      access: 'keep-access',
+      refresh: 'keep-refresh',
+    })
+    expect(state.accounts?.update).toMatchObject({
+      access: 'update-access-new',
+      refresh: 'update-refresh-new',
+    })
   })
 
   test('concurrent account additions preserve both accounts', async () => {

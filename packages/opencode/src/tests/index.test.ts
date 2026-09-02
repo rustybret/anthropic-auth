@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from 'bun:test'
 import { readFileSync } from 'node:fs'
 import {
   chmod,
@@ -60,13 +68,14 @@ import {
   setSidebarState,
 } from '../sidebar-state'
 import { rewriteRequestBody } from '../transform.ts'
-
-/** Extract the URL string from a fetch input (string, URL, or Request). */
-function extractUrl(input: string | URL | Request): string {
-  if (typeof input === 'string') return input
-  if (input instanceof URL) return input.toString()
-  return input.url
-}
+import {
+  extractUrl,
+  installDefaultFetchMock,
+  MESSAGES_URL,
+  PROFILE_URL,
+  QUOTA_URL,
+  TOKEN_URL,
+} from './test-fetch'
 
 async function freshPrimeQuotaResponse(
   body: unknown,
@@ -99,9 +108,163 @@ function createMockClient(
   }
 }
 
-const MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 const EMPTY_POST = { method: 'POST', body: '{}' } as const
 let tempConfigDir: string | undefined
+const tempConfigDirs = new Set<string>()
+const allTempConfigDirs = new Set<string>()
+const fallbackRefreshes = new Set<Promise<unknown>>()
+
+beforeEach(() => {
+  installDefaultFetchMock()
+})
+
+afterEach(async () => {
+  await cleanupTempConfigDirs()
+})
+
+afterAll(async () => {
+  await cleanupTempConfigDirs()
+  await Bun.sleep(100)
+  await cleanupTempConfigDirs()
+  await Promise.all(
+    [...allTempConfigDirs].map((directory) =>
+      rm(directory, { recursive: true, force: true }).catch(() => {}),
+    ),
+  )
+  allTempConfigDirs.clear()
+})
+
+async function cleanupTempConfigDirs(drainTimeoutMs = 4_000) {
+  const refreshesSettled = await Promise.race([
+    Promise.allSettled(fallbackRefreshes).then(() => true),
+    Bun.sleep(drainTimeoutMs).then(() => false),
+  ])
+  if (refreshesSettled) fallbackRefreshes.clear()
+  await drainSidebarWrites()
+  const directories = [...tempConfigDirs, tempConfigDir].filter(
+    (directory): directory is string => Boolean(directory),
+  )
+  tempConfigDirs.clear()
+  tempConfigDir = undefined
+  await Promise.all(
+    directories.map((directory) =>
+      rm(directory, { recursive: true, force: true }).catch(() => {}),
+    ),
+  )
+}
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
+
+async function withDeadlockGuard<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), ms)
+  })
+  try {
+    return await Promise.race([promise, timeoutPromise])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
+
+test('withDeadlockGuard clears its timeout after the primary settles', async () => {
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  // Concurrent async work schedules unrelated timers during the override
+  // window; every counter is scoped to the guard's own timer (identified by
+  // this sentinel delay) so nothing else can flip the probe.
+  const sentinelDelayMs = 47
+  const guardTimers = new Set<unknown>()
+  let timeoutFired = 0
+  let timeoutCleared = 0
+  let unhandled = 0
+  const guardMessage = 'late guard'
+  const onUnhandled = (reason: unknown) => {
+    if (reason instanceof Error && reason.message === guardMessage) {
+      unhandled += 1
+    }
+  }
+  globalThis.setTimeout = ((
+    callback: (...args: any[]) => void,
+    delay?: number,
+  ) => {
+    const isGuardTimer = delay === sentinelDelayMs
+    const handle = originalSetTimeout(() => {
+      if (isGuardTimer) timeoutFired += 1
+      callback()
+    }, delay)
+    if (isGuardTimer) guardTimers.add(handle)
+    return handle
+  }) as typeof globalThis.setTimeout
+  globalThis.clearTimeout = ((
+    timeout: ReturnType<typeof originalSetTimeout>,
+  ) => {
+    if (guardTimers.delete(timeout)) timeoutCleared += 1
+    originalClearTimeout(timeout)
+  }) as typeof globalThis.clearTimeout
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    await withDeadlockGuard(
+      Promise.resolve('primary'),
+      sentinelDelayMs,
+      guardMessage,
+    )
+    await Bun.sleep(100)
+    expect(timeoutFired).toBe(0)
+    expect(timeoutCleared).toBe(1)
+    expect(unhandled).toBe(0)
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  }
+})
+
+test('withDeadlockGuard rejects with its message at the deadline', async () => {
+  await expect(
+    withDeadlockGuard(new Promise<never>(() => {}), 20, 'deadline'),
+  ).rejects.toThrow('deadline')
+})
+
+test('cleanup retries a fallback refresh that outlives its bounded wait', async () => {
+  const slowRefresh = deferred()
+  let settled = false
+  const refresh = slowRefresh.promise.then(() => {
+    settled = true
+  })
+  fallbackRefreshes.add(refresh)
+
+  const firstStartedAt = Date.now()
+  await cleanupTempConfigDirs(50)
+  expect(Date.now() - firstStartedAt).toBeLessThan(500)
+  expect(settled).toBe(false)
+  expect(fallbackRefreshes.has(refresh)).toBe(true)
+
+  const releaseTimer = setTimeout(() => slowRefresh.resolve(), 20)
+  try {
+    await cleanupTempConfigDirs(50)
+  } finally {
+    clearTimeout(releaseTimer)
+  }
+  expect(settled).toBe(true)
+  expect(fallbackRefreshes.size).toBe(0)
+})
+
+test('extractUrl uses canonical fetch URLs and preserves raw invalid strings', () => {
+  expect(extractUrl('https://example.com/a/../b')).toBe('https://example.com/b')
+  expect(extractUrl('/relative')).toBe('/relative')
+  expect(extractUrl('not a URL')).toBe('not a URL')
+})
 
 async function expectHandledCommandResponse(promise: Promise<unknown>) {
   try {
@@ -345,6 +508,8 @@ async function useTempAccountFile(storage: AccountStorage) {
     await rm(tempConfigDir, { recursive: true, force: true })
   }
   tempConfigDir = await mkdtemp(join(tmpdir(), 'anthropic-plugin-test-'))
+  tempConfigDirs.add(tempConfigDir)
+  allTempConfigDirs.add(tempConfigDir)
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
     tempConfigDir,
     'anthropic-auth.json',
@@ -472,6 +637,18 @@ type PluginTimerOverrides = Partial<{
   clearInterval: typeof globalThis.clearInterval
 }>
 
+function disabledPluginTimerOverrides(): PluginTimerOverrides {
+  return {
+    // Background intervals must not outlive the test-scoped fetch mock they captured.
+    setInterval: mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    ) as unknown as typeof setInterval,
+    clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+  }
+}
+
+const originalSetInterval = globalThis.setInterval
+const originalClearInterval = globalThis.clearInterval
 let pluginTimerOverrides: PluginTimerOverrides = {}
 
 beforeEach(() => {
@@ -481,9 +658,14 @@ beforeEach(() => {
 async function getPlugin(
   client?: ReturnType<typeof createMockClient>,
   directory?: string,
-  timerOverrides: PluginTimerOverrides = pluginTimerOverrides,
+  timerOverrides: PluginTimerOverrides = {},
 ) {
-  return (await (
+  const defaultTimerOverrides =
+    globalThis.setInterval === originalSetInterval &&
+    globalThis.clearInterval === originalClearInterval
+      ? disabledPluginTimerOverrides()
+      : {}
+  const plugin = (await (
     AnthropicAuthPlugin as unknown as (
       ctx: Parameters<typeof AnthropicAuthPlugin>[0],
       timers?: PluginTimerOverrides,
@@ -494,11 +676,21 @@ async function getPlugin(
       client: client ?? createMockClient(),
       ...(directory && { directory }),
     },
-    timerOverrides,
-  )) as Promise<any>
+    { ...defaultTimerOverrides, ...pluginTimerOverrides, ...timerOverrides },
+  )) as any
+  if (plugin.__fallbackRefreshReady) {
+    fallbackRefreshes.add(plugin.__fallbackRefreshReady)
+  }
+  return plugin
 }
 
 describe('sidebar needsReauth (dead-fallback indicator)', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
   function fallbackWithRefreshError(status: number) {
     const refresh = 'fallback-refresh'
     const now = Date.now()
@@ -545,6 +737,28 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
 
   test('transient (429 rate-limited) fallback → needsReauth false', async () => {
     await useTempAccountFile(fallbackWithRefreshError(429))
+    const defaultFetch = globalThis.fetch
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url === TOKEN_URL) {
+        tokenCalls += 1
+        return Promise.reject(
+          new Error('TOKEN_URL is outside this transient quota test'),
+        )
+      }
+      if (url === QUOTA_URL) {
+        return Promise.resolve(
+          Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 0 },
+            limits: [],
+          }),
+        )
+      }
+      return defaultFetch(input, init)
+    }) as unknown as typeof fetch
+
     const plugin = await getPlugin()
     await plugin.auth.loader(
       () =>
@@ -560,6 +774,7 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
       (candidate) => candidate.fallbacks[0]?.needsReauth === false,
     )
     expect(state.fallbacks[0]?.needsReauth).toBe(false)
+    expect(tokenCalls).toBe(0)
   })
 })
 
@@ -643,6 +858,12 @@ async function loadMainAndFetch(
 }
 
 describe('quota header feed integration', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
   test('publishes a direct harvested response with the observation timestamp', async () => {
     const originalNow = Date.now
     let clock = 1_000_000
@@ -1360,6 +1581,39 @@ describe('quota header feed integration', () => {
           accounts: [],
         }),
       )
+      const otherCheckedAt = 2_000_000
+      const statePath = getAccountStatePath(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+      )
+      await writeFile(
+        statePath,
+        `${JSON.stringify({
+          version: 1,
+          main: {
+            quota: {
+              source: 'headers',
+              accountIdentity,
+              five_hour: {
+                usedPercent: 4,
+                remainingPercent: 96,
+                checkedAt: requestCheckedAt,
+              },
+              seven_day: {
+                usedPercent: 52,
+                remainingPercent: 48,
+                checkedAt: requestCheckedAt,
+              },
+            },
+            quotaCheckedAt: otherCheckedAt,
+            quotaToken: tokenFingerprint(accessToken),
+          },
+        })}\n`,
+      )
+      const mixedState = await loadAccounts()
+      expect(mixedState?.quota?.mainQuota?.accountIdentity).toBe(
+        accountIdentity,
+      )
+      expect(mixedState?.quota?.mainQuotaCheckedAt).toBe(otherCheckedAt)
       globalThis.fetch = mock((input: any) => {
         const url = extractUrl(input)
         if (url.includes('/claude_cli/bootstrap')) {
@@ -1380,14 +1634,6 @@ describe('quota header feed integration', () => {
         }
         return Promise.resolve(Response.json({}))
       }) as unknown as typeof fetch
-      const stateWriteLock = await acquireRefreshFileLock({
-        name: 'state-write',
-        ttlMs: 10_000,
-        path: process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-        renew: true,
-      })
-      if (!stateWriteLock) throw new Error('failed to hold account state lock')
-
       const plugin = await getPlugin()
       const result = await plugin.auth.loader(
         () =>
@@ -1401,34 +1647,6 @@ describe('quota header feed integration', () => {
       )
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
       await response.text()
-
-      const otherCheckedAt = 2_000_000
-      const statePath = getAccountStatePath(
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-      )
-      const state = JSON.parse(await readFile(statePath, 'utf8')) as {
-        main?: Record<string, unknown>
-      }
-      state.main = {
-        ...(state.main ?? {}),
-        quota: {
-          source: 'poll',
-          accountIdentity: 'account-b',
-          checkedAt: otherCheckedAt,
-          five_hour: {
-            usedPercent: 80,
-            remainingPercent: 20,
-            checkedAt: otherCheckedAt,
-          },
-        },
-        quotaCheckedAt: otherCheckedAt,
-        quotaToken: tokenFingerprint('sk-ant-oat-account-b'),
-      }
-      await writeFile(statePath, `${JSON.stringify(state)}\n`)
-      await stateWriteLock.release()
-      await waitForAccountStorage(
-        (loaded) => loaded?.quota?.mainQuotaCheckedAt === otherCheckedAt,
-      )
 
       const published = (
         await waitForFeedEntries(
@@ -2202,6 +2420,12 @@ describe('experimental.chat.system.transform', () => {
 })
 
 describe('quota header feed extended integration', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
   test('disabled quota header feed publishes nothing by default or when explicitly false', async () => {
     for (const enabled of [undefined, false]) {
       const storage = createFallbackStorage({
@@ -2781,6 +3005,12 @@ test('test setup keeps sidebar state off the production default path', () => {
 })
 
 describe('Fable 5.1 request-scoped effort history', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
   test('carries message variants into the OAuth body and strips the internal header', async () => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -3125,7 +3355,6 @@ describe('auth.loader', () => {
   const originalDateNow = Date.now
 
   beforeEach(async () => {
-    globalThis.fetch = originalFetch
     pluginTimerOverrides = {}
     Math.random = originalRandom
     Date.now = originalDateNow
@@ -3468,6 +3697,7 @@ describe('auth.loader', () => {
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
+        quota: { enabled: false },
         accounts: [
           {
             id: 'work-deleted',
@@ -3476,49 +3706,132 @@ describe('auth.loader', () => {
             refresh: 'work-deleted-refresh',
             expires: Date.now() + 100000,
           },
-        ],
-      }),
-    )
-    const plugin = await getPlugin()
-    // v1.16.0's mergeAccountsForSave unions existing+incoming accounts, so a
-    // deletion must be declared explicitly via removedAccountIds — a plain
-    // save without the account no longer removes it.
-    await saveAccounts(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        accounts: [
           {
-            id: 'work-current',
+            id: 'work-witness',
             type: 'oauth',
-            access: 'work-current-access',
-            refresh: 'work-current-refresh',
+            access: 'work-witness-stale-access',
+            refresh: 'work-witness-stale-refresh',
             expires: Date.now() + 100000,
+            lastRefreshedAt: 100,
           },
         ],
       }),
-      undefined,
-      { removedAccountIds: ['work-deleted'] },
     )
-    await seedSidebarRouting('work-deleted', 'fallback-first', Date.now())
-
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
+    const refreshStarted = deferred()
+    const releaseRefresh = deferred()
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url === TOKEN_URL) {
+        refreshStarted.resolve()
+        return releaseRefresh.promise.then(
+          () =>
+            new Response(JSON.stringify({ error: 'invalid_grant' }), {
+              status: 400,
+              headers: { 'content-type': 'application/json' },
+            }),
+        )
+      }
+      if (url === PROFILE_URL) {
+        return Promise.resolve(new Response('unauthorized', { status: 401 }))
+      }
+      if (url === QUOTA_URL) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.1 },
+              seven_day: { utilization: 0.1 },
+              limits: [],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.reject(new Error(`Unexpected test fetch: ${url}`))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const backgroundRefreshReady = (
+      plugin as unknown as { __fallbackRefreshReady?: Promise<void> }
+    ).__fallbackRefreshReady
+    expect(backgroundRefreshReady).toBeInstanceOf(Promise)
+    try {
+      await withDeadlockGuard(
+        refreshStarted.promise,
+        4_000,
+        'fallback refresh never reached the token stub; the eager refresh did not start',
+      )
+      // v1.16.0's mergeAccountsForSave unions existing+incoming accounts, so a
+      // deletion must be declared explicitly via removedAccountIds — a plain
+      // save without the account no longer removes it.
+      await saveAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: { enabled: false },
+          accounts: [
+            {
+              id: 'work-current',
+              type: 'oauth',
+              access: 'work-current-access',
+              refresh: 'work-current-refresh',
+              expires: Date.now() + 100000,
+            },
+            {
+              id: 'work-witness',
+              type: 'oauth',
+              access: 'work-witness-current-access',
+              refresh: 'work-witness-current-refresh',
+              expires: Date.now() + 100000,
+              lastRefreshedAt: 200,
+            },
+          ],
         }),
-      { models: {} },
-    )
-    await drainSidebarWrites()
+        undefined,
+        { removedAccountIds: ['work-deleted'] },
+      )
+      await seedSidebarRouting('work-deleted', 'fallback-first', Date.now())
 
-    const state = await getSidebarState()
-    expect(state.activeId).toBe('work-current')
-    expect(state.route).toBe('fallback-first')
-    expect(state.fallbacks.map((account) => account.id)).toEqual([
-      'work-current',
-    ])
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+      releaseRefresh.resolve()
+      await withDeadlockGuard(
+        backgroundRefreshReady!,
+        4_000,
+        'fallback background refresh did not complete after the token stub was released',
+      )
+      const disk = await loadAccounts()
+      expect(disk?.accounts.map((account) => account.id)).toEqual([
+        'work-current',
+        'work-witness',
+      ])
+      expect(
+        disk?.accounts.find((account) => account.id === 'work-current'),
+      ).toMatchObject({
+        access: 'work-current-access',
+        refresh: 'work-current-refresh',
+      })
+      expect(
+        disk?.accounts.find((account) => account.id === 'work-witness'),
+      ).toMatchObject({
+        lastRefreshError: { status: 400, permanent: true },
+      })
+      const state = await waitForSidebarState(
+        (candidate) => candidate.activeId === 'work-current',
+      )
+      expect(state.route).toBe('fallback-first')
+      expect(state.fallbacks.map((account) => account.id)).toEqual([
+        'work-current',
+        'work-witness',
+      ])
+    } finally {
+      releaseRefresh.resolve()
+    }
   })
 
   test('boot ignores stale sidebar routing and derives fallback-first routing', async () => {
@@ -5494,7 +5807,7 @@ describe('auth.loader', () => {
       }),
     })
 
-    expect(capturedUrl).toBe('https://relay.example.test')
+    expect(capturedUrl).toBe('https://relay.example.test/')
     expect(capturedHeaders?.get('x-relay-token')).toBe('relay-token')
     const payload = JSON.parse(capturedBody!)
     expect(payload).toMatchObject({
@@ -5566,7 +5879,7 @@ describe('auth.loader', () => {
       }),
     })
 
-    expect(capturedUrl).toBe('https://relay.example.test')
+    expect(capturedUrl).toBe('https://relay.example.test/')
   })
 
   test('sidebar relay transport reflects current sidecar storage', async () => {
@@ -6743,7 +7056,6 @@ describe('auth.loader', () => {
     )
     await profileStarted
     await drainSidebarWrites()
-    const initialSidebarUpdatedAt = (await getSidebarState()).lastUpdated
 
     const rotated = await loadAccounts()
     const fallback = rotated?.accounts[0]
@@ -6763,11 +7075,16 @@ describe('auth.loader', () => {
         },
       }),
     )
-    await waitForSidebarState(
-      (state) => state.lastUpdated > initialSidebarUpdatedAt,
-    )
-
-    const reloaded = await loadAccounts()
+    const reloaded = await waitForAccountStorage((storage) => {
+      const account = storage?.accounts.find(
+        (candidate) => candidate.id === 'fb',
+      )
+      return (
+        account?.type === 'oauth' &&
+        account.profile?.tier === 'default_claude_max_5x'
+      )
+    })
+    await drainSidebarWrites()
     const reloadedFallback = reloaded?.accounts[0]
     expect(reloadedFallback).toMatchObject({
       access: 'new-access',
@@ -12409,14 +12726,18 @@ describe('auth.loader', () => {
         }),
       )
       const records: LogTestRecord[] = []
+      let relay503Calls = 0
+      let directCalls = 0
       __setLogTestSink((record) => records.push(record))
       globalThis.fetch = mock((input: string | URL | Request) => {
         const url = extractUrl(input)
-        if (url === 'https://relay.example.test') {
+        if (url === 'https://relay.example.test/') {
+          relay503Calls += 1
           return Promise.resolve(
             new Response('relay unavailable', { status: 503 }),
           )
         }
+        directCalls += 1
         return Promise.resolve(
           new Response('direct', { headers: quotaHeaders }),
         )
@@ -12430,6 +12751,8 @@ describe('auth.loader', () => {
           headers: { 'x-session-affinity': 'quota-relay-direct-fallback' },
         })
         expect(await response.text()).toBe('direct')
+        expect(relay503Calls).toBe(1)
+        expect(directCalls).toBe(1)
         await waitForState((value) => value.main?.quota?.source === 'headers')
         expect(
           records.filter(
@@ -14246,7 +14569,6 @@ describe('killswitch fetch gate', () => {
   const originalFetch = globalThis.fetch
 
   beforeEach(() => {
-    globalThis.fetch = originalFetch
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     // Prevent this plugin instance's background intervals from leaking into
     // later tests without mutating process-global timers used by other files.
@@ -14651,7 +14973,6 @@ describe('claude-prime direct request', () => {
   const originalSetInterval = globalThis.setInterval
 
   beforeEach(async () => {
-    globalThis.fetch = originalFetch
     globalThis.setInterval = mock(
       () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
     ) as unknown as typeof setInterval
@@ -14993,6 +15314,7 @@ describe('claude-prime direct request', () => {
       expires: Date.now() + 5 * 60 * 60_000,
     }
     const mockClient = createMockClient()
+    const mainRefreshPublished = deferred()
     let lineageObservedBeforePublish: string | undefined
     let lineageObservedDuringPublish: string | undefined
     ;(mockClient.auth as any).set = mock(
@@ -15013,6 +15335,7 @@ describe('claude-prime direct request', () => {
           'main',
           process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
         )
+        mainRefreshPublished.resolve()
       },
     )
     let sends = 0
@@ -15069,7 +15392,16 @@ describe('claude-prime direct request', () => {
     const mainRefreshHandler = intervalHandlers.at(-1)
     expect(mainRefreshHandler).toBeDefined()
     mainRefreshHandler!()
-    await waitForMockCall(mockClient.auth.set)
+    await withDeadlockGuard(
+      mainRefreshPublished.promise,
+      4_000,
+      'main background refresh did not publish rotated auth',
+    )
+    await waitForAccountStorage(
+      (storage) =>
+        hostAuth.access === 'main-access-b' &&
+        storage?.refresh?.mainRefreshLeaseId === undefined,
+    )
     await manager.tick()
 
     const after = JSON.parse(
@@ -15762,7 +16094,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   const originalSetInterval = globalThis.setInterval
 
   beforeEach(async () => {
-    globalThis.fetch = originalFetch
     globalThis.setInterval = mock(
       () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
     ) as unknown as typeof setInterval
@@ -16135,7 +16466,6 @@ describe('claude-prime — warn dedup (R3)', () => {
   const originalSetInterval = globalThis.setInterval
 
   beforeEach(async () => {
-    globalThis.fetch = originalFetch
     globalThis.setInterval = mock(
       () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
     ) as unknown as typeof setInterval

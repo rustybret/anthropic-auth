@@ -1286,9 +1286,7 @@ const anthropicAuthPlugin = async (
         ? {
             ...entry,
             quota: mergedQuota,
-            checkedAt: persistedQuotaBelongsToRequest
-              ? (reloaded.quota?.mainQuotaCheckedAt ?? entry.checkedAt)
-              : entry.checkedAt,
+            checkedAt: entry.checkedAt,
           }
         : entry
     }
@@ -1527,7 +1525,7 @@ const anthropicAuthPlugin = async (
       void refreshSidebarQuota().catch(() => {})
     },
   })
-  fallbackManager.startBackgroundRefresh()
+  const fallbackRefreshReady = fallbackManager.startBackgroundRefresh()
   const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
   const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
   type CacheDiagnosticsResponse = {
@@ -6741,6 +6739,7 @@ const anthropicAuthPlugin = async (
     },
     __primeManager: primeManager,
     __quotaManager: quotaManager,
+    __fallbackRefreshReady: fallbackRefreshReady,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }

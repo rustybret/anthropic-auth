@@ -53,6 +53,7 @@ type QuotaHeaderFeedMetadata = {
   schema_version: typeof QUOTA_HEADER_FEED_SCHEMA_VERSION
   provider: 'anthropic'
   configured_account_count: number
+  /** Header observation time; merged poll-owned fields retain their own checkedAt. */
   observed_at_ms: number
 }
 

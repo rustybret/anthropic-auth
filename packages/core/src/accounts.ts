@@ -939,6 +939,25 @@ function mergeConfigAccountAndState(
   return { ...account, ...stateAccount }
 }
 
+function configAccountHasInvalidShape(account: Record<string, unknown>) {
+  if (account.type !== 'api' && account.type !== 'oauth') return true
+  if (
+    account.type === 'api' &&
+    'baseURL' in account &&
+    (typeof account.baseURL !== 'string' || !isValidApiBaseURL(account.baseURL))
+  ) {
+    return true
+  }
+  if (
+    account.type === 'oauth' &&
+    'refresh' in account &&
+    (typeof account.refresh !== 'string' || !account.refresh.trim())
+  ) {
+    return true
+  }
+  return false
+}
+
 function mergeConfigAndState(
   configValue: unknown,
   stateValue: unknown,
@@ -971,10 +990,13 @@ function mergeConfigAndState(
   const accounts = Array.isArray(configValue.accounts)
     ? configValue.accounts.map((account) => {
         if (!isRecord(account)) return account
-        const stateAccount: Record<string, unknown> =
-          typeof account.id === 'string' && isRecord(stateAccounts[account.id])
-            ? (stateAccounts[account.id] as Record<string, unknown>)
-            : {}
+        const rawId = typeof account.id === 'string' ? account.id : undefined
+        const stateValue = rawId
+          ? (stateAccounts[rawId] ?? stateAccounts[rawId.trim()])
+          : undefined
+        const stateAccount: Record<string, unknown> = isRecord(stateValue)
+          ? (stateValue as Record<string, unknown>)
+          : {}
         return mergeConfigAccountAndState(account, stateAccount)
       })
     : []
@@ -1951,30 +1973,77 @@ async function saveAccountStateUnlocked(
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
+    const config = (await readJsonIfPresent(path)).value
+    const configuredIds = (() => {
+      if (!isRecord(config) || !Array.isArray(config.accounts)) return null
+      if (config.accounts.length === 0) return new Set<string>()
+      const stateAccounts = isRecord(next.accounts) ? next.accounts : {}
+      const incomingAccounts = Object.fromEntries(
+        storage.accounts.map((account) => [
+          account.id.trim(),
+          accountRuntimeState(account),
+        ]),
+      )
+      // Keep both forms because legacy state may still use either key while
+      // scoped saves must preserve entries not superseded by an incoming account.
+      const memberships = config.accounts.map((account) => {
+        if (!isRecord(account) || typeof account.id !== 'string') return null
+        const id = account.id.trim()
+        if (!id) return null
+        if (configAccountHasInvalidShape(account)) return null
+        const stateValue = stateAccounts[account.id] ?? stateAccounts[id]
+        const stateAccount: Record<string, unknown> = isRecord(stateValue)
+          ? (stateValue as Record<string, unknown>)
+          : {}
+        const incomingAccount = incomingAccounts[id] as
+          | Record<string, unknown>
+          | undefined
+        return normalizeAccount(
+          mergeConfigAccountAndState(account, incomingAccount ?? stateAccount),
+        )
+          ? [account.id, id]
+          : null
+      })
+      // A populated config with any unparseable entry cannot establish safe membership.
+      return memberships.every((membership) => membership !== null)
+        ? new Set(memberships.flatMap((membership) => membership ?? []))
+        : null
+    })()
     next.accounts = { ...(isRecord(next.accounts) ? next.accounts : {}) }
     for (const account of storage.accounts) {
-      if (ids && !ids.has(account.id)) continue
-      next.accounts[account.id] = mergeAccountRuntimeState(
-        next.accounts[account.id],
+      const accountId = account.id.trim()
+      if (ids && !ids.has(account.id) && !ids.has(accountId)) continue
+      if (
+        configuredIds &&
+        !configuredIds.has(account.id) &&
+        !configuredIds.has(accountId)
+      )
+        continue
+      const legacyKeys = Object.keys(next.accounts).filter(
+        (key) => key !== accountId && key.trim() === accountId,
+      )
+      const legacyKey = legacyKeys[0]
+      const existingAccount =
+        next.accounts[accountId] ??
+        (legacyKey ? next.accounts[legacyKey] : undefined)
+      for (const key of legacyKeys) delete next.accounts[key]
+      next.accounts[accountId] = mergeAccountRuntimeState(
+        existingAccount,
         accountRuntimeState(account),
       )
+    }
+    if (configuredIds) {
+      // Config membership is authoritative for scoped writes too; otherwise a
+      // stale writer can preserve state for an account removed out of band.
+      for (const id of Object.keys(next.accounts)) {
+        if (!configuredIds.has(id)) delete next.accounts[id]
+      }
     }
     if (ids) {
       for (const id of ids) {
         if (!storage.accounts.some((account) => account.id === id)) {
           delete next.accounts[id]
         }
-      }
-    } else {
-      // Full save: drop any per-account state whose id is no longer present in
-      // storage.accounts. The scoped path above only prunes ids it was asked to
-      // save; on a removal the storage is saved with scope.accounts === true
-      // (ids === null), so without this branch the removed account's runtime
-      // state (quota/lastRefreshError/access/refresh/expires) would be orphaned
-      // in the state file and later merged onto a re-added same-id account.
-      const present = new Set(storage.accounts.map((account) => account.id))
-      for (const id of Object.keys(next.accounts)) {
-        if (!present.has(id)) delete next.accounts[id]
       }
     }
   }
@@ -3608,13 +3677,14 @@ export class FallbackAccountManager {
       await this.refreshDueAccounts()
       await this.refreshQuotaForDueAccounts()
     }
-    void run().catch(() => {})
+    const initialRun = run().catch(() => {})
     if (!this.refreshTimer) {
       this.refreshTimer = this.setIntervalImpl(() => {
         void run().catch(() => {})
       }, BACKGROUND_TICK_MS + jitterMs(BACKGROUND_TICK_JITTER_MS))
       if ('unref' in this.refreshTimer) this.refreshTimer.unref()
     }
+    return initialRun
   }
 
   stopBackgroundRefresh() {

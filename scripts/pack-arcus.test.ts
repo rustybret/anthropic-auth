@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -99,6 +100,65 @@ describe('anthropic-auth arcus packaging & sync', () => {
 
   it('packs release and generates a signed Arcus v2 envelope and dual-window v1 manifest in an isolated directory', () => {
     const testOutDir = mkdtempSync(join(tmpdir(), 'arcus-v2-test-'))
+    const mockBinDir = mkdtempSync(join(tmpdir(), 'arcus-mock-bin-'))
+    const mockArcus = join(mockBinDir, 'arcus')
+
+    // Provide a mock arcus binary if arcus CLI is not installed on the system
+    const hasArcus =
+      existsSync('/usr/local/bin/arcus') ||
+      existsSync(`${process.env.HOME}/.local/bin/arcus`)
+    const env = { ...process.env }
+    if (!hasArcus && !process.env.ARCUS_BIN) {
+      const mockScript = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+
+const args = process.argv.slice(2);
+if (args[0] === 'pack') {
+  let output = 'dist-arcus';
+  let releaseId = '${opencodePkg.version}';
+  let sequence = 9999;
+  let pkgId = 'opencode-anthropic-auth';
+  let version = '${opencodePkg.version}';
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--output' && args[i + 1]) output = args[i + 1];
+    if (args[i] === '--release-id' && args[i + 1]) releaseId = args[i + 1];
+    if (args[i] === '--sequence' && args[i + 1]) sequence = Number(args[i + 1]);
+    if (args[i] === '--package-id' && args[i + 1]) pkgId = args[i + 1];
+    if (args[i] === '--version' && args[i + 1]) version = args[i + 1];
+  }
+  const relDir = path.join(output, 'releases');
+  fs.mkdirSync(relDir, { recursive: true });
+  const targets = {};
+  for (const t of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'windows-x64']) {
+    targets[t] = {
+      artifact: { archive_sha256: 'a'.repeat(64) },
+      target_content_source: { sha256: 'b'.repeat(64) },
+      tree_signature: { sha256: 'c'.repeat(64) }
+    };
+  }
+  const envelope = {
+    signed: {
+      schema_version: 2,
+      kind: 'release',
+      package_id: pkgId,
+      version: version,
+      sequence: sequence,
+      targets: targets
+    },
+    signatures: ['mock-signature']
+  };
+  fs.writeFileSync(path.join(relDir, releaseId + '.json'), JSON.stringify(envelope, null, 2));
+  console.log(JSON.stringify({ status: 'ok' }));
+  process.exit(0);
+} else if (args[0] === 'manifest' && args[1] === 'validate') {
+  process.exit(0);
+}
+process.exit(0);
+`
+      writeFileSync(mockArcus, mockScript, { mode: 0o755 })
+      env.ARCUS_BIN = mockArcus
+    }
 
     try {
       execFileSync(
@@ -111,7 +171,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
           testOutDir,
           '--skip-build',
         ],
-        { cwd: repoRoot, stdio: 'pipe' },
+        { cwd: repoRoot, stdio: 'pipe', env },
       )
 
       const expectedTarballName = `cortexkit-opencode-anthropic-auth-${opencodePkg.version}.tgz`
@@ -173,6 +233,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
       )
     } finally {
       rmSync(testOutDir, { recursive: true, force: true })
+      rmSync(mockBinDir, { recursive: true, force: true })
     }
   }, 25000)
 })
