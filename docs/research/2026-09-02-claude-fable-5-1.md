@@ -46,7 +46,7 @@ Additional migration constraints:
 - Temperature and top-p cannot both be set.
 - Fable 5.1 validates replayed thinking blocks against the exact conversation prefix that produced their signatures. Anthropic's `thinking-binding-controls-2026-08-01` beta and `thinking.block_binding.prefix_mismatch_behavior = "drop_block"` allow a client that intentionally rewrites history to discard mismatched thinking blocks instead of failing the request.
 - Anthropic documents this prefix check as a Fable 5.1 behavior; it does not affect Mythos 5.1.
-- New API accounts default to mismatch errors. Existing accounts are temporarily warning-only before the stricter default is applied.
+- New API accounts default to mismatch errors. Existing accounts are temporarily warning-only before the stricter default is applied. CortexKit therefore exposes `thinkingBinding.prefixMismatchBehavior` with `account-default`, `error`, and `drop_block` values instead of assuming one account-wide default.
 
 ## Verified Claude Code 2.1.258 wire contract
 
@@ -74,6 +74,12 @@ A direct OAuth probe against Fable 5.1 generated a signed thinking block, replay
 - `prefix_mismatch_behavior: "drop_block"` returned HTTP 200 and completed normally with new thinking and text blocks.
 
 This proves the shared control covers the actual Pi/OpenCode compaction failure mode rather than only satisfying a request-schema test.
+
+## Live mid-conversation effort validation
+
+A three-turn OAuth Fable 5.1 probe changed effort with empty system messages carrying `output_config.effort` under beta `mid-conversation-output-config-2026-07-01`. The request kept top-level effort anchored to the first retained turn. Anthropic read the full 6,378-token cached prefix after the effort change, confirming that the marker changes reasoning effort without rewriting the cache prefix. Reasoning effort was not present in the system prompt.
+
+CortexKit now includes the mid-conversation beta on every OAuth Fable 5.1 request so the beta set itself remains stable across a session. OpenCode derives changes from per-user model variants; Pi derives them from `thinking_level_change` entries. Both fold the current effort into a newly compacted prefix and begin a fresh transition timeline. Mythos 5.1, older models, and API-key routes remain outside this behavior.
 
 ## PR assessment
 

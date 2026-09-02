@@ -2,7 +2,7 @@
 
 Pi package for CortexKit Anthropic OAuth support. It overrides Pi's built-in `anthropic` provider with a CortexKit provider extension backed by the shared `@cortexkit/anthropic-auth-core` package.
 
-The Pi provider catalog includes Claude Fable 5 (`claude-fable-5`) and 5.1 (`claude-fable-5-1`), limited-access Claude Mythos 5 (`claude-mythos-5`) and 5.1 (`claude-mythos-5-1`), Claude Opus 5 (`claude-opus-5`), Claude Opus 4.8, Claude Opus 4.5, Claude Sonnet 4.5, and Claude Sonnet 5 (`claude-sonnet-5`). Fable/Mythos reasoning uses Anthropic adaptive thinking with `thinking.display: "summarized"` and `output_config.effort`; the package does not send rejected manual `thinking.budget_tokens` for those models. On Fable 5.1 continuations, Pi uses Anthropic's thinking-binding control only when replaying signed or redacted thinking, so a compacted prefix drops mismatched thinking instead of failing the request.
+The Pi provider catalog includes Claude Fable 5 (`claude-fable-5`) and 5.1 (`claude-fable-5-1`), limited-access Claude Mythos 5 (`claude-mythos-5`) and 5.1 (`claude-mythos-5-1`), Claude Opus 5 (`claude-opus-5`), Claude Opus 4.8, Claude Opus 4.5, Claude Sonnet 4.5, and Claude Sonnet 5 (`claude-sonnet-5`). Fable/Mythos reasoning uses Anthropic adaptive thinking with `thinking.display: "summarized"` and `output_config.effort`; the package does not send rejected manual `thinking.budget_tokens` for those models. OAuth Fable 5.1 sessions preserve Pi thinking-level changes as mid-conversation effort markers, so switching effort does not rewrite the cached prefix. Replayed signed/redacted thinking follows the configured prefix-mismatch behavior.
 
 This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@cortexkit/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic.
 
@@ -42,7 +42,7 @@ Pi state is stored separately from OpenCode at:
 
 Override the path with `PI_ANTHROPIC_AUTH_FILE`. The package also respects `PI_AGENT_DIR` when deriving the default sidecar path.
 
-The sidecar uses the same JSON shape as the OpenCode package, including `routing`, `claudeCache`, `cacheKeep`, `prime`, `claudeFast`, `dump`, `relay`, and fallback `accounts` blocks. Runtime OAuth/quota state is stored in `anthropic-auth-state.json`; sticky session assignments are stored separately in `anthropic-auth-routing-state.json` with SHA-256-hashed session IDs.
+The sidecar uses the same JSON shape as the OpenCode package, including `routing`, `claudeCache`, `cacheKeep`, `prime`, `claudeFast`, `thinkingBinding`, `dump`, `relay`, and fallback `accounts` blocks. `thinkingBinding.prefixMismatchBehavior` accepts `account-default` (default), `error`, or `drop_block` for OAuth Fable 5.1 replay. Runtime OAuth/quota state is stored in `anthropic-auth-state.json`; sticky session assignments are stored separately in `anthropic-auth-routing-state.json` with SHA-256-hashed session IDs.
 
 ## Commands
 

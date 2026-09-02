@@ -95,6 +95,7 @@ describe('Pi API fallback routing helpers', () => {
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },
+        thinkingBinding: { prefixMismatchBehavior: 'drop_block' },
         accounts: [],
       },
       storagePath,
@@ -159,6 +160,10 @@ describe('Pi API fallback routing helpers', () => {
       { ...anthropicModel, id: 'claude-fable-5-1', name: 'Claude Fable 5.1' },
       context,
       { apiKey: 'sk-ant-oat-pi-fable-51', sessionId: 'ses_pi_fable_51' },
+      [
+        { afterAssistantMessages: 0, effort: 'low' },
+        { afterAssistantMessages: 1, effort: 'high' },
+      ],
     )
     for await (const _event of stream) {
       // Drain the provider stream.
@@ -167,8 +172,17 @@ describe('Pi API fallback routing helpers', () => {
     expect(requestBody?.thinking?.block_binding).toEqual({
       prefix_mismatch_behavior: 'drop_block',
     })
+    expect(requestBody?.output_config).toEqual({ effort: 'low' })
+    expect(requestBody?.messages[2]).toEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
     expect(requestHeaders?.get('anthropic-beta')).toContain(
       'thinking-binding-controls-2026-08-01',
+    )
+    expect(requestHeaders?.get('anthropic-beta')).toContain(
+      'mid-conversation-output-config-2026-07-01',
     )
   })
 

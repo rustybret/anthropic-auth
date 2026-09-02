@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyMidConversationOutputConfig,
   applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
@@ -21,6 +22,8 @@ import {
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
+  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
@@ -30,7 +33,9 @@ import {
   signRequestBody,
   TEXT_REPLACEMENTS,
   THINKING_BINDING_CONTROLS_BETA,
+  type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
+  usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
   applyCacheDiagnosticsOptIn,
@@ -169,6 +174,9 @@ export function setOAuthHeaders(
         : []),
       ...(options.body && hasThinkingBindingControls(options.body)
         ? [THINKING_BINDING_CONTROLS_BETA]
+        : []),
+      ...(options.body && usesMidConversationOutputConfig(options.body)
+        ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
         : []),
     ],
   })
@@ -1220,7 +1228,8 @@ export async function rewriteRequestBody(
     fastModeEnabled?: boolean
     identity?: ClaudeCodeIdentity
     sessionId?: string
-    thinkingBindingControlsEnabled?: boolean
+    thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
+    effortTransitions?: readonly MidConversationEffortTransition[]
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1290,9 +1299,11 @@ export async function rewriteRequestBody(
       delete parsed.thinking
     }
 
-    if (options.thinkingBindingControlsEnabled === true) {
-      applyThinkingBindingControls(parsed)
-    }
+    applyMidConversationOutputConfig(parsed, options.effortTransitions ?? [])
+    applyThinkingBindingControls(
+      parsed,
+      options.thinkingPrefixMismatchBehavior ?? 'account-default',
+    )
 
     const billingStart = rewriteNowMs()
     const billingHeader =

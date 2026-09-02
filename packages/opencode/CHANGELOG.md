@@ -9,6 +9,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 - Keep quota, profile, refresh-backoff, Prime-lineage, and routing state attached to stable Claude account identities across OAuth token rotation, while treating unknown identity or quota as distinct from an absent account.
 - Add an opt-in host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
 - Add Claude Fable 5.1 and limited-access Mythos 5.1 to the model catalogue and extend quota routing, server fallback, deterministic recovery, cache warming, and sidebar naming to Fable 5.1.
+- Preserve OAuth Fable 5.1 prompt-cache prefixes across per-turn effort changes, expose native effort variants, and add explicit `account-default`, `error`, or `drop_block` thinking-prefix behavior in sidecar config.
 
 ### Patch Changes
 
@@ -16,7 +17,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 - Treat DNS lookup failures as transient OAuth refresh failures with a fixed five-minute retry interval—including already-persisted long backoffs—and keep sticky-balanced fallback routes usable while their current access token remains valid.
 - Keep the plugin entrypoint limited to the plugin factory so OpenCode cannot invoke internal request-policy helpers as plugins.
 - Update OpenTUI Core and Solid together to 0.5.7.
-- Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply Fable 5.1 thinking-prefix recovery only when replaying signed or redacted thinking.
+- Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking.
 
 Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity, the host-local quota feed, Fable/Mythos 5.1 support, and Claude Code identity compatibility.
 

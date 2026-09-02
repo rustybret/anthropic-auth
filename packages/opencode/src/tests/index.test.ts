@@ -2780,6 +2780,136 @@ test('test setup keeps sidebar state off the production default path', () => {
   ).toBe(true)
 })
 
+describe('Fable 5.1 request-scoped effort history', () => {
+  test('carries message variants into the OAuth body and strips the internal header', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        refresh: {
+          enabled: false,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+        },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+        thinkingBinding: { prefixMismatchBehavior: 'error' },
+      }),
+    )
+    let sentBody: Record<string, any> | undefined
+    let sentHeaders: Headers | undefined
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/claude_cli/bootstrap')) {
+          return Promise.resolve(
+            Response.json({
+              oauth_account: { account_uuid: 'effort-account' },
+            }),
+          )
+        }
+        if (url.includes('/v1/messages')) {
+          sentBody = JSON.parse(String(init?.body))
+          sentHeaders = new Headers(init?.headers)
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const messages = [
+      {
+        info: {
+          role: 'user',
+          sessionID: 'ses_effort',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5-1',
+            variant: 'low',
+          },
+        },
+        parts: [],
+      },
+      {
+        info: { role: 'assistant', sessionID: 'ses_effort' },
+        parts: [],
+      },
+      {
+        info: {
+          role: 'user',
+          sessionID: 'ses_effort',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5-1',
+            variant: 'high',
+          },
+        },
+        parts: [],
+      },
+    ]
+    await plugin['experimental.chat.messages.transform']({}, { messages })
+    const output = { headers: {} as Record<string, string> }
+    await plugin['chat.headers'](
+      { sessionID: 'ses_effort', message: { id: 'msg_effort' } },
+      output,
+    )
+
+    const auth = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: {
+        ...output.headers,
+        'x-session-affinity': 'ses_effort',
+      },
+      body: JSON.stringify({
+        model: 'claude-fable-5-1',
+        thinking: { type: 'adaptive', display: 'summarized' },
+        output_config: { effort: 'high' },
+        messages: [
+          { role: 'user', content: 'first' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'trace', signature: 'sig' },
+              { type: 'text', text: 'answer' },
+            ],
+          },
+          { role: 'user', content: 'second' },
+        ],
+      }),
+    })
+
+    expect(sentBody?.output_config).toEqual({ effort: 'low' })
+    expect(sentBody?.messages[2]).toEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
+    expect(sentBody?.thinking.block_binding).toEqual({
+      prefix_mismatch_behavior: 'error',
+    })
+    expect(sentHeaders?.get('anthropic-beta')).toContain(
+      'mid-conversation-output-config-2026-07-01',
+    )
+    expect(sentHeaders?.get('anthropic-beta')).toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
+    expect(sentHeaders?.has('x-cortexkit-effort-history')).toBe(false)
+  })
+})
+
 describe('provider.models', () => {
   beforeEach(async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
@@ -2842,6 +2972,18 @@ describe('provider.models', () => {
       output: 0,
       cache: { read: 0, write: 0 },
     })
+    expect(Object.keys(result?.['claude-fable-5-1']?.variants ?? {})).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    expect(result?.['claude-fable-5-1']?.variants?.xhigh).toEqual({
+      thinking: { type: 'adaptive', display: 'summarized' },
+      effort: 'xhigh',
+    })
+    expect(result?.['claude-mythos-5-1']?.variants).toBeUndefined()
     expect(result?.['claude-mythos-5-1']?.name).toBe('Claude Mythos 5.1')
     expect(models['claude-opus-4-8'].cost).toEqual({
       input: 5,

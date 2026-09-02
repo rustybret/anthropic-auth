@@ -16,6 +16,7 @@ import {
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
+  getThinkingPrefixMismatchBehavior,
   hasThinkingBindingControls,
   isApiKeyAccount,
   isCache1hPersistentlyEnabled,
@@ -28,6 +29,8 @@ import {
   isValidApiBaseURL,
   killswitchPassesPolicy,
   loadAccounts,
+  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -49,6 +52,7 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   THINKING_BINDING_CONTROLS_BETA,
+  usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -352,6 +356,7 @@ async function sendAnthropicRequest(options: {
   storagePath: string
   oauthAccountId?: string
   route?: string
+  effortTransitions?: readonly MidConversationEffortTransition[]
 }): Promise<Response> {
   await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
@@ -377,6 +382,12 @@ async function sendAnthropicRequest(options: {
     },
     isFastModePersistentlyEnabled(storage),
     identity,
+    {
+      effortTransitions: options.apiAccount ? [] : options.effortTransitions,
+      thinkingPrefixMismatchBehavior: options.apiAccount
+        ? 'account-default'
+        : getThinkingPrefixMismatchBehavior(storage),
+    },
   )
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
@@ -384,9 +395,14 @@ async function sendAnthropicRequest(options: {
     : applyClaudeCodeHeaders(new Headers(), options.accessToken ?? '', {
         body,
         identity,
-        extraBetas: hasThinkingBindingControls(body)
-          ? [THINKING_BINDING_CONTROLS_BETA]
-          : [],
+        extraBetas: [
+          ...(hasThinkingBindingControls(body)
+            ? [THINKING_BINDING_CONTROLS_BETA]
+            : []),
+          ...(usesMidConversationOutputConfig(body)
+            ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
+            : []),
+        ],
       })
   if (!options.apiAccount && fastMode) {
     headers.set(
@@ -503,6 +519,7 @@ async function executeWithFallback(options: {
   streamOptions?: SimpleStreamOptions
   primaryAccessToken: string
   storagePath: string
+  effortTransitions?: readonly MidConversationEffortTransition[]
 }): Promise<Response> {
   await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
@@ -1165,6 +1182,7 @@ export function streamCortexKitAnthropic(
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
+  effortTransitions?: readonly MidConversationEffortTransition[],
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream()
 
@@ -1183,6 +1201,7 @@ export function streamCortexKitAnthropic(
         streamOptions: options,
         primaryAccessToken: accessToken,
         storagePath,
+        effortTransitions,
       })
 
       if (!response.ok) {

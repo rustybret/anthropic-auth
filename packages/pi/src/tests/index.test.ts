@@ -6,20 +6,30 @@ import cortexKitPiAnthropicAuth from '../index'
 function mockPi() {
   const providers = new Map<
     string,
-    { models?: Array<Record<string, unknown>> }
+    {
+      models?: Array<Record<string, unknown>>
+      streamSimple?: (...args: any[]) => unknown
+    }
   >()
+  const events = new Map<string, (...args: any[]) => unknown>()
 
   const pi = {
     registerCommand: () => {},
     registerProvider: (
       name: string,
-      config: { models?: Array<Record<string, unknown>> },
+      config: {
+        models?: Array<Record<string, unknown>>
+        streamSimple?: (...args: any[]) => unknown
+      },
     ) => {
       providers.set(name, config)
     },
+    on: (name: string, handler: (...args: any[]) => unknown) => {
+      events.set(name, handler)
+    },
   } as unknown as ExtensionAPI
 
-  return { pi, providers }
+  return { pi, providers, events }
 }
 
 describe('cortexKitPiAnthropicAuth provider registration', () => {

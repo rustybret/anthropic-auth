@@ -7,6 +7,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   exchange,
   isClaudeFableOrMythos51Model,
+  type MidConversationEffortTransition,
   refreshClaudeOAuthToken,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -16,6 +17,7 @@ import type {
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
+import { collectPiEffortHistory } from './effort-history.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 
 async function loginAnthropic(
@@ -62,6 +64,29 @@ async function refreshAnthropicToken(
 
 export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
   registerCommands(pi)
+  const effortHistoryBySession = new Map<
+    string,
+    MidConversationEffortTransition[]
+  >()
+  pi.on('turn_start', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (!sessionId) return
+    const transitions = collectPiEffortHistory(
+      ctx.sessionManager.buildContextEntries(),
+      ctx.sessionManager.getBranch(),
+    )
+    effortHistoryBySession.delete(sessionId)
+    effortHistoryBySession.set(sessionId, transitions)
+    while (effortHistoryBySession.size > 128) {
+      const oldest = effortHistoryBySession.keys().next().value
+      if (oldest) effortHistoryBySession.delete(oldest)
+      else break
+    }
+  })
+  pi.on('session_shutdown', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) effortHistoryBySession.delete(sessionId)
+  })
 
   pi.registerProvider('anthropic', {
     name: 'Anthropic (CortexKit OAuth)',
@@ -139,6 +164,14 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
       refreshToken: refreshAnthropicToken,
       getApiKey: (credentials) => credentials.access,
     },
-    streamSimple: streamCortexKitAnthropic,
+    streamSimple: (model, context, options) =>
+      streamCortexKitAnthropic(
+        model,
+        context,
+        options,
+        options?.sessionId
+          ? effortHistoryBySession.get(options.sessionId)
+          : undefined,
+      ),
   })
 }

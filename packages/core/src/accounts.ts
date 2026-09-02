@@ -262,6 +262,9 @@ export type AccountStorage = {
   claudeFast?: {
     enabled?: boolean
   }
+  thinkingBinding?: {
+    prefixMismatchBehavior?: 'account-default' | 'error' | 'drop_block'
+  }
   /**
    * Zero out Anthropic OAuth model costs in the provider hook. Default: enabled
    * (OAuth usage is quota-based, not per-token billed, so costs show as $0).
@@ -775,6 +778,9 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     claudeCache: isRecord(value.claudeCache) ? value.claudeCache : undefined,
     dump: isRecord(value.dump) ? value.dump : undefined,
     claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
+    thinkingBinding: isRecord(value.thinkingBinding)
+      ? value.thinkingBinding
+      : undefined,
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
@@ -1278,6 +1284,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     dump: storage.dump,
     logging: storage.logging,
     claudeFast: storage.claudeFast,
+    thinkingBinding: storage.thinkingBinding,
     costZeroing: storage.costZeroing,
     cacheKeep: storage.cacheKeep,
     relay: storage.relay,

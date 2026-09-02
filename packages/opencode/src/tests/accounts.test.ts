@@ -30,6 +30,7 @@ import {
   getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
   getScopedQuotaWindowForModel,
+  getThinkingPrefixMismatchBehavior,
   incrementPrimeUsagePersistent,
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
@@ -761,6 +762,26 @@ describe('OAuth account profiles', () => {
       ),
     ).toBe(false)
     expect((await loadAccounts(accountPath))?.main?.profile).toEqual(profile)
+  })
+})
+
+describe('thinkingBinding.prefixMismatchBehavior', () => {
+  test('persists explicit behavior and defaults unknown values safely', async () => {
+    const storage = baseStorage()
+    storage.thinkingBinding = { prefixMismatchBehavior: 'error' }
+    await saveAccounts(storage)
+    const loaded = await loadAccounts()
+    expect(loaded?.thinkingBinding).toEqual({
+      prefixMismatchBehavior: 'error',
+    })
+    expect(getThinkingPrefixMismatchBehavior(loaded)).toBe('error')
+    expect(
+      getThinkingPrefixMismatchBehavior({
+        thinkingBinding: {
+          prefixMismatchBehavior: 'unknown' as 'account-default',
+        },
+      }),
+    ).toBe('account-default')
   })
 })
 

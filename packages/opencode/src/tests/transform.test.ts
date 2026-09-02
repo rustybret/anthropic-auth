@@ -3,9 +3,11 @@ import {
   CLAUDE_CODE_IDENTITY,
   computeCcVersionSuffix,
   FAST_MODE_BETA,
+  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
   selectClaudeCodeBetas,
+  THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
@@ -380,7 +382,7 @@ describe('setOAuthHeaders', () => {
           thinking: { type: 'adaptive' },
           messages: [{ role: 'user', content: 'hello' }],
         }),
-        { thinkingBindingControlsEnabled: true },
+        { thinkingPrefixMismatchBehavior: 'drop_block' },
       ),
     )
     expect(firstTurnBody.thinking).toEqual({
@@ -411,7 +413,7 @@ describe('setOAuthHeaders', () => {
           thinking: { type: 'adaptive' },
           messages: signedHistory,
         }),
-        { thinkingBindingControlsEnabled: true },
+        { thinkingPrefixMismatchBehavior: 'drop_block' },
       ),
     )
     expect(fableBody.thinking).toEqual({
@@ -433,7 +435,7 @@ describe('setOAuthHeaders', () => {
             thinking: { type: 'adaptive' },
             messages: signedHistory,
           }),
-          { thinkingBindingControlsEnabled: true },
+          { thinkingPrefixMismatchBehavior: 'drop_block' },
         ),
       )
       expect(body.thinking.block_binding).toBeUndefined()
@@ -443,6 +445,32 @@ describe('setOAuthHeaders', () => {
         'thinking-binding-controls-2026-08-01',
       )
     }
+
+    const accountDefaultBody = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          thinking: { type: 'adaptive' },
+          messages: signedHistory,
+        }),
+        { thinkingPrefixMismatchBehavior: 'account-default' },
+      ),
+    )
+    expect(accountDefaultBody.thinking.block_binding).toBeUndefined()
+
+    const errorBody = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          thinking: { type: 'adaptive' },
+          messages: signedHistory,
+        }),
+        { thinkingPrefixMismatchBehavior: 'error' },
+      ),
+    )
+    expect(errorBody.thinking.block_binding).toEqual({
+      prefix_mismatch_behavior: 'error',
+    })
 
     const apiKeyBody = JSON.parse(
       await rewriteRequestBody(
@@ -457,6 +485,92 @@ describe('setOAuthHeaders', () => {
     expect(mergeBetaHeaders(new Headers())).not.toContain(
       'thinking-binding-controls-2026-08-01',
     )
+  })
+
+  test('keeps signed Fable 5.1 history on the account default unless configured', async () => {
+    const signedHistory = [
+      { role: 'user', content: 'hello' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'reason', signature: 'sig' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'continue' },
+    ]
+    const body = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          thinking: { type: 'adaptive' },
+          messages: signedHistory,
+        }),
+      ),
+    )
+    const headers = new Headers()
+    setOAuthHeaders(headers, 'token', { body })
+
+    expect(body.thinking.block_binding).toBeUndefined()
+    expect(headers.get('anthropic-beta')).not.toContain(
+      THINKING_BINDING_CONTROLS_BETA,
+    )
+  })
+
+  test('always adds the mid-conversation output-config beta for OAuth Fable 5.1', () => {
+    const fable51 = new Headers()
+    setOAuthHeaders(fable51, 'token', {
+      body: { model: 'claude-fable-5-1', messages: [] },
+    })
+    expect(fable51.get('anthropic-beta')?.split(',')).toContain(
+      MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+    )
+
+    for (const model of [
+      'claude-fable-5',
+      'claude-mythos-5-1',
+      'claude-opus-5',
+    ]) {
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', { body: { model, messages: [] } })
+      expect(headers.get('anthropic-beta')?.split(',')).not.toContain(
+        MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+      )
+    }
+  })
+
+  test('rewrites Fable 5.1 effort history without changing the cached prefix', async () => {
+    const body = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          output_config: { effort: 'max' },
+          messages: [
+            { role: 'user', content: 'first' },
+            { role: 'assistant', content: 'one' },
+            { role: 'user', content: 'second' },
+          ],
+        }),
+        {
+          effortTransitions: [
+            { afterAssistantMessages: 0, effort: 'low' },
+            { afterAssistantMessages: 1, effort: 'high' },
+          ],
+        },
+      ),
+    )
+
+    expect(body.output_config).toEqual({ effort: 'low' })
+    expect(body.messages).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'one' },
+      {
+        role: 'system',
+        content: [],
+        output_config: { effort: 'high' },
+      },
+      { role: 'user', content: 'second' },
+    ])
   })
 })
 

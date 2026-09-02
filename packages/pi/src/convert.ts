@@ -1,5 +1,6 @@
 import {
   applyClaudeCodeMetadata,
+  applyMidConversationOutputConfig,
   applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
@@ -15,8 +16,10 @@ import {
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
+  type MidConversationEffortTransition,
   orderClaudeCodeBody,
   signRequestBody,
+  type ThinkingPrefixMismatchBehavior,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   Context,
@@ -464,6 +467,10 @@ export async function buildAnthropicRequest(
   cache: { enabled: boolean; mode: Cache1hMode },
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
+  controls: {
+    effortTransitions?: readonly MidConversationEffortTransition[]
+    thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
+  } = {},
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
   const messages = convertMessages(context.messages, modelId)
   // Strip trailing assistant messages — Anthropic rejects prefill on some models
@@ -577,10 +584,14 @@ export async function buildAnthropicRequest(
     }
   }
 
+  applyMidConversationOutputConfig(body, controls.effortTransitions ?? [])
   addEphemeralCacheControl(body)
   applyCacheMode(body, cache.enabled, cache.mode)
   if (identity) {
-    applyThinkingBindingControls(body)
+    applyThinkingBindingControls(
+      body,
+      controls.thinkingPrefixMismatchBehavior ?? 'account-default',
+    )
     applyClaudeCodeMetadata(body, identity)
   }
 

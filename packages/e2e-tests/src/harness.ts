@@ -14,6 +14,7 @@ type SdkClient = {
       body: {
         model: { providerID: string; modelID: string }
         parts: Array<{ type: 'text'; text: string }>
+        variant?: string
       }
     }) => Promise<{ data?: unknown }>
     messages: (options: {
@@ -114,6 +115,7 @@ export class E2EHarness {
     text: string,
     timeoutMs = 45_000,
     modelID = 'claude-sonnet-4-5',
+    variant?: string,
   ) {
     const result = await this.withTimeout(
       this.client.session.prompt({
@@ -121,6 +123,7 @@ export class E2EHarness {
         body: {
           model: { providerID: 'anthropic', modelID },
           parts: [{ type: 'text', text }],
+          variant,
         },
       }),
       timeoutMs,

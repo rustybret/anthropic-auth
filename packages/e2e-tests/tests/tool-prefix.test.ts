@@ -76,6 +76,56 @@ describe('OpenCode Anthropic auth e2e', () => {
     })
   }, 90_000)
 
+  it('preserves Fable 5.1 effort history across OpenCode variant changes', async () => {
+    harness = await E2EHarness.create()
+    harness.script([
+      { type: 'text', text: 'first effort response' },
+      { type: 'text', text: 'second effort response' },
+    ])
+    const sessionId = await harness.createSession()
+
+    await harness.sendPrompt(
+      sessionId,
+      'start with low effort',
+      60_000,
+      'claude-fable-5-1',
+      'low',
+    )
+    await harness.sendPrompt(
+      sessionId,
+      'switch to high effort',
+      60_000,
+      'claude-fable-5-1',
+      'high',
+    )
+
+    const generationRequests = harness.anthropic.requests().filter((request) => {
+      const serializedBody = JSON.stringify(request.body)
+      return (
+        request.body.model === 'claude-fable-5-1' &&
+        !serializedBody.includes('Generate a title for this conversation')
+      )
+    })
+    expect(generationRequests).toHaveLength(2)
+    expect(generationRequests[0]?.body.output_config).toMatchObject({
+      effort: 'low',
+    })
+    expect(generationRequests[1]?.body.output_config).toMatchObject({
+      effort: 'low',
+    })
+    const secondMessages = generationRequests[1]?.body.messages
+    expect(Array.isArray(secondMessages) ? secondMessages : []).toContainEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
+    for (const request of generationRequests) {
+      expect(request.headers['anthropic-beta']?.split(',')).toContain(
+        'mid-conversation-output-config-2026-07-01',
+      )
+    }
+  }, 90_000)
+
   it('replays a mid-output Anthropic safety fallback boundary through OpenCode', async () => {
     harness = await E2EHarness.create()
     harness.script([

@@ -69,6 +69,7 @@ import {
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
+  getThinkingPrefixMismatchBehavior,
   hashRefreshToken,
   type IdentityState,
   incrementPrimeUsagePersistent,
@@ -79,6 +80,7 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
+  isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isCostZeroingEnabled,
@@ -98,6 +100,7 @@ import {
   loadAccounts,
   log,
   logger,
+  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   mergeMainQuotaErrorClearedAt,
@@ -179,6 +182,12 @@ import {
   summarizeCacheTtl,
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
+import {
+  collectOpenCodeEffortHistory,
+  EFFORT_HISTORY_HEADER,
+  parseEffortHistory,
+  serializeEffortHistory,
+} from './effort-history.ts'
 import {
   FableFallbackManager,
   type FableFallbackPlan,
@@ -775,7 +784,7 @@ function createClaudeOpus5Variants() {
   )
 }
 
-function applyClaudeOpus5Variants<
+function applyNativeAdaptiveEffortVariants<
   T extends Record<string, AnthropicProviderModel>,
 >(models: T) {
   return Object.fromEntries(
@@ -783,7 +792,7 @@ function applyClaudeOpus5Variants<
       const modelId = model.api?.id ?? model.id ?? id
       return [
         id,
-        isClaudeOpus5Model(modelId)
+        isClaudeOpus5Model(modelId) || isClaudeFable51Model(modelId)
           ? { ...model, variants: createClaudeOpus5Variants() }
           : model,
       ]
@@ -887,6 +896,10 @@ const anthropicAuthPlugin = async (
   )
   const fableFallbackManager = new FableFallbackManager()
   const laneStartTracker = new LaneStartTracker()
+  const effortHistoryBySession = new Map<
+    string,
+    MidConversationEffortTransition[]
+  >()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const pendingRecoveryDesktopNotices = new Map<string, string>()
@@ -3594,6 +3607,22 @@ const anthropicAuthPlugin = async (
   }
 
   return {
+    'experimental.chat.messages.transform': async (
+      _input: Record<string, never>,
+      output: { messages: { info?: unknown }[] },
+    ) => {
+      const history = collectOpenCodeEffortHistory(
+        output.messages as Parameters<typeof collectOpenCodeEffortHistory>[0],
+      )
+      if (!history) return
+      effortHistoryBySession.delete(history.sessionId)
+      effortHistoryBySession.set(history.sessionId, history.transitions)
+      while (effortHistoryBySession.size > 128) {
+        const oldest = effortHistoryBySession.keys().next().value
+        if (oldest) effortHistoryBySession.delete(oldest)
+        else break
+      }
+    },
     'chat.message': async (
       {
         sessionID,
@@ -3623,6 +3652,14 @@ const anthropicAuthPlugin = async (
         messageId: message.id,
         headers: output.headers,
       })
+      const effortHistory = serializeEffortHistory(
+        effortHistoryBySession.get(sessionID) ?? [],
+      )
+      if (effortHistory) {
+        output.headers[EFFORT_HISTORY_HEADER] = effortHistory
+      } else {
+        delete output.headers[EFFORT_HISTORY_HEADER]
+      }
     },
     event: async ({ event }: { event: unknown }) => {
       const value = event as unknown as {
@@ -3664,6 +3701,7 @@ const anthropicAuthPlugin = async (
 
       if (value.type === 'session.deleted') {
         laneStartTracker.clearSession(sessionId)
+        effortHistoryBySession.delete(sessionId)
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
@@ -3752,7 +3790,7 @@ const anthropicAuthPlugin = async (
         provider: { models: Record<string, AnthropicProviderModel> },
         context: { auth?: { type?: string } },
       ) {
-        const models = applyClaudeOpus5Variants(
+        const models = applyNativeAdaptiveEffortVariants(
           addFableMythos5Models(provider.models),
         )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
@@ -4446,6 +4484,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
+            requestHeaders.delete(EFFORT_HISTORY_HEADER)
             let body = init?.body
             let streaming = false
             let dump: DumpHandle | null = null
@@ -4577,9 +4616,13 @@ const anthropicAuthPlugin = async (
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
+            const effortTransitions = parseEffortHistory(
+              requestHeaders.get(EFFORT_HISTORY_HEADER),
+            )
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
+            requestHeaders.delete(EFFORT_HISTORY_HEADER)
             let body = init?.body
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
@@ -4645,7 +4688,9 @@ const anthropicAuthPlugin = async (
                 fastModeEnabled: fastModeRequested,
                 identity,
                 sessionId: relayAffinity || undefined,
-                thinkingBindingControlsEnabled: true,
+                thinkingPrefixMismatchBehavior:
+                  getThinkingPrefixMismatchBehavior(await getRequestStorage()),
+                effortTransitions,
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
                 laneStart: laneStartRequest,

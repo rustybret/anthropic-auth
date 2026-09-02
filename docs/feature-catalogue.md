@@ -45,8 +45,9 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 - **How:** `opencode/transform.ts` — `rewriteUrl()` (adds `?beta=true`, base-URL override);
   `rewriteRequestBody()` pipeline: strip trailing assistant msgs and foreign thinking → opt eligible
   Fable 5/5.1 or Opus 5 OAuth calls into server-side safety fallback and restore boundary markers →
-  normalize Fable/Mythos 5/5.1 thinking → conditionally attach Fable 5.1 thinking-prefix recovery for
-  replayed signed/redacted blocks → inject the Claude Code 2.1.258 billing header with a session-pinned
+  normalize Fable/Mythos 5/5.1 thinking → preserve Fable 5.1 per-turn effort changes with cache-stable
+  empty system markers → conditionally attach configured Fable 5.1 thinking-prefix behavior for replayed
+  signed/redacted blocks → inject the Claude Code 2.1.258 billing header with a session-pinned
   suffix → sanitize system prompt (remove OpenCode identity, prepend Claude Code identity;
   `sanitize-memo.ts` memoized + `prompt-context.ts`) → apply cache strategy → add fast mode → prefix tool
   names `mcp_` → sign the final body with `cch` (xxhash). `createStrippedStream()` reverses
@@ -149,9 +150,10 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 
 ## L. Provider model handling — [A]
 
-- `provider.models` hook: `addFableMythos5Models()` injects model specs; `zeroModelCosts()` zeroes
-  OAuth per-token costs (quota-billed, not per-token) unless `costZeroing.enabled=false`. `models.ts` =
-  model IDs/pricing/context windows. **[A]**.
+- `provider.models` hook: `addFableMythos5Models()` injects model specs; native adaptive variants expose
+  `low` through `max` for Fable 5.1 and Opus 5; `zeroModelCosts()` zeroes OAuth per-token costs
+  (quota-billed, not per-token) unless `costZeroing.enabled=false`. `models.ts` = model IDs/pricing/context
+  windows. **[A]**.
 
 ## M. Quota toast — [G+A]
 

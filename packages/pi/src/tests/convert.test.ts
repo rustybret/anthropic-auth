@@ -538,12 +538,45 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
       defaultCache,
       false,
       identity,
+      { thinkingPrefixMismatchBehavior: 'drop_block' },
     )
 
     expect(body.thinking as Record<string, unknown>).toEqual({
       type: 'adaptive',
       display: 'summarized',
       block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    })
+  })
+
+  test('injects Pi effort changes before their user turns', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      {
+        messages: [
+          userMsg('first'),
+          assistantMsg('first answer'),
+          userMsg('second'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any,
+      { sessionId: 'pi-fable-5-1-effort', reasoning: 'high' } as any,
+      defaultCache,
+      false,
+      undefined,
+      {
+        effortTransitions: [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+        ],
+      },
+    )
+
+    expect(body.output_config).toEqual({ effort: 'low' })
+    expect(body.messages[2]).toEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
     })
   })
 
