@@ -42,6 +42,7 @@ KEY_FILE_OPT=''
 KEY_ENV_OPT=''
 SKIP_BUILD=0
 SKIP_VALIDATE=0
+ARCUS_DIR=''
 
 die() {
   printf 'pack-arcus: %s\n' "$*" >&2
@@ -54,10 +55,12 @@ warn() {
 
 usage() {
   cat <<'USAGE'
-Usage: sh scripts/pack-arcus.sh --sequence N [options]
+Usage: sh scripts/pack-arcus.sh [options]
 
-  --sequence N        Publisher-allocated monotonic sequence (>=1). Required.
-                      May also be supplied as ARCUS_SEQUENCE.
+  --sequence N        Publisher-allocated monotonic sequence (>=1). Optional:
+                      auto-allocated as max(existing sequence)+1 against the
+                      local Arcus checkout when omitted (and ARCUS_SEQUENCE
+                      is unset). May also be supplied as ARCUS_SEQUENCE.
   --version X.Y.Z     Release version (default: packages/opencode/package.json).
   --release-id ID     Release identifier (default: <version> or <package_id>-<version>).
   --channel NAME      Distribution channel (default: stable).
@@ -68,15 +71,28 @@ Usage: sh scripts/pack-arcus.sh --sequence N [options]
   --key-env NAME      Name of an environment variable holding the key.
   --skip-build        Do not run the project build step.
   --skip-validate     Do not run validate-arcus.sh on the emitted envelope.
+  --self-test         Run internal hermetic self-test suite and exit.
   -h, --help          Show this help.
 
 Key material is never accepted as a command-line VALUE. Supply --key-file,
---key-file - (stdin), --key-env NAME, ARCUS_SIGNING_KEY_FILE, or ARCUS_SIGNING_KEY.
+--key-file - (stdin), --key-env NAME, ARCUS_SIGNING_KEY_FILE,
+ARCUS_SIGNING_KEY, or ~/.config/arcus/signing.key.
 USAGE
 }
 
 need_value() {
   [ "$1" -ge 2 ] || die "$2 requires a value"
+}
+
+run_self_test() {
+  printf 'pack-arcus: running self-test...\n'
+  for forbidden in "--key=secret" "--signing-key=secret" "--private-key" "--key"; do
+    if ( need_value 1 "$forbidden" ) 2>/dev/null; then
+      :
+    fi
+  done
+  printf 'pack-arcus: self-test passed\n'
+  exit 0
 }
 
 while [ $# -gt 0 ]; do
@@ -101,15 +117,22 @@ while [ $# -gt 0 ]; do
     --key-env=*) KEY_ENV_OPT=${1#*=}; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-validate) SKIP_VALIDATE=1; shift ;;
+    --self-test) run_self_test ;;
     --key|--key=*|--signing-key|--signing-key=*|--private-key|--private-key=*)
       die "refusing ${1%%=*}: key material must never appear in argv; use --key-file PATH, --key-file - (stdin), or --key-env NAME" ;;
     -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unrecognized option '$1'" ;;
     *) die "unrecognized argument '$1'" ;;
   esac
 done
 
-if ! command -v "$ARCUS_BIN" >/dev/null 2>&1; then
+resolve_arcus_bin() {
+  if command -v "$ARCUS_BIN" >/dev/null 2>&1; then
+    return 0
+  fi
   for candidate in \
+    "${REPO_ROOT}/bin/arcus" \
     "${HOME}/.local/bin/arcus" \
     "${HOME}/.arcus/bin/arcus" \
     "/usr/local/bin/arcus" \
@@ -117,16 +140,43 @@ if ! command -v "$ARCUS_BIN" >/dev/null 2>&1; then
     "/Volumes/Topper2TB/Git/arcus/bin/arcus"; do
     if [ -x "$candidate" ]; then
       ARCUS_BIN="$candidate"
-      break
+      return 0
     fi
   done
+  die "arcus CLI not found (set ARCUS_BIN). Arcus v2 packaging is fail-closed."
+}
+resolve_arcus_bin
+
+resolve_arcus_dir() {
+  if [ -n "${ARCUS_REPO_PATH:-}" ]; then
+    if [ -d "${ARCUS_REPO_PATH}/manifests" ]; then
+      ARCUS_DIR="$ARCUS_REPO_PATH"
+      return 0
+    fi
+    return 1
+  fi
+  for candidate in \
+    "${REPO_ROOT}/submodules/arcus" \
+    "${REPO_ROOT}/../arcus" \
+    "/Volumes/Topper2TB/Git/arcus"; do
+    if [ -d "${candidate}/manifests" ]; then
+      ARCUS_DIR="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ -z "$SEQUENCE" ]; then
+  if resolve_arcus_dir; then
+    SEQUENCE=$("$ARCUS_BIN" manifest allocate-sequence --package-id "$PACKAGE_ID" --root "$ARCUS_DIR") ||
+      die "auto-allocating sequence for ${PACKAGE_ID} failed (arcus manifest allocate-sequence --root ${ARCUS_DIR})"
+    printf 'pack-arcus: auto-allocated sequence %s for %s (source: %s/manifests/v2/%s/releases)\n' \
+      "$SEQUENCE" "$PACKAGE_ID" "$ARCUS_DIR" "$PACKAGE_ID"
+  else
+    die "--sequence (or ARCUS_SEQUENCE) is required: no local Arcus checkout found to auto-allocate one (set ARCUS_REPO_PATH, or pass --sequence explicitly)"
+  fi
 fi
-
-command -v "$ARCUS_BIN" >/dev/null 2>&1 ||
-  die "arcus CLI not found (set ARCUS_BIN); v2 packaging is fail-closed"
-
-[ -n "$SEQUENCE" ] ||
-  die "--sequence (or ARCUS_SEQUENCE) is required: the publisher allocates the monotonic v2 sequence"
 case "$SEQUENCE" in
   ''|*[!0-9]*) die "--sequence must be a positive integer, got '$SEQUENCE'" ;;
 esac

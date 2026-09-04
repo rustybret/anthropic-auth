@@ -2,8 +2,10 @@ import { describe, expect, it } from 'bun:test'
 import { execFileSync } from 'node:child_process'
 import {
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -21,6 +23,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
     const pkg = JSON.parse(
       readFileSync(resolve(repoRoot, 'package.json'), 'utf-8'),
     )
+    expect(pkg.scripts.setup).toBe('bash scripts/setup.sh')
     expect(pkg.scripts.build).toBeDefined()
     expect(pkg.scripts.test).toBeDefined()
     expect(pkg.scripts.typecheck).toBeDefined()
@@ -29,16 +32,108 @@ describe('anthropic-auth arcus packaging & sync', () => {
     expect(pkg.scripts['build:arcus']).toBe(
       'bun run build && bash scripts/pack-arcus.sh',
     )
+    expect(pkg.scripts['pipeline:arcus']).toBe('sh scripts/arcus-pipeline.sh')
     expect(pkg.scripts['package:arcus']).toBe('bash scripts/pack-arcus.sh')
     expect(pkg.scripts['pack:arcus']).toBe('bash scripts/pack-arcus.sh')
     expect(pkg.scripts['publish:arcus']).toBe('bash scripts/publish-arcus.sh')
     expect(pkg.scripts['validate:arcus']).toBe('bash scripts/validate-arcus.sh')
     expect(pkg.scripts['sign:arcus']).toBe('bash scripts/sign-arcus.sh')
     expect(pkg.scripts['migrate:arcus']).toBe('bash scripts/migrate-arcus.sh')
+    expect(pkg.scripts['test:arcus']).toBe(
+      'sh scripts/arcus-pipeline.sh self-test && bun test scripts/pack-arcus.test.ts',
+    )
 
     // Ensure legacy v1 aliases are pruned
     expect(pkg.scripts['arcus:pack']).toBeUndefined()
     expect(pkg.scripts['arcus:test']).toBeUndefined()
+  })
+
+  it('configures submodules/arcus in .gitmodules and hydrates submodule tree', () => {
+    const gitmodulesPath = resolve(repoRoot, '.gitmodules')
+    expect(existsSync(gitmodulesPath)).toBe(true)
+    const gitmodules = readFileSync(gitmodulesPath, 'utf-8')
+    expect(gitmodules).toContain('submodule "submodules/arcus"')
+    expect(gitmodules).toContain('path = submodules/arcus')
+    expect(gitmodules).toContain('url = https://github.com/rustybret/arcus.git')
+
+    const submoduleScriptsDir = resolve(
+      repoRoot,
+      'submodules/arcus/skills/scripts',
+    )
+    expect(existsSync(submoduleScriptsDir)).toBe(true)
+  })
+
+  it('symlinks generic Arcus lifecycle scripts to upstream submodule', () => {
+    const symlinkedScripts = [
+      'arcus-pipeline.sh',
+      'sign-arcus.sh',
+      'validate-arcus.sh',
+      'publish-arcus.sh',
+      'migrate-arcus.sh',
+    ]
+
+    for (const name of symlinkedScripts) {
+      const scriptPath = resolve(repoRoot, 'scripts', name)
+      const lstat = lstatSync(scriptPath)
+      expect(lstat.isSymbolicLink()).toBe(true)
+
+      const target = readlinkSync(scriptPath)
+      expect(target).toBe(`../submodules/arcus/skills/scripts/${name}`)
+      expect(existsSync(scriptPath)).toBe(true)
+
+      const stat = statSync(scriptPath)
+      expect((stat.mode & 0o111) !== 0).toBe(true)
+    }
+
+    // pack-arcus.sh is anthropic-auth's specialized opencode-plugin packaging driver
+    const packScriptPath = resolve(repoRoot, 'scripts/pack-arcus.sh')
+    const packLstat = lstatSync(packScriptPath)
+    expect(packLstat.isSymbolicLink()).toBe(false)
+    const packStat = statSync(packScriptPath)
+    expect((packStat.mode & 0o111) !== 0).toBe(true)
+
+    // setup.sh is the fresh clone hydration script
+    const setupScriptPath = resolve(repoRoot, 'scripts/setup.sh')
+    expect(existsSync(setupScriptPath)).toBe(true)
+    const setupStat = statSync(setupScriptPath)
+    expect((setupStat.mode & 0o111) !== 0).toBe(true)
+  })
+
+  it('passes hermetic self-tests across all Arcus pipeline scripts', () => {
+    const output = execFileSync(
+      'sh',
+      ['scripts/arcus-pipeline.sh', 'self-test'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf-8',
+      },
+    )
+    expect(output).toContain('all self-tests passed successfully')
+  })
+
+  it('refuses private key material passed via command-line argv', () => {
+    const scripts = [
+      'scripts/pack-arcus.sh',
+      'scripts/sign-arcus.sh',
+      'scripts/migrate-arcus.sh',
+    ]
+
+    for (const relPath of scripts) {
+      let rejected = false
+      try {
+        execFileSync('sh', [relPath, '--key=secret_value'], {
+          cwd: repoRoot,
+          stdio: 'pipe',
+        })
+      } catch (err: any) {
+        rejected = true
+        const stderr = err.stderr?.toString() || ''
+        expect(stderr).toMatch(
+          /refusing|key material must never appear in argv/,
+        )
+      }
+      expect(rejected).toBe(true)
+    }
   })
 
   it('removes upstream CortexKit-specific publish and package dry-run scripts', () => {
