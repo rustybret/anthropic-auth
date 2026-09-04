@@ -64,7 +64,7 @@ anthropic-auth/
 
 **`scripts/`:**
 - Purpose: Development, Arcus packaging, sync, and analysis utilities
-- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager and verification tests), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
+- Contains: `setup.sh` (toolchain bootstrap, submodule hydration, and symlink verification), `arcus-pipeline.sh` (unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager and verification tests), Arcus v2 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
 
 ## Key File Locations
 

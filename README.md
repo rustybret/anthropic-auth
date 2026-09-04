@@ -55,6 +55,18 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Add `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands to OpenCode.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
+## Quick Start & Fresh Clone Setup
+
+On a fresh clone, run the repository setup script to initialize submodules, verify toolchain dependencies, hydrate the Arcus distribution pipeline, and install dependencies:
+
+```bash
+git clone --recurse-submodules https://github.com/rustybret/anthropic-auth.git
+cd anthropic-auth
+bun run setup
+```
+
+If cloned without `--recurse-submodules`, `bun run setup` (or `bash scripts/setup.sh`) will automatically initialize and hydrate `submodules/arcus`, repair Arcus pipeline script symlinks, install workspace dependencies, and verify the workspace build.
+
 ## Install
 
 ### OpenCode
@@ -755,12 +767,11 @@ bun run lint
 bun run format:check
 ```
 
-Inspect package contents:
+Verify Arcus packaging pipeline:
 
 ```bash
-bun run pack:core:dry
-bun run pack:opencode:dry
-bun run pack:pi:dry
+bun run test:arcus
+bun run pack:arcus
 ```
 
 Test a local build with OpenCode:
@@ -777,29 +788,24 @@ Clean the local dev symlink with:
 bun run dev:clean
 ```
 
-## Release
+## Arcus Distribution & Packaging
 
-This repo uses CortexKit's tag-driven release workflow.
-
-Preview a release:
+This repository is distributed via Arcus v2. Packaging and publishing scripts are driven through the Arcus pipeline:
 
 ```bash
-./scripts/release.sh 1.9.0 --dry
+# Verify pipeline scripts and self-tests
+bun run test:arcus
+# or
+bun run pipeline:arcus self-test
+
+# Package 5-canonical-target release envelope
+bun run pack:arcus
+
+# Execute full pipeline: pack -> sign -> validate -> publish
+bun run pipeline:arcus all
 ```
 
-Create and push the release tag:
-
-```bash
-./scripts/release.sh 1.9.0
-```
-
-Wait for GitHub Actions:
-
-```bash
-./scripts/wait-release.sh v1.9.0
-```
-
-The release workflow runs checks, publishes the core, OpenCode, and Pi packages to npm with provenance, and creates the GitHub release.
+See [scripts/AGENTS.md](scripts/AGENTS.md) for full script inventory and architecture details.
 
 ## Troubleshooting
 

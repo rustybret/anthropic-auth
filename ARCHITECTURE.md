@@ -39,6 +39,11 @@
 - Location: `packages/e2e-tests/`
 - Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`), OpenCode runner (`src/opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`, `tests/quota-header-relay.test.ts`, `tests/tmp-hygiene.test.ts`)
 
+**Arcus Distribution & Packaging:**
+- Purpose: Hermetic Arcus v2 release packaging, signing, validation, and publishing without upstream script drift
+- Location: `scripts/` (symlinks to `submodules/arcus/skills/scripts/`), `scripts/pack-arcus.sh`, `scripts/setup.sh`
+- Pattern: Option B (Git Submodule + Symlinks + setup.sh) — generic pipeline scripts (`arcus-pipeline.sh`, `sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`) are symlinks to `submodules/arcus/skills/scripts/*`; `scripts/pack-arcus.sh` acts as the specialized project packaging driver for the OpenCode plugin strategy, staging runtime assets and enforcing distinct digest triples across all 5 canonical targets; `scripts/setup.sh` hydrates submodules, repairs symlinks, and bootstraps dependencies on fresh clones.
+
 ## Data Flow
 
 **OpenCode Request Lifecycle:**
