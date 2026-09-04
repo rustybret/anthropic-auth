@@ -4,6 +4,13 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 1.22.0
 
+### Fleet Fork Enhancements (rustybret/anthropic-auth)
+
+- **Arcus v2 Toolchain Alignment (Option B)**: Migrated repository packaging to the fleet Option B architecture — integrated shallow submodule `submodules/arcus`, replaced committed pipeline scripts with symlinks to `submodules/arcus/skills/scripts/*`, and created `scripts/setup.sh` (`bun run setup`) for automated fresh clone toolchain hydration and symlink verification.
+- **Packaging Driver & Self-Test Verification**: Upgraded `scripts/pack-arcus.sh` with automated monotonic sequence allocation via `arcus manifest allocate-sequence`, dynamic `arcus` CLI discovery, argv private key safety guards, hermetic `--self-test` mode, and multi-target verification across all 5 canonical platforms (`bun run test:arcus`).
+- **Fork Synchronization Hardening**: Hardened `scripts/fork-sync.sh` (`bun run fork-sync`) to ensure workspace dependencies are hydrated via `bun install` before verifying builds, preventing compilation failures when upstream merges introduce new packages (such as `@cortexkit/subc-client`).
+- **Fleet Integration & Promotion**: Tagged and pushed `v1.22.0` on `origin/main` for canonical Cloudhome BuildKit CI publishing (`arcus-release-upload`) and coordinated 4-gate verification criteria with `uc-studio` for `arcus-blessed-plugins.json` promotion.
+
 ### Minor Changes
 
 - Add Claude Fable 5.1 and limited-access Mythos 5.1 across the shared model catalogue, OpenCode request/routing/recovery paths, and Pi provider catalogue.

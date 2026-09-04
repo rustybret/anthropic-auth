@@ -25,7 +25,9 @@ anthropic-auth/
 │   └── e2e-tests/              # End-to-end integration tests
 │       ├── src/                # Test harness + mock servers
 │       └── tests/              # Test files
-├── scripts/                    # Dev, release, and analysis scripts
+├── submodules/
+│   └── arcus/                  # Shallow submodule tracking rustybret/arcus (Option B)
+├── scripts/                    # Dev, Arcus packaging symlinks, setup, and fork-sync scripts
 ├── captures/                   # System-prompt capture artifacts (git-ignored)
 ├── docs/                       # Feature docs, research, plans, specs, and perf notes
 ├── images/                     # Images for README
@@ -62,9 +64,13 @@ anthropic-auth/
 - Purpose: Integration tests with mock Anthropic and relay servers
 - Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene)
 
+**`submodules/arcus/`:**
+- Purpose: Git submodule tracking `https://github.com/rustybret/arcus.git` (Option B architecture)
+- Contains: Upstream Arcus toolchain, manifests, and canonical pipeline scripts (`skills/scripts/*`). Generic scripts in `scripts/` symlink into this submodule to eliminate upstream drift.
+
 **`scripts/`:**
 - Purpose: Development, Arcus packaging, sync, and analysis utilities
-- Contains: `setup.sh` (toolchain bootstrap, submodule hydration, and symlink verification), `arcus-pipeline.sh` (unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager and verification tests), Arcus v2 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
+- Contains: `setup.sh` (toolchain bootstrap, submodule hydration, and symlink verification), `arcus-pipeline.sh` (symlinked unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager with sequence auto-allocation and self-test verification), Arcus v2 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`), `fork-sync.sh` / `fork-sync-exclusions` (upstream fork-synchronization automation with automated `bun install` dependency hydration), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
 
 ## Key File Locations
 
@@ -169,4 +175,7 @@ anthropic-auth/
 
 **New model spec:** `packages/core/src/models.ts` — add model ID, pricing, context window, and max output tokens constants. If it needs special request handling, update `packages/opencode/src/transform.ts` (e.g., Fable/Mythos, Sonnet 5, or Opus 5 adaptive thinking normalization).
 
-**Shared utilities used across packages:** Extend `packages/core/src/` rather than duplicating between opencode and pi packages.
+**Fork & Arcus Conventions:**
+- Never publish packages from this repo to npm or recreate upstream release scripts (`scripts/release.sh`, `scripts/wait-release.sh`).
+- Distribution is driven via Arcus v2: canonical releases are built, signed, and landed on `rustybret/arcus` via Cloudhome BuildKit CI (`arcus-release-upload`) and promoted by `uc-studio` in `arcus-blessed-plugins.json`.
+- Upstream sync is driven via `bun run fork-sync`, which automatically installs dependencies before build verification and preserves fork-specific files.

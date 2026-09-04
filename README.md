@@ -1,8 +1,20 @@
-# CortexKit Anthropic Auth for OpenCode and Pi
+# CortexKit Anthropic Auth for OpenCode and Pi (Fleet Fork)
 
-Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), maintained by CortexKit.
+Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), maintained as a private fleet fork distributed via [Arcus](https://github.com/rustybret/arcus).
 
-This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi provider extension that overrides Pi's built-in Anthropic provider. Both integrations share the same Anthropic OAuth, fallback-account, quota, prompt-cache, relay, dump, and request-signing logic through `@cortexkit/anthropic-auth-core`.
+This repository is a Bun workspace monorepo. It is maintained as a downstream fork (`rustybret/anthropic-auth`) of the upstream CortexKit repository (`cortexkit/anthropic-auth`), adapted for the OpenCode private package fleet and hermetically distributed via Arcus v2.
+
+## Fork Identity & Ecosystem Differentiation
+
+| Dimension | Upstream (`cortexkit/anthropic-auth`) | Fleet Fork (`rustybret/anthropic-auth`) |
+| --- | --- | --- |
+| **Primary Repository** | `https://github.com/cortexkit/anthropic-auth` | `https://github.com/rustybret/anthropic-auth` |
+| **Distribution Channel** | Public npm registry (`@cortexkit/opencode-anthropic-auth`, `@cortexkit/pi-anthropic-auth`) | **Arcus v2 Release Envelopes** (`rustybret/arcus`) via `arcus manifest validate --with-envelope` |
+| **npm Publishing** | Published via GitHub Actions tag workflow (`scripts/release.sh`) | **Never published to npm**; upstream release scripts are purged |
+| **Release Pipeline** | Upstream npm publish scripts + tag triggers | **Option B Pipeline**: `submodules/arcus` shallow submodule, pipeline symlinks, `scripts/pack-arcus.sh`, and `cloudhome` BuildKit CI (`arcus-release-upload`) |
+| **Upstream Sync** | N/A (origin of truth) | Automated via `scripts/fork-sync.sh` (`bun run fork-sync`) with automatic dependency hydration and exclusion guards |
+| **OpenCode Loading** | Installed via `npm:` or `@cortexkit/...` in `opencode.json` | Installed via **Arcus v2 blessed set** (`arcus-blessed-plugins.json`) or local file link (`file:///.../packages/opencode/dist/index.js`) |
+| **Fleet Coordination** | Standalone OSS project | Integrated into fleet composition, cross-project messaging (`project_message`), and promotion gates (`uc-studio`, `cloudhome`, `lore`) |
 
 ## Packages
 
@@ -69,23 +81,40 @@ If cloned without `--recurse-submodules`, `bun run setup` (or `bash scripts/setu
 
 ## Install
 
-### OpenCode
+### OpenCode (Arcus & Fleet Deployment)
 
-Add the OpenCode plugin to your OpenCode configuration:
+In the OpenCode fleet, this plugin is distributed through **Arcus v2** and loaded via the blessed plugin composition:
 
-```json
-{
-  "plugin": ["@cortexkit/opencode-anthropic-auth"]
-}
-```
+1. **Arcus Distribution (Recommended for Fleet)**:
+   The plugin is declared in `arcus-blessed-plugins.json` and installed into the OpenCode environment via the Arcus toolchain.
 
-Pinning is strongly recommended for any OpenCode plugin:
+2. **Local Development Build (`file://`)**:
+   Point your `~/.config/opencode/opencode.json` and `tui.json` directly to the local built bundle:
 
-```json
-{
-  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
-}
-```
+   ```json
+   {
+     "plugin": ["file:///Volumes/Topper2TB/Git/anthropic-auth/packages/opencode/dist/index.js"]
+   }
+   ```
+
+   And for the TUI widget in `~/.config/opencode/tui.json`:
+
+   ```json
+   {
+     "plugin": ["file:///Volumes/Topper2TB/Git/anthropic-auth/packages/opencode"]
+   }
+   ```
+
+   Run `bun run build` to update the bundled output in `dist/` or `bun run dev` for continuous watch compilation.
+
+3. **Upstream npm Reference**:
+   If using the upstream CortexKit release outside of the Arcus fleet:
+
+   ```json
+   {
+     "plugin": ["@cortexkit/opencode-anthropic-auth@1.22.0"]
+   }
+   ```
 
 After changing plugin config, restart OpenCode.
 
@@ -94,22 +123,16 @@ After changing plugin config, restart OpenCode.
 
 ### Pi
 
-Install the Pi package with Pi's package manager:
+For local development or fleet testing:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth@1.0.0
+pi -e file:///Volumes/Topper2TB/Git/anthropic-auth/packages/pi
 ```
 
-For an unpinned install:
+Or when running the upstream npm release:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth
-```
-
-To try it for one run without adding it to Pi settings:
-
-```bash
-pi -e npm:@cortexkit/pi-anthropic-auth
+pi install npm:@cortexkit/pi-anthropic-auth@1.22.0
 ```
 
 The Pi package registers a CortexKit Anthropic provider extension under Pi's built-in `anthropic` provider ID. After installation, start or restart Pi and authenticate with Pi's normal login command:
@@ -790,20 +813,52 @@ bun run dev:clean
 
 ## Arcus Distribution & Packaging
 
-This repository is distributed via Arcus v2. Packaging and publishing scripts are driven through the Arcus pipeline:
+This repository is distributed to the OpenCode fleet via **Arcus v2**. The packaging pipeline adheres to fleet-wide standards:
+
+### Canonical Release Workflow (Cloudhome CI)
+1. **Push commits and release tag** to `origin` (`rustybret/anthropic-auth`):
+   ```bash
+   git push origin main
+   git push origin v1.22.0
+   ```
+2. **Cloudhome BuildKit CI** triggers the `arcus-release-upload` job, which:
+   - Clones the release tag and builds all target binaries/assets hermetically.
+   - Signs the release envelope with the fleet private key (`ARCUS_SIGNING_KEY`).
+   - Commits the signed descriptor to `rustybret/arcus` under `manifests/v2/opencode-anthropic-auth/releases/`.
+   - Uploads binary assets to GitHub Releases (`rustybret/anthropic-auth`).
+3. **Fleet Promotion (`uc-studio`)**:
+   - `uc-studio` independently downloads, verifies SHA-256 digests, and checks hydration rules before bumping `opencode-anthropic-auth` in `arcus-blessed-plugins.json`.
+
+### Local Packaging & Pipeline Verification
+Developers can verify and drive the Arcus toolchain locally via the Option B submodule symlink architecture:
 
 ```bash
-# Verify pipeline scripts and self-tests
+# Verify pipeline scripts and self-tests across all scripts
 bun run test:arcus
 # or
 bun run pipeline:arcus self-test
 
-# Package 5-canonical-target release envelope
+# Package 5-canonical-target release envelope locally (darwin-arm64, darwin-x64, linux-arm64, linux-x64, windows-x64)
 bun run pack:arcus
 
-# Execute full pipeline: pack -> sign -> validate -> publish
-bun run pipeline:arcus all
+# Full local lifecycle test (pack -> sign -> validate)
+bun run pipeline:arcus all --dry-run
 ```
+
+### Upstream Fork Synchronization
+To sync changes from upstream `cortexkit/anthropic-auth`:
+
+```bash
+bun run fork-sync
+```
+
+This script:
+- Fetches from `upstream` and `origin`.
+- Merges `upstream/main` into local `main`.
+- Resolves any `bun.lock` conflict artifacts cleanly.
+- Runs `bun install` to ensure workspace dependencies are hydrated before building.
+- Verifies the full workspace build (`bun run build`).
+- Preserves fork-specific Arcus scripts and prevents reinstatement of upstream release scripts.
 
 See [scripts/AGENTS.md](scripts/AGENTS.md) for full script inventory and architecture details.
 

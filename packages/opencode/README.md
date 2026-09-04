@@ -1,8 +1,15 @@
-# CortexKit Anthropic Auth for OpenCode and Pi
+# CortexKit Anthropic Auth for OpenCode (Fleet Fork)
 
-Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), maintained by CortexKit.
+Claude Pro/Max OAuth support for [OpenCode](https://opencode.ai), maintained as a private fleet fork distributed via [Arcus](https://github.com/rustybret/arcus).
 
-This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi provider extension that overrides Pi's built-in Anthropic provider. Both integrations share the same Anthropic OAuth, fallback-account, quota, prompt-cache, relay, dump, and request-signing logic through `@cortexkit/anthropic-auth-core`.
+This package is part of the `rustybret/anthropic-auth` downstream fork of upstream `cortexkit/anthropic-auth`. It provides Anthropic OAuth interception, multi-account fallback, prompt caching, quota tracking, TUI sidebar integration, and request signing for OpenCode, packaged as an Arcus v2 plugin bundle.
+
+## Fork Identity & Ecosystem Differentiation
+
+- **Distribution**: This fork is packaged exclusively as an **Arcus v2 release envelope** registered in `arcus-blessed-plugins.json`. It is never published to the public npm registry.
+- **Packaging Pipeline**: Uses Arcus Option B (`submodules/arcus` shallow submodule + symlinked pipeline scripts in `scripts/`), driven locally with `scripts/pack-arcus.sh` and canonicalized in CI via Cloudhome BuildKit (`arcus-release-upload`).
+- **Fork Synchronization**: Synchronized with upstream `cortexkit/anthropic-auth` via `scripts/fork-sync.sh` with automated dependency hydration and lockfile merge handling.
+- **Local Loading**: Loaded directly by OpenCode through Arcus or via `file://` references to `packages/opencode/dist/index.js`.
 
 ## Packages
 
@@ -55,23 +62,40 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 
 ## Install
 
-### OpenCode
+### OpenCode (Arcus & Fleet Deployment)
 
-Add the OpenCode plugin to your OpenCode configuration:
+In the OpenCode fleet, this plugin is distributed through **Arcus v2** and loaded via the blessed plugin composition:
 
-```json
-{
-  "plugin": ["@cortexkit/opencode-anthropic-auth"]
-}
-```
+1. **Arcus Distribution (Recommended for Fleet)**:
+   The plugin is declared in `arcus-blessed-plugins.json` and installed into the OpenCode environment via the Arcus toolchain.
 
-Pinning is strongly recommended for any OpenCode plugin:
+2. **Local Development Build (`file://`)**:
+   Point your `~/.config/opencode/opencode.json` and `tui.json` directly to the local built bundle:
 
-```json
-{
-  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
-}
-```
+   ```json
+   {
+     "plugin": ["file:///Volumes/Topper2TB/Git/anthropic-auth/packages/opencode/dist/index.js"]
+   }
+   ```
+
+   And for the TUI widget in `~/.config/opencode/tui.json`:
+
+   ```json
+   {
+     "plugin": ["file:///Volumes/Topper2TB/Git/anthropic-auth/packages/opencode"]
+   }
+   ```
+
+   Run `bun run build` to update the bundled output in `dist/` or `bun run dev` for continuous watch compilation.
+
+3. **Upstream npm Reference**:
+   If using the upstream CortexKit release outside of the Arcus fleet:
+
+   ```json
+   {
+     "plugin": ["@cortexkit/opencode-anthropic-auth@1.22.0"]
+   }
+   ```
 
 After changing plugin config, restart OpenCode.
 
@@ -80,22 +104,16 @@ After changing plugin config, restart OpenCode.
 
 ### Pi
 
-Install the Pi package with Pi's package manager:
+For local development or fleet testing:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth@1.0.0
+pi -e file:///Volumes/Topper2TB/Git/anthropic-auth/packages/pi
 ```
 
-For an unpinned install:
+Or when running the upstream npm release:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth
-```
-
-To try it for one run without adding it to Pi settings:
-
-```bash
-pi -e npm:@cortexkit/pi-anthropic-auth
+pi install npm:@cortexkit/pi-anthropic-auth@1.22.0
 ```
 
 The Pi package registers a CortexKit Anthropic provider extension under Pi's built-in `anthropic` provider ID. After installation, start or restart Pi and authenticate with Pi's normal login command:
@@ -766,29 +784,26 @@ Clean the local dev symlink with:
 bun run dev:clean
 ```
 
-## Release
+## Arcus Distribution & Packaging
 
-This repo uses CortexKit's tag-driven release workflow.
-
-Preview a release:
+This repository is distributed to the OpenCode fleet via **Arcus v2**. Packaging and publishing scripts are driven through the Arcus pipeline:
 
 ```bash
-./scripts/release.sh 1.9.0 --dry
+# Verify pipeline scripts and self-tests across all scripts
+bun run test:arcus
+# or
+bun run pipeline:arcus self-test
+
+# Package 5-canonical-target release envelope locally (darwin-arm64, darwin-x64, linux-arm64, linux-x64, windows-x64)
+bun run pack:arcus
+
+# Canonical release:
+# 1. Push commits and tag to origin: git push origin main && git push origin v1.22.0
+# 2. Cloudhome BuildKit CI (arcus-release-upload) builds, signs, and commits the descriptor to rustybret/arcus
+# 3. uc-studio independently validates and promotes the release in arcus-blessed-plugins.json
 ```
 
-Create and push the release tag:
-
-```bash
-./scripts/release.sh 1.9.0
-```
-
-Wait for GitHub Actions:
-
-```bash
-./scripts/wait-release.sh v1.9.0
-```
-
-The release workflow runs checks, publishes the core, OpenCode, and Pi packages to npm with provenance, and creates the GitHub release.
+See [scripts/AGENTS.md](../../scripts/AGENTS.md) for full script inventory and architecture details.
 
 ## Troubleshooting
 

@@ -4,6 +4,13 @@
 
 **Overall:** Plugin/extension-based Anthropic authentication and routing architecture — a shared core library provides Claude Pro/Max OAuth, account, quota, cache, relay, and routing logic, with separate integration packages adapting it to OpenCode and Pi.
 
+**Fork & Fleet Architecture:**
+- Downstream repository: `rustybret/anthropic-auth` (personal/fleet fork).
+- Upstream repository: `cortexkit/anthropic-auth` (source of truth for core OAuth and protocol shims).
+- Distribution: Distributed hermetically to the OpenCode fleet via **Arcus v2** (`submodules/arcus`, `scripts/pack-arcus.sh`, `arcus manifest validate --with-envelope`) and managed through `arcus-blessed-plugins.json`. Upstream npm publishing scripts are purged; this fork is never published to the public npm registry.
+- Upstream synchronization: Managed via `scripts/fork-sync.sh` (`bun run fork-sync`), which reconciles git merges, auto-resolves `bun.lock` conflicts, ensures workspace dependency hydration (`bun install`) before build verification, and prevents restoration of purged upstream release scripts.
+- CI/CD & Fleet Promotion: Canonical packaging and publishing are handled remotely by **Cloudhome BuildKit CI** (`arcus-release-upload`), landing signed manifests in `rustybret/arcus` and release assets on GitHub, with independent multi-target download, sha256, and hydration verification performed by **`uc-studio`** before blessed set promotion.
+
 **Key Characteristics:**
 - Shared core (`@cortexkit/anthropic-auth-core`) contains all OAuth, quota, cache, relay, and request-signing logic — no duplication between agent integrations
 - OpenCode integration operates at the **fetch/request transform** layer: intercepts Anthropic fetch calls, rewrites URLs and request bodies, sanitizes system prompts, and strips tool-prefix on streaming responses
@@ -39,10 +46,15 @@
 - Location: `packages/e2e-tests/`
 - Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`), OpenCode runner (`src/opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`, `tests/quota-header-relay.test.ts`, `tests/tmp-hygiene.test.ts`)
 
-**Arcus Distribution & Packaging:**
+**Arcus Distribution & Packaging (Fleet Option B):**
 - Purpose: Hermetic Arcus v2 release packaging, signing, validation, and publishing without upstream script drift
-- Location: `scripts/` (symlinks to `submodules/arcus/skills/scripts/`), `scripts/pack-arcus.sh`, `scripts/setup.sh`
-- Pattern: Option B (Git Submodule + Symlinks + setup.sh) — generic pipeline scripts (`arcus-pipeline.sh`, `sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`) are symlinks to `submodules/arcus/skills/scripts/*`; `scripts/pack-arcus.sh` acts as the specialized project packaging driver for the OpenCode plugin strategy, staging runtime assets and enforcing distinct digest triples across all 5 canonical targets; `scripts/setup.sh` hydrates submodules, repairs symlinks, and bootstraps dependencies on fresh clones.
+- Location: `submodules/arcus/` (shallow git submodule), `scripts/` (symlinks to `submodules/arcus/skills/scripts/`), `scripts/pack-arcus.sh`, `scripts/setup.sh`
+- Pattern: Option B (Git Submodule + Symlinks + setup.sh) — generic pipeline scripts (`arcus-pipeline.sh`, `sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`) are symlinks to `submodules/arcus/skills/scripts/*`; `scripts/pack-arcus.sh` acts as the specialized project packaging driver for the OpenCode plugin strategy, staging runtime assets, auto-allocating sequence numbers against `submodules/arcus`, enforcing argv private key safety, supporting `--self-test` mode, and enforcing distinct digest triples across all 5 canonical targets; `scripts/setup.sh` hydrates submodules, repairs symlinks, and bootstraps dependencies on fresh clones.
+
+**Upstream Fork Synchronization:**
+- Purpose: Bi-directional synchronization from upstream `cortexkit/anthropic-auth` to maintain feature and protocol parity while preserving fleet distribution assets
+- Location: `scripts/fork-sync.sh`, `scripts/fork-sync-exclusions`, `scripts/fork-sync.test.ts`
+- Pattern: Automated fetch from `upstream` and `origin`, clean merge of `upstream/main`, `bun.lock` conflict mitigation, pre-build dependency hydration via `bun install`, workspace build gate, and exclusion enforcement preventing restoration of deleted npm release tooling.
 
 ## Data Flow
 

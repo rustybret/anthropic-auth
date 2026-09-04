@@ -1,269 +1,123 @@
-# Arcus Release Process — @cortexkit/opencode-anthropic-auth
+# Arcus v2 Release Process — opencode-anthropic-auth
 
 ## Overview
 
-This document describes the end-to-end release pipeline for publishing `@cortexkit/opencode-anthropic-auth` via the Arcus private package distribution system (`rustybret/arcus`). The process ensures:
+This document describes the modern Arcus v2 release and distribution pipeline for `opencode-anthropic-auth` within the private package fleet. The package is distributed hermetically through Arcus v2 (`rustybret/arcus`) and managed via the blessed plugin composition (`arcus-blessed-plugins.json`).
 
-- **Zero binary blobs in git**: Compiled `.tgz` archives are published as GitHub Release assets only.
-- **SHA-256 integrity**: Every release manifest records a checksum so consumers can verify.
-- **Monorepo-friendly**: Works from the `anthropic-auth` workspace root; no separate repo checkout needed for the build.
+### Key Characteristics:
+- **Zero Binaries in Git**: All compiled archives (`.tar.zst`, `.zip`, `.pwr`) are published as GitHub Release assets or served via the Arcus artifact gateway (`arcus-auth.rustybret.com`).
+- **Cryptographic Signature Verification**: Every release manifest is cryptographically signed using Ed25519 and validated via `arcus manifest validate --with-envelope`.
+- **5 Canonical Targets**: Releases provide distinct, verified multi-arch artifacts across `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, and `windows-x64`.
+- **Zero Drift Option B Architecture**: Pipeline scripts are symlinked directly to `submodules/arcus/skills/scripts/*`, ensuring the toolchain stays aligned with upstream Arcus without duplicate code.
+- **Automated CI Build & Publish**: The canonical publishing path is driven automatically by Cloudhome BuildKit CI (`arcus-release-upload`), landing signed manifests in `rustybret/arcus` and triggering verification by `uc-studio`.
 
 ---
 
-## 1. Prepare the Workspace
+## 1. Toolchain & Submodule Architecture (Option B)
 
-From the `anthropic-auth` repo root:
+The repository integrates Arcus via **Option B: Git Submodule + Symlinks + setup.sh**:
+
+```
+anthropic-auth/
+├── submodules/
+│   └── arcus/                  # Shallow submodule tracking rustybret/arcus
+├── scripts/
+│   ├── setup.sh                # Fresh clone bootstrap script
+│   ├── pack-arcus.sh           # Specialized OpenCode plugin target packager
+│   ├── pack-arcus.test.ts      # Automated verification tests
+│   ├── arcus-pipeline.sh       # -> ../submodules/arcus/skills/scripts/arcus-pipeline.sh
+│   ├── sign-arcus.sh           # -> ../submodules/arcus/skills/scripts/sign-arcus.sh
+│   ├── validate-arcus.sh       # -> ../submodules/arcus/skills/scripts/validate-arcus.sh
+│   ├── publish-arcus.sh        # -> ../submodules/arcus/skills/scripts/publish-arcus.sh
+│   └── migrate-arcus.sh        # -> ../submodules/arcus/skills/scripts/migrate-arcus.sh
+```
+
+### Fresh Clone Bootstrap
+On a fresh clone, run the repository bootstrap script:
 
 ```bash
-# Ensure local packages are built and up to date
-bun run build
-
-# Install dependencies (if not already installed)
-bun install
+git clone --recurse-submodules https://github.com/rustybret/anthropic-auth.git
+cd anthropic-auth
+bun run setup
 ```
+
+If cloned without `--recurse-submodules`, `bun run setup` (or `bash scripts/setup.sh`) will automatically:
+1. Initialize and hydrate `submodules/arcus`.
+2. Verify and repair all pipeline script symlinks.
+3. Install workspace dependencies (`bun install`).
+4. Verify the workspace build (`bun run build`).
 
 ---
 
-## 2. Package the Plugin
+## 2. Local Packaging & Pipeline Verification
 
-Run the included packaging script. This performs the build, creates the `.tgz` tarball, calculates its SHA-256 checksum, and emits an Arcus-compatible manifest JSON.
+Before releasing, developers can verify the packaging pipeline and run hermetic self-tests locally:
 
 ```bash
-./scripts/pack-arcus.sh --outdir dist-arcus
+# Run self-tests across all pipeline scripts and package test assertions
+bun run test:arcus
+# or
+bun run pipeline:arcus self-test
+
+# Package 5 canonical targets into dist-arcus/
+bun run pack:arcus
 ```
 
-**What this does:**
-
-| Step | Action |
-|------|--------|
-| `bun run build` | Compiles all workspace packages (`core`, `opencode`, `pi`) and generates `dist/` |
-| `npm pack` | Creates `cortexkit-opencode-anthropic-auth-<version>.tgz` in `dist-arcus/` |
-| `shasum -a 256` | Computes the SHA-256 hash of the tarball |
-| Manifest JSON | Writes `anthropic-auth-<version>.json` with name, version, asset filename, URL template, and SHA-256 |
-
-**Output files (in `dist-arcus/`):**
-
-```
-dist-arcus/
-├─ cortexkit-opencode-anthropic-auth-1.19.0.tgz     ← binary asset (NOT committed to git)
-└─ anthropic-auth-1.19.0.json                       ← Arcus manifest (commit this)
-```
-
-**Generated manifest example** (`anthropic-auth-1.19.0.json`):
-
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/rustybret/arcus/main/manifests/schema.json",
-  "name": "opencode-anthropic-auth",
-  "version": "1.19.0",
-  "description": "Anthropic auth, quota, cache, and relay plugin for OpenCode",
-  "harness": "opencode",
-  "plugin": {
-    "type": "opencode-plugin",
-    "name": "@cortexkit/opencode-anthropic-auth",
-    "version": "1.19.0",
-    "asset": {
-      "filename": "cortexkit-opencode-anthropic-auth-1.19.0.tgz",
-      "url": "PENDING_UPLOAD_URL",
-      "sha256": "PENDING_BUILD_HASH",
-      "strip_components": 1
-    },
-    "entrypoints": {
-      "server": "dist/index.js",
-      "tui": "src/tui/entry.mjs",
-      "tui_compiled": "src/tui-compiled/tui.tsx"
-    }
-  }
-}
-```
-
-> **Note**: The `url` field (`PENDING_UPLOAD_URL`) is a placeholder — see Step 4 for the actual upload.
+### Packaging Driver (`scripts/pack-arcus.sh`)
+`scripts/pack-arcus.sh` acts as the target-assembly driver for `@cortexkit/opencode-anthropic-auth`:
+- **Sequence Auto-Allocation**: When `--sequence` is omitted, it invokes `arcus manifest allocate-sequence --root submodules/arcus` to assign the next monotonic sequence number.
+- **Dynamic Binary Discovery**: Resolves the `arcus` CLI binary from `$PATH`, candidate local build trees, or `ARCUS_BIN`.
+- **Argv Key Guard**: Prevents leaking private keys in command-line arguments (rejects raw key values passed via `--key`, `--signing-key`, or `--private-key`; accepts `--key-env`, `--key-file`, or stdin).
+- **Hermetic Self-Test**: Supports `--self-test` to validate argument parsing, exit codes, and sequence logic safely.
+- **5 Canonical Targets**: Stages standalone release archives with distinct digest triples (`sha256`, target content source digest, and size) for each target architecture.
 
 ---
 
-## 3. Verify the Artifact
+## 3. Canonical Release Workflow (Cloudhome BuildKit CI)
 
-Inspect the generated manifest and tarball:
+Manual pack, sign, and publish operations from local workstations are discouraged for official releases. Official releases follow the canonical Cloudhome BuildKit CI pipeline:
 
-```bash
-# Check manifest JSON syntax
-cat dist-arcus/anthropic-auth-1.19.0.json
-
-# Verify the tarball can be unpacked
-tar tzf dist-arcus/cortexkit-opencode-anthropic-auth-1.19.0.tgz | head -5
-
-# Confirm SHA-256 matches
-shasum -a 256 dist-arcus/cortexkit-opencode-anthropic-auth-1.19.0.json  # manifest file hash
-shasum -a 256 dist-arcus/cortexkit-opencode-anthropic-auth-1.19.0.tgz   # artifact hash
+```
+[Developer]
+    │
+    ▼ (git tag -a v1.22.0 && git push origin v1.22.0)
+[GitHub: rustybret/anthropic-auth]
+    │
+    ▼ (Webhook via Cloudflare Tunnel)
+[Cloudhome Build Dispatcher]
+    │ (Job: arcus-release-upload)
+    ▼
+[Cloudhome BuildKit Runner]
+    ├─ Clones rustybret/anthropic-auth @ release tag
+    ├─ Builds workspace packages (bun run build)
+    ├─ Clones rustybret/arcus
+    ├─ Executes arcus-pipeline.sh pack & sign with fleet key
+    ├─ Validates signed envelope (arcus manifest validate --with-envelope)
+    ├─ Commits signed manifest to rustybret/arcus manifests/v2/opencode-anthropic-auth/releases/
+    └─ Uploads release archives to GitHub Release (gh release upload)
+    │
+    ▼
+[Fleet Steward: uc-studio]
+    ├─ Downloads signed manifest and candidate artifacts
+    ├─ Evaluates 4-gate verification:
+    │   1. Authenticated download verification
+    │   2. SHA-256 digest match against manifest
+    │   3. Hydration check (hydrate_required: false)
+    │   4. Delta & regression checks
+    └─ Promotes version & sequence in arcus-blessed-plugins.json
 ```
 
 ---
 
-## 4. Publish to GitHub Releases
+## 4. Release Checklist
 
-The `.tgz` tarball **MUST NOT** be committed to the `anthropic-auth` git repo. It is published as a GitHub Release asset.
-
-```bash
-# From the anthropic-auth repo root (or via GitHub CLI on any machine with access)
-
-# 1. Create / verify the release tag
-git tag -l  # e.g. v1.19.0 should exist
-
-# 2. Upload the tarball as a Release asset
-#    (requires GITHUB_TOKEN or PAT with repo scope)
-gh release upload v1.19.0 dist-arcus/cortexkit-opencode-anthropic-auth-1.19.0.tgz \
-  --repo rustybret/anthropic-auth
-
-# 3. Update the manifest URL placeholder
-#    Edit dist-arcus/anthropic-auth-1.19.0.json and replace:
-#      "url": "PENDING_UPLOAD_URL"
-#    with the actual uploaded URL, e.g.:
-#      "url": "https://github.com/rustybret/anthropic-auth/releases/download/v1.19.0/cortexkit-opencode-anthropic-auth-1.19.0.tgz"
-```
-
-**Alternative: One-liner upload (if GITHUB_TOKEN is set as a build arg):**
-
-```bash
-# Inside a Docker build or CI with GITHUB_TOKEN env var:
-gh release upload v$VERSION dist-arcus/cortexkit-opencode-anthropic-auth-$VERSION.tgz \
-  --repo rustybret/anthropic-auth
-```
-
----
-
-## 5. Update Arcus Index (`rustybret/arcus`)
-
-The consumer-facing Arcus repo (`rustybret/arcus`) tracks plugin manifests. After Step 4, commit the manifest to the appropriate path.
-
-```bash
-# From rustybret/arcus repo root
-
-# 1. Create the manifests/plugins directory structure if needed
-mkdir -p manifests/plugins/anthropic-auth
-
-# 2. Copy (or symlink) the manifest from the source repo
-cp /path/to/anthropic-auth/dist-arcus/anthropic-auth-1.19.0.json manifests/plugins/anthropic-auth/1.19.0.json
-
-# 3. Commit and push
-git add manifests/plugins/anthropic-auth/1.19.0.json
-git commit -m "plugin: add @cortexkit/opencode-anthropic-auth v1.19.0"
-git push origin main
-```
-
-**Expected manifest path in `rustybret/arcus`:**
-
-```
-manifests/plugins/anthropic-auth/1.19.0.json
-```
-
-This file is referenced by consumer `arcus.json` manifests (see Step 6).
-
----
-
-## 6. Consumer `arcus.json` Update
-
-Consumer repositories (e.g., `cloudhome`, `uc-studio`, workspace base images) include `anthropic-auth` in their `arcus.json` manifest:
-
-```json
-{
-  "version": 1,
-  "submodule": "submodules/arcus",
-  "skills": [
-    {
-      "name": "opencode-anthropic-auth",
-      "path": "manifests/plugins/anthropic-auth/1.19.0.json"
-    }
-  ]
-}
-```
-
-**Consumption workflow** (per consumer):
-
-```bash
-# 1. Verify / initialize the arcus submodule
-git submodule update --init submodules/arcus
-
-# 2. Pull the latest skills/manifests
-just pull arcus     # or: ./scripts/arcus-pull.sh
-
-# 3. Verify materialized manifest exists
-cat submodules/arcus/manifests/plugins/anthropic-auth/1.19.0.json
-
-# 4. (Unity projects) Reference the UPM package if needed
-#    Packages/manifest.json: "com.supermcp.unity-bridge": "file:../../submodules/arcus/packages/unity/..."
-```
-
----
-
-## 7. Auto-Sync & Auto-Upgrade in Workspaces
-
-For Docker-based OpenCode workspaces (e.g., `cloudhome` deployment):
-
-**Build-time** (`Dockerfile`):
-
-```dockerfile
-# During image build — fetch latest plugin via Arcus
-ARG GITHUB_TOKEN
-RUN just pull arcus  # clones rustybret/arcus, runs arcus-pull.sh
-```
-
-**Runtime** (`docker/workspaces/opencode-entrypoint.sh`):
-
-```bash
-# On container boot, seed plugins directory
-if [[ ! -f ${HOME}/.config/opencode/plugins/cortexkit-opencode-anthropic-auth.tgz ]]; then
-  just pull arcus     # ensures latest manifest is fetched
-  # Download the tarball from the GitHub Release URL recorded in the manifest
-  TARBALL_URL=$(jq -r '.plugin.asset.url' ${HOME}/.arcus/manifests/plugins/anthropic-auth/1.19.0.json)
-  curl -L -o ${HOME}/.config/opencode/plugins/cortexkit-opencode-anthropic-auth.tgz "$TARBALL_URL"
-fi
-```
-
-**Persistent user OAuth state**:
-
-- `~/.config/opencode/anthropic-auth.json` and sidecar files (`anthropic-auth-state.json`, `anthropic-auth-routing-state.json`) should be persisted on a PVC across workspace restarts.
-- OpenCode reads config from this path; the plugin writes token/quota state here.
-
----
-
-## 8. Safety Gates & Checklist
-
-| Gate | Command / Action | Pass condition |
-|------|-----------------|----------------|
-| **Build** | `bun run build` | Exit code 0 |
-| **Typecheck** | `bun run typecheck` | Exit code 0 |
-| **Tests** | `bun test` | 0 failures |
-| **Packaging** | `./scripts/pack-arcus.sh --outdir dist-arcus` | Manifest + tarball generated |
-| **Git sanity** | `git status --porcelain` | Only `dist-arcus/` and `scripts/pack-arcus.sh` are new/modified (no `.tgz` in git) |
-| **Release tag** | `git rev-parse v<version>` | Tag exists |
-| **GitHub Release** | `gh release view v<version> --repo rustybret/anthropic-auth` | Tarball asset listed |
-| **Arcus manifest** | `cat manifests/plugins/anthropic-auth/<version>.json` | Valid JSON, SHA-256 matches tarball |
-| **Consumer pull** | `just pull arcus` on consumer repo | Manifest materializes, no errors |
-
-**Never commit:** `.tgz` archives, `node_modules/`, `dist/` (except what's tracked in `.gitignore`), or any build outputs to the `anthropic-auth` git repo. Always publish heavy binaries to **GitHub Release assets**.
-
----
-
-## 9. Version Bump Workflow (minor/patch)
-
-When releasing a new version (e.g., `1.19.0 → 1.20.0`):
-
-1. Update version in `packages/opencode/package.json` (and `packages/core/package.json` if core changes).
-2. Run `bun run build`.
-3. Run `./scripts/pack-arcus.sh --outdir dist-arcus`.
-4. Follow Steps 3–7 above, replacing `<version>` with the new version.
-5. Tag the release: `git tag v1.20.0 && git push origin v1.20.0`.
-6. Announce / coordinate with cross-project targets (cloudhome, uc-studio, etc.) via `project_message`.
-
----
-
-## Appendix: Related Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `scripts/pack-arcus.sh` | Build + package + manifest generation (primary release tool) |
-| `scripts/pack-arcus.test.ts` | Unit test skeleton for packaging script |
-| `scripts/fork-sync.sh` | Merge upstream changes into fork (conflict resolution via `fork-sync-exclusions`) |
-| `scripts/fork-sync-exclusions` | Standing conflict-class rules (keep-deleted / take-theirs) |
-| `scripts/version-sync.mjs` | Cross-package version sync helper |
-| `scripts/release.sh` | Full release pipeline (lint → typecheck → test → build → tag → push) |
+| Step | Action | Verification |
+|------|--------|--------------|
+| **1. Upstream Sync** | `bun run fork-sync` | Upstream `cortexkit/anthropic-auth` merged, dependencies hydrated, build passes |
+| **2. Code Quality** | `bun run typecheck && bun run test` | All packages compile; full test suite passes |
+| **3. Pipeline Test** | `bun run test:arcus` | All script self-tests and pack tests pass (0 failures) |
+| **4. Version Bump** | Update `packages/opencode/package.json` | Correct SemVer set |
+| **5. Commit & Push** | `git commit -m "release: vX.Y.Z" && git push origin main` | Remote `origin/main` up to date |
+| **6. Tag Release** | `git tag -a vX.Y.Z -m "Release vX.Y.Z" && git push origin vX.Y.Z` | Tag visible on GitHub |
+| **7. CI Upload** | Monitor Cloudhome BuildKit `arcus-release-upload` | Descriptor committed to `rustybret/arcus` |
+| **8. Blessed Promotion** | Notify `uc-studio` with release ID and sequence | Updated in `arcus-blessed-plugins.json` |
