@@ -255,6 +255,8 @@ cd "$ROOT"
 if [[ "$SKIP_BUILD" == "1" ]]; then
   echo "FORK_SYNC_SKIP_BUILD=1; skipping workspace build."
 else
+  echo "== installing workspace dependencies =="
+  bun install
   bun run build
 fi
 
