@@ -1,0 +1,4 @@
+[submodule "submodules/arcus"]
+	path = submodules/arcus
+	url = https://github.com/rustybret/arcus.git
+	shallow = true
