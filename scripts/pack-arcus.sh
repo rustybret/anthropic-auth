@@ -169,6 +169,11 @@ resolve_arcus_dir() {
 
 if [ -z "$SEQUENCE" ]; then
   if resolve_arcus_dir; then
+    if command -v git >/dev/null 2>&1 && ([ -d "${ARCUS_DIR}/.git" ] || [ -f "${ARCUS_DIR}/.git" ]); then
+      if ! (CDPATH='' cd -- "$ARCUS_DIR" && git fetch origin) 2>/dev/null; then
+        warn "could not fetch origin in ${ARCUS_DIR}; auto-allocated sequence may be stale"
+      fi
+    fi
     SEQUENCE=$("$ARCUS_BIN" manifest allocate-sequence --package-id "$PACKAGE_ID" --root "$ARCUS_DIR") ||
       die "auto-allocating sequence for ${PACKAGE_ID} failed (arcus manifest allocate-sequence --root ${ARCUS_DIR})"
     printf 'pack-arcus: auto-allocated sequence %s for %s (source: %s/manifests/v2/%s/releases)\n' \
