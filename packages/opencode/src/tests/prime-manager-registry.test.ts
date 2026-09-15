@@ -13,13 +13,9 @@ import { adoptPrimeManager } from '../prime-manager-registry.ts'
 
 const tempDirs: string[] = []
 const managers: PrimeManager[] = []
-const originalSetInterval = globalThis.setInterval
-const originalClearInterval = globalThis.clearInterval
 
 afterEach(async () => {
   for (const manager of managers.splice(0)) manager.stop()
-  globalThis.setInterval = originalSetInterval
-  globalThis.clearInterval = originalClearInterval
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   )
@@ -94,7 +90,7 @@ function adopt(
   return adoptPrimeManager(storagePath, create, {
     slot,
     rebind,
-  })
+  }).manager
 }
 
 describe('prime manager registry lifecycle', () => {
@@ -190,19 +186,23 @@ describe('prime manager registry lifecycle', () => {
 
   test('same-path adoption does not create a duplicate interval', async () => {
     let intervalCalls = 0
-    globalThis.setInterval = mock(() => {
+    const setIntervalImpl = mock(() => {
       intervalCalls += 1
       return { unref() {} } as unknown as ReturnType<typeof setInterval>
     }) as unknown as typeof setInterval
-    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
+    const clearIntervalImpl = mock(() => {}) as unknown as typeof clearInterval
     const root = await markerRoot()
     const path = join(root, 'accounts.json')
-    const managerOptions = options({
-      storagePath: path,
-      markerDir: root,
-      reset: Date.now(),
-      send() {},
-    })
+    const managerOptions = {
+      ...options({
+        storagePath: path,
+        markerDir: root,
+        reset: Date.now(),
+        send() {},
+      }),
+      setIntervalImpl,
+      clearIntervalImpl,
+    }
     const first = adopt(
       path,
       () => {

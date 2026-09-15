@@ -95,6 +95,10 @@ Prime marker identities live in `anthropic-auth-state.json`. Plugin-owned refres
 
 Pi's `/claude-prime` command displays status only. The `on` and `off` arguments are ignored; toggling priming requires OpenCode.
 
+## Anthropic-compatible proxy overrides
+
+API-key fallback routes honor `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`, and `ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU,FABLE}_MODEL`. These variables never alter OAuth requests. Custom headers may add proxy metadata but cannot replace route authentication, Anthropic protocol headers, body framing, or internal correlation headers; a configuration containing an invalid or protected header is ignored as a whole. Versioned provider base paths are preserved without duplicating `/v1`.
+
 ## Relay
 
 The Pi package can use the same user-owned Cloudflare relay config as the OpenCode package. The relay setup helper currently lives in the OpenCode package CLI:

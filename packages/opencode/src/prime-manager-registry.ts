@@ -13,42 +13,64 @@ type PrimeManagerAdoption = {
   rebind: (manager: PrimeManager) => void
 }
 
-// Each project slot owns one fingerprint at a time, while slots sharing a
-// storage identity adopt one process-wide manager. Moving a slot releases its
-// old owner so an unreferenced timer cannot survive a project reload.
+type SlotLease = {
+  fingerprint: string
+  marker: symbol
+}
+
+export interface AdoptedPrimeManager {
+  manager: PrimeManager
+  release: () => void
+}
+
+// Each project slot owns one lease at a time, while slots sharing a storage
+// identity adopt one process-wide manager. The opaque lease marker prevents a
+// disposed predecessor from releasing a same-slot successor after reload.
 const primeManagers = new Map<string, PrimeManagerEntry>()
-const slotFingerprints = new Map<string, string>()
+const slotLeases = new Map<string, SlotLease>()
+
+function releaseSlot(slot: string, lease: SlotLease): void {
+  const current = slotLeases.get(slot)
+  if (
+    current?.fingerprint !== lease.fingerprint ||
+    current.marker !== lease.marker
+  ) {
+    return
+  }
+
+  const entry = primeManagers.get(lease.fingerprint)
+  entry?.slots.delete(slot)
+  if (entry?.slots.size === 0) {
+    entry.manager.stop()
+    primeManagers.delete(lease.fingerprint)
+  }
+  slotLeases.delete(slot)
+}
 
 export function adoptPrimeManager(
   storagePath: string,
   create: () => PrimeManager,
   adoption: PrimeManagerAdoption,
-): PrimeManager {
+): AdoptedPrimeManager {
   const fingerprint = primeStorageFingerprint(storagePath)
-  const previousFingerprint = slotFingerprints.get(adoption.slot)
-  if (previousFingerprint && previousFingerprint !== fingerprint) {
-    const previous = primeManagers.get(previousFingerprint)
-    if (previous) {
-      previous.slots.delete(adoption.slot)
-      if (previous.slots.size === 0) {
-        previous.manager.stop()
-        primeManagers.delete(previousFingerprint)
-      }
-    }
-  }
-
-  slotFingerprints.set(adoption.slot, fingerprint)
   const existing = primeManagers.get(fingerprint)
-  if (existing) {
-    existing.slots.add(adoption.slot)
-    adoption.rebind(existing.manager)
-    return existing.manager
+  const manager = existing?.manager ?? create()
+  if (existing) adoption.rebind(manager)
+
+  const previous = slotLeases.get(adoption.slot)
+  if (previous && previous.fingerprint !== fingerprint) {
+    releaseSlot(adoption.slot, previous)
   }
 
-  const manager = create()
-  primeManagers.set(fingerprint, {
+  const entry = existing ?? { manager, slots: new Set<string>() }
+  if (!existing) primeManagers.set(fingerprint, entry)
+
+  const lease: SlotLease = { fingerprint, marker: Symbol(adoption.slot) }
+  entry.slots.add(adoption.slot)
+  slotLeases.set(adoption.slot, lease)
+
+  return {
     manager,
-    slots: new Set([adoption.slot]),
-  })
-  return manager
+    release: () => releaseSlot(adoption.slot, lease),
+  }
 }

@@ -150,8 +150,9 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 - **What:** Loopback-HTTP bridge so a slash command in the server process opens a modal in the TUI
   process. `rpc/` — `rpc-server.ts` (bearer-auth HTTP on 127.0.0.1), `rpc-client.ts`, `port-file.ts`
   (pid-stamped discovery), `rpc-dir.ts` (dir keyed on project hash), `notifications.ts`, `protocol.ts`.
-- **Coupling:** 100% **[G]** — only the dir namespace + the command-name union are renamed. NOTE: carries
-  the multi-session keying bug (parity-backlog #1, memory #410).
+  Each project owns a distinct server and port file; notification drains require the active session id,
+  and identity-fenced disposal cannot remove a same-directory successor.
+- **Coupling:** 100% **[G]** — only the dir namespace + the command-name union are renamed.
 
 ## L. Provider model handling — [A]
 

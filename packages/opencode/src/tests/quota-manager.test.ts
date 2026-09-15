@@ -738,7 +738,7 @@ describe('QuotaManager', () => {
   })
 
   describe('persistence', () => {
-    test('seeds main quota from persisted storage', () => {
+    test('seeds legacy main quota without trusting its unbound timestamp', () => {
       const quota = {
         quotas: [],
         expires: new Date(2_000_000).toISOString(),
@@ -757,7 +757,7 @@ describe('QuotaManager', () => {
 
       const main = qm.getMain()
       expect(main).not.toBeNull()
-      expect(main!.checkedAt).toBe(900_000)
+      expect(main!.checkedAt).toBe(0)
     })
 
     test('getMain(mainAccountId) rejects a cached entry from a different identity', () => {
@@ -1685,7 +1685,7 @@ describe('QuotaManager', () => {
   })
 
   describe('refreshMain dedup (identity-keyed)', () => {
-    test('rotated access tokens under one main identity share one in-flight fetch', async () => {
+    test('rotated access tokens under one main identity use separate in-flight fetches', async () => {
       let fetchCalls = 0
       const fetchMock = mock(async () => {
         fetchCalls++
@@ -1703,7 +1703,7 @@ describe('QuotaManager', () => {
       ])
 
       expect(quotaA).toEqual(quotaB)
-      expect(fetchCalls).toBe(1)
+      expect(fetchCalls).toBe(2)
     })
 
     test('concurrent different-token refreshMain: each gets its own quota', async () => {

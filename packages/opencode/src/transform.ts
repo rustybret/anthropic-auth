@@ -3,6 +3,8 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyThinkingBindingControls,
+  assertNotCustodyTombstone,
+  type BillingLineageFields,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -27,8 +29,10 @@ import {
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
+  remapRequestBodyModel,
   selectClaudeCodeBetas,
   signRequestBody,
+  stripBillingLineageFromBody,
   TEXT_REPLACEMENTS,
   THINKING_BINDING_CONTROLS_BETA,
   type ThinkingPrefixMismatchBehavior,
@@ -42,6 +46,7 @@ import {
 import {
   applyOpenCodeEffortMarkers,
   EffortMarkerCorrelationError,
+  type OpenCodeEffortMarkerPlan,
 } from './effort-history'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
@@ -168,6 +173,8 @@ export function setOAuthHeaders(
     identity?: ClaudeCodeIdentity
   } = {},
 ): Headers {
+  // This is the shared boundary where an access value becomes a bearer header.
+  assertNotCustodyTombstone(accessToken, 'anthropic')
   return applyClaudeCodeHeaders(headers, accessToken, {
     ...options,
     extraBetas: [
@@ -340,10 +347,31 @@ export function rewriteUrl(
     ? parseBaseUrl(options.baseURL)
     : resolveBaseUrl()
   if (baseUrl) {
+    const basePath = baseUrl.pathname.replace(/\/$/, '')
+    const inputPath = requestUrl.pathname
     requestUrl.protocol = baseUrl.protocol
     requestUrl.host = baseUrl.host
-    if (options.baseURL) {
-      requestUrl.pathname = `${baseUrl.pathname.replace(/\/$/, '')}${requestUrl.pathname}`
+
+    const alreadyUnderBase =
+      inputPath === basePath ||
+      (basePath !== '' && inputPath.startsWith(`${basePath}/`))
+    if (!alreadyUnderBase) {
+      const baseEndsInVersion = /\/v\d[^/]*$/.test(basePath)
+      if (inputPath === '/messages') {
+        requestUrl.pathname = baseEndsInVersion
+          ? `${basePath}/messages`
+          : `${basePath}/v1/messages`
+      } else if (inputPath === '/v1/messages' && baseEndsInVersion) {
+        requestUrl.pathname = `${basePath}/messages`
+      } else {
+        requestUrl.pathname = `${basePath}${inputPath}`
+      }
+    } else if (inputPath === `${basePath}/messages`) {
+      // Repair only the exact SDK form under a non-versioned base. Do not
+      // rewrite sibling resources or explicit /v2 (and later) proxy paths.
+      if (!/\/v\d[^/]*$/.test(basePath)) {
+        requestUrl.pathname = `${basePath}/v1/messages`
+      }
     }
   }
 
@@ -1059,6 +1087,7 @@ export function prepareFableCacheWarmSource(
     // The prewarm must reach the source model (not be fallback-routed),
     // so strip any server-side fallback opt-in inherited from the captured body.
     delete body.fallbacks
+    stripBillingLineageFromBody(body)
     normalizeFableMythosRequest(body)
     normalizeOpus5Request(body)
     return { ok: true, bodyText: JSON.stringify(body) }
@@ -1233,10 +1262,13 @@ export async function rewriteRequestBody(
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     midConversationEffortEnabled?: boolean
     midConversationEffortPlan?: string
+    midConversationEffortResolvedPlan?: OpenCodeEffortMarkerPlan
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
+    modelRemapEnabled?: boolean
     laneStart?: boolean
+    billingLineage?: BillingLineageFields
     cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
 ): Promise<string> {
@@ -1306,6 +1338,7 @@ export async function rewriteRequestBody(
       parsed,
       options.midConversationEffortEnabled === true,
       options.midConversationEffortPlan,
+      options.midConversationEffortResolvedPlan,
     )
     applyThinkingBindingControls(
       parsed,
@@ -1329,6 +1362,7 @@ export async function rewriteRequestBody(
                   options.laneStart === true,
                 )
               : undefined,
+            options.billingLineage,
           )
         : null
     options.perf?.('billing_header', {
@@ -1387,6 +1421,7 @@ export async function rewriteRequestBody(
     })
 
     const prefixStart = rewriteNowMs()
+    if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),

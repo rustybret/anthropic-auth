@@ -12,6 +12,7 @@ packages/opencode/src/tui-compiled/
 .cortexkit/
 .ucs/
 coordination_notes/
+.pi/
 
 # Editor and OS metadata
 .DS_Store

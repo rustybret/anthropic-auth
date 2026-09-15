@@ -2,6 +2,22 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## Unreleased
+
+### Minor Changes
+
+- Add API-key/proxy-only custom headers and model aliases while preserving versioned proxy base paths and protecting route authentication, protocol headers, body framing, and internal correlation state.
+
+### Patch Changes
+
+- Publish account UUIDs and credential-lineage provenance in the sanitized quota-header feed while fencing stale lease cleanup.
+- Bind persisted main-quota ordering to the account-bound snapshot's embedded `checkedAt` value, preventing a concurrent unbound `mainQuotaCheckedAt` value from making stale state replace a newer in-memory or on-disk observation.
+- Harden global Claustrum takeover as a resumable fail-closed transition: repeated commands accept already tombstoned fallbacks, failed partial commits never restore whole-file snapshots over concurrent account edits, local fallback login is refused before OAuth while custody is active, and main-account Prime uses the resident vault credential for quota checks and sends with version-fenced 401 reporting.
+- Keep the request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.
+- Match Claude Code's request billing lineage on OAuth turns: pin one `cc_prompt_id` UUID to the causal user message across tool loops and retries, carry genuine direct or relay response request IDs as `cc_prev_req`, exclude background turns, and strip request lineage from reusable prewarm bodies before re-signing. Model-family checks also recognize OpenCode's `[1m]` context qualifier.
+- Isolate loopback RPC servers and notification drains by project/session, serialize concurrent same-directory server replacement, and make plugin disposal release every per-instance background service without stopping a successor or a shared Prime manager still leased by another project.
+- Fence no-reply Desktop fallback notices against newly created user messages before OpenCode publishes its busy status, and coalesce overtaken transition notices to the latest state so rapid turns neither duplicate provider requests nor strand a current notice behind stale text.
+
 ## 1.22.0
 
 ### Minor Changes

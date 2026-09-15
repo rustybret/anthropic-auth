@@ -3,52 +3,56 @@ import type { OpenDialogPayload, RpcNotification } from './protocol'
 const QUEUE_CAP = 100
 const TUI_CONNECTED_WINDOW_MS = 3_000
 
+// One queue serves every RPC server in the process, and a process can hold one
+// server per project directory. Session ids are globally unique, so both
+// producers and drains require one: an unscoped drain could otherwise expose
+// another project's pending command dialog.
 let queue: RpcNotification[] = []
 let nextId = 1
-let lastDrainAtAny = 0
 const lastDrainAtBySession = new Map<string, number>()
+
+function assertSessionId(sessionId: string): void {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new TypeError('sessionId is required')
+  }
+}
 
 export function pushNotification(
   payload: OpenDialogPayload,
-  sessionId?: string,
+  sessionId: string,
 ): void {
+  assertSessionId(sessionId)
   queue.push({ id: nextId++, type: 'open-dialog', payload, sessionId })
   if (queue.length > QUEUE_CAP) queue = queue.slice(queue.length - QUEUE_CAP)
 }
 
 export function drainNotifications(
-  lastReceivedId = 0,
-  sessionId?: string,
+  lastReceivedId: number,
+  sessionId: string,
 ): RpcNotification[] {
-  const now = Date.now()
-  lastDrainAtAny = now
-  if (sessionId !== undefined) lastDrainAtBySession.set(sessionId, now)
-  const matches = (n: RpcNotification) =>
-    sessionId === undefined ||
-    n.sessionId === undefined ||
-    n.sessionId === sessionId
+  assertSessionId(sessionId)
+  lastDrainAtBySession.set(sessionId, Date.now())
   if (lastReceivedId > 0) {
-    queue = queue.filter((n) => {
-      if (n.id > lastReceivedId) return true
-      if (sessionId === undefined) return false
-      return n.sessionId !== sessionId
-    })
+    queue = queue.filter(
+      (notification) =>
+        notification.id > lastReceivedId ||
+        notification.sessionId !== sessionId,
+    )
   }
-  return queue.filter((n) => n.id > lastReceivedId && matches(n))
+  return queue.filter(
+    (notification) =>
+      notification.id > lastReceivedId && notification.sessionId === sessionId,
+  )
 }
 
-export function isTuiConnected(sessionId?: string): boolean {
+export function isTuiConnected(sessionId: string): boolean {
   const now = Date.now()
-  if (sessionId !== undefined) {
-    const at = lastDrainAtBySession.get(sessionId) ?? 0
-    return at > 0 && now - at < TUI_CONNECTED_WINDOW_MS
-  }
-  return lastDrainAtAny > 0 && now - lastDrainAtAny < TUI_CONNECTED_WINDOW_MS
+  const at = lastDrainAtBySession.get(sessionId) ?? 0
+  return at > 0 && now - at < TUI_CONNECTED_WINDOW_MS
 }
 
 export function resetNotificationsForTest(): void {
   queue = []
   nextId = 1
-  lastDrainAtAny = 0
   lastDrainAtBySession.clear()
 }

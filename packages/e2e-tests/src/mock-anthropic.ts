@@ -73,6 +73,7 @@ export class MockAnthropicServer {
   private server: ReturnType<typeof Bun.serve> | null = null
   private queue: MockResponse[] = []
   private captured: CapturedAnthropicRequest[] = []
+  private tokenRequestCount = 0
 
   async start() {
     this.server = Bun.serve({
@@ -97,8 +98,22 @@ export class MockAnthropicServer {
     return [...this.captured]
   }
 
+  tokenRequests() {
+    return this.tokenRequestCount
+  }
+
   private async handle(request: Request) {
     const url = new URL(request.url)
+    if (url.pathname === '/oauth/token') {
+      this.tokenRequestCount += 1
+      return new Response(
+        JSON.stringify({ error: 'unexpected_token_refresh' }),
+        {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        },
+      )
+    }
     if (
       request.method !== 'POST' ||
       (url.pathname !== '/v1/messages' && url.pathname !== '/messages')

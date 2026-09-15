@@ -36,6 +36,16 @@ export interface SidebarAccountState {
   needsReauth: boolean
   // True when the vault copy needs re-importing while the sidecar remains usable.
   vaultReauth?: boolean
+  // A gate alone does not prove the sidecar can serve a request.
+  vaultServed?: boolean
+  custodyState?:
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'unknown-identity'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
   tierLabel?: string
 }
 
@@ -59,7 +69,7 @@ export interface PrimeSidebarAccountState {
   label: string
   nextDueAt?: number | null
   lastPrimedAt?: number | null
-  lastResult?: 'ok' | 'error'
+  lastResult?: 'ok' | 'error' | 'skipped'
   usage?: PrimeUsageCounters
   estimatedCostUsd?: number
 }
@@ -180,7 +190,11 @@ function normalizePrimeAccount(
   } else if (isFiniteNumber(value.lastPrimedAt)) {
     account.lastPrimedAt = value.lastPrimedAt
   }
-  if (value.lastResult === 'ok' || value.lastResult === 'error') {
+  if (
+    value.lastResult === 'ok' ||
+    value.lastResult === 'error' ||
+    value.lastResult === 'skipped'
+  ) {
     account.lastResult = value.lastResult
   }
   const usage = normalizePrimeUsage(value.usage)
@@ -338,6 +352,11 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
           ...(entry.vaultReauth === true && { vaultReauth: true }),
+          ...(entry.vaultServed === true && { vaultServed: true }),
+          ...(typeof entry.custodyState === 'string' && {
+            custodyState:
+              entry.custodyState as SidebarAccountState['custodyState'],
+          }),
           tierLabel:
             typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
               ? entry.tierLabel.trim()
@@ -843,6 +862,9 @@ export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
 } {
   if (account.lastResult === 'error') {
     return { text: 'err', hasError: true }
+  }
+  if (account.lastResult === 'skipped') {
+    return { text: 'skip', hasError: false }
   }
   if (account.nextDueAt && account.nextDueAt > Date.now()) {
     return { text: formatPrimeTime(account.nextDueAt), hasError: false }

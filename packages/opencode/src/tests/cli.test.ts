@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   addAccountPersistent,
+  custodyTombstoneKey,
   getAccountStatePath,
+  loadAccounts,
+  saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 
 import { addApiRoute, login, relaySetup } from '../cli'
@@ -114,6 +117,133 @@ describe('CLI api add', () => {
 })
 
 describe('CLI login', () => {
+  test('refuses before authorization while global Claustrum custody is committed', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [],
+        claustrum: { mode: 'claustrum' },
+      },
+      accountPath,
+    )
+    let authorizeCalls = 0
+
+    await expect(
+      withAccountEnv(accountPath, {}, () =>
+        login('blocked', {
+          authorize: async () => {
+            authorizeCalls += 1
+            throw new Error('authorization should not start')
+          },
+          prompt: async () => {
+            throw new Error('prompt should not run')
+          },
+        }),
+      ),
+    ).rejects.toThrow('Exit Claustrum mode first')
+    expect(authorizeCalls).toBe(0)
+    await expect(loadAccounts(accountPath)).resolves.toMatchObject({
+      accounts: [],
+    })
+  })
+
+  test('clears the matching custody binding after fallback OAuth login', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const manifestPath = join(tempDir, 'handles.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'cli-label',
+                handle: `ckh_${'D'.repeat(43)}`,
+                credential_id: 'oauth:anthropic:cli-label',
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [
+          {
+            id: 'cli-label',
+            label: 'cli-label',
+            type: 'oauth',
+            refresh: 'old-refresh',
+            authLineageId: 'old-lineage',
+          },
+        ],
+      },
+      accountPath,
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          'cli-label': {
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+            authLineageId: 'old-lineage',
+          },
+        },
+      }),
+    )
+
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '))
+    }
+    try {
+      await withAccountEnv(
+        accountPath,
+        { CLAUSTRUM_OPENCODE_HANDLES: manifestPath },
+        () =>
+          login('cli-label', {
+            prompt: async () =>
+              'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
+            exchange: async () => ({
+              type: 'success' as const,
+              access: 'cli-access',
+              refresh: 'cli-refresh',
+              expires: Date.now() + 3600 * 1000,
+            }),
+          }),
+      )
+    } finally {
+      console.warn = originalWarn
+    }
+
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    expect(manifest.providers[0].accounts).toEqual([])
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(
+      state.claustrumDivergence['oauth:anthropic:cli-label'],
+    ).toMatchObject({ minimumRecordVersion: 1 })
+    expect(state.accounts['cli-label']).toMatchObject({
+      access: 'cli-access',
+      refresh: 'cli-refresh',
+    })
+    expect(state.accounts['cli-label'].authLineageId).not.toBe('old-lineage')
+    expect(warnings).toContain(
+      'Fallback login had no served vault record for cli-label',
+    )
+  })
+
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
@@ -198,6 +328,28 @@ describe('CLI login', () => {
     expect(runtimeState.accounts['cli-label'].authLineageId).toMatch(
       /^[0-9a-f-]{36}$/,
     )
+  })
+
+  test('rejects an invalid label before saving an OAuth account', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+
+    await expect(
+      withAccountEnv(accountPath, {}, () =>
+        login('invalid label', {
+          prompt: async () => 'cli-code',
+          exchange: async () => ({
+            type: 'success' as const,
+            access: 'cli-access',
+            refresh: 'cli-refresh',
+            expires: Date.now() + 3600 * 1000,
+          }),
+        }),
+      ),
+    ).rejects.toThrow('invalid-label')
+
+    await expect(readFile(accountPath, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {

@@ -11,6 +11,11 @@ export const CLAUDE_MYTHOS_5_1_MODEL_ID = 'claude-mythos-5-1'
  */
 export const CLAUDE_HAIKU_4_5_MODEL_ID = 'claude-haiku-4-5'
 
+/** Remove OpenCode's context-window qualifier before model-family checks. */
+export function normalizeAnthropicModelId(model: string): string {
+  return model.endsWith('[1m]') ? model.slice(0, -4) : model
+}
+
 /**
  * Per-million-token USD pricing for Haiku 4.5. Used to project the cumulative
  * cost of prime requests from persisted usage counters — never persisted on
@@ -96,28 +101,27 @@ export const CLAUDE_FABLE_MYTHOS_5_1_MODEL_SPECS = {
 >
 
 export function isClaudeFableOrMythos5Model(model: unknown) {
-  return (
-    typeof model === 'string' &&
-    CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
-      (id) => model === id || model.startsWith(`${id}-`),
-    )
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
+    (id) => normalized === id || normalized.startsWith(`${id}-`),
   )
 }
 
 export function isClaudeFableOrMythos51Model(model: unknown) {
-  return (
-    typeof model === 'string' &&
-    CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS.some(
-      (id) => model === id || model.startsWith(`${id}-`),
-    )
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS.some(
+    (id) => normalized === id || normalized.startsWith(`${id}-`),
   )
 }
 
 export function isClaudeFable51Model(model: unknown) {
   if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
   return (
-    model === CLAUDE_FABLE_5_1_MODEL_ID ||
-    model.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
+    normalized === CLAUDE_FABLE_5_1_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
   )
 }
 
@@ -139,10 +143,11 @@ export const CLAUDE_SONNET_5_ADAPTIVE_THINKING =
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
 
 export function isClaudeSonnet5Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
   return (
-    typeof model === 'string' &&
-    (model === CLAUDE_SONNET_5_MODEL_ID ||
-      model.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`))
+    normalized === CLAUDE_SONNET_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`)
   )
 }
 
@@ -160,10 +165,11 @@ export const CLAUDE_OPUS_5_ADAPTIVE_THINKING =
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
 
 export function isClaudeOpus5Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
   return (
-    typeof model === 'string' &&
-    (model === CLAUDE_OPUS_5_MODEL_ID ||
-      model.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`))
+    normalized === CLAUDE_OPUS_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`)
   )
 }
 

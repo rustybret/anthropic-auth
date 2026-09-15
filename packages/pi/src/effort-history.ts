@@ -8,7 +8,47 @@ type SessionEntryLike = {
   id?: unknown
   type?: unknown
   thinkingLevel?: unknown
+  firstKeptEntryId?: unknown
   message?: { role?: unknown }
+}
+
+/**
+ * Reproduce the host's context-entry view — the entries the next request will
+ * actually carry — from the branch path, ordered root to leaf.
+ *
+ * `SessionManager.buildContextEntries()` computes this on Pi hosts but does not
+ * exist on Oh My Pi 18.x, where calling it threw on every turn (issue #200).
+ * `getBranch()` is present on both hosts and is the same path that method walks,
+ * so the compaction trim is applied here instead of asking the host for it.
+ *
+ * A branch without compaction is already the context. After a compaction the
+ * context is the compaction entry, then the tail retained from
+ * `firstKeptEntryId`, then everything appended after the compaction.
+ */
+export function deriveContextEntries<Entry extends SessionEntryLike>(
+  branch: readonly Entry[],
+): Entry[] {
+  let compactionIndex = -1
+  for (let index = 0; index < branch.length; index++) {
+    if (branch[index]?.type === 'compaction') compactionIndex = index
+  }
+
+  const compaction = branch[compactionIndex]
+  if (!compaction) return branch.slice()
+
+  const contextEntries: Entry[] = [compaction]
+  let retaining = false
+  for (let index = 0; index < compactionIndex; index++) {
+    const entry = branch[index]
+    if (!entry) continue
+    if (entry.id === compaction.firstKeptEntryId) retaining = true
+    if (retaining) contextEntries.push(entry)
+  }
+  for (let index = compactionIndex + 1; index < branch.length; index++) {
+    const entry = branch[index]
+    if (entry) contextEntries.push(entry)
+  }
+  return contextEntries
 }
 
 function entryRole(entry: SessionEntryLike): unknown {

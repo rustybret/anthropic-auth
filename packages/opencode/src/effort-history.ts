@@ -26,6 +26,7 @@ const EFFORTS_BY_CODE = Object.fromEntries(
 ) as Record<string, AdaptiveEffort>
 
 export const EFFORT_MARKER_PREFIX = '<cortexkit-internal-effort-v2 '
+export const EFFORT_ANCHOR_PREFIX = '<cortexkit-internal-effort-anchor-v1 '
 export const EFFORT_PLAN_REQUEST_HEADER = 'x-cortexkit-effort-plan'
 
 export type OpenCodeEffortMarkerPlan = {
@@ -33,6 +34,8 @@ export type OpenCodeEffortMarkerPlan = {
   baseline: AdaptiveEffort
   markerCount: number
   digest: string
+  transitionTokens: readonly string[]
+  anchorToken?: string
   sessionId: string
   messageId: string
 }
@@ -81,9 +84,18 @@ type ParsedTransitionMarker = {
   token: string
 }
 
+type ParsedEffortAnchor = {
+  scope: string
+  boundary: string
+  effort: AdaptiveEffort
+  digest: string
+  token: string
+}
+
 type ParsedUserMessage = {
   value: unknown
   transitions: ParsedTransitionMarker[]
+  anchors: ParsedEffortAnchor[]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -154,6 +166,34 @@ function parseTransitionMarker(text: string): ParsedTransitionMarker | null {
   return { scope, boundary, effort, token: text }
 }
 
+function effortAnchor(
+  scope: string,
+  boundary: string,
+  effort: AdaptiveEffort,
+  planHash: string,
+): string {
+  const effortCode = EFFORT_CODES[effort]
+  const payload = `anchor:${scope}:${boundary}:${effortCode}:${planHash}`
+  return `${EFFORT_ANCHOR_PREFIX}scope="${scope}" boundary="${boundary}" effort="${effortCode}" digest="${planHash}" check="${markerCheck(payload)}"/>`
+}
+
+function parseEffortAnchor(text: string): ParsedEffortAnchor | null {
+  const match = text.match(
+    new RegExp(
+      `^${EFFORT_ANCHOR_PREFIX}scope="([0-9a-f]{${SCOPE_HEX_LENGTH}})" boundary="(${MESSAGE_ID_PATTERN})" effort="([lmhxz])" digest="([0-9a-f]{64})" check="([0-9a-f]{${MARKER_CHECK_HEX_LENGTH}})"/>$`,
+    ),
+  )
+  if (!match) return null
+  const [, scope, boundary, effortCode, planHash, check] = match
+  const effort = EFFORTS_BY_CODE[effortCode ?? '']
+  if (!scope || !boundary || !effortCode || !planHash || !check || !effort) {
+    return null
+  }
+  const payload = `anchor:${scope}:${boundary}:${effortCode}:${planHash}`
+  if (markerCheck(payload) !== check) return null
+  return { scope, boundary, effort, digest: planHash, token: text }
+}
+
 function isInternalMarkerWrapperOnly(text: string): boolean {
   return text.trim() === '' || INTERNAL_MARKER_WRAPPER_PATTERN.test(text)
 }
@@ -172,9 +212,17 @@ function transitionMarkerPattern(): RegExp {
   )
 }
 
+function effortAnchorPattern(): RegExp {
+  return new RegExp(
+    `${EFFORT_ANCHOR_PREFIX}scope="[0-9a-f]{${SCOPE_HEX_LENGTH}}" boundary="${MESSAGE_ID_PATTERN}" effort="[lmhxz]" digest="[0-9a-f]{64}" check="[0-9a-f]{${MARKER_CHECK_HEX_LENGTH}}"/>`,
+    'g',
+  )
+}
+
 function stripMarkers(
   text: string,
   onTransition?: (transition: ParsedTransitionMarker) => void,
+  onAnchor?: (anchor: ParsedEffortAnchor) => void,
 ): { text: string; removed: number } {
   let removed = 0
   let stripped = text
@@ -190,6 +238,13 @@ function stripMarkers(
     const transition = parseTransitionMarker(token)
     if (!transition) return token
     onTransition?.(transition)
+    removed++
+    return ''
+  })
+  stripped = stripped.replace(effortAnchorPattern(), (token) => {
+    const anchor = parseEffortAnchor(token)
+    if (!anchor) return token
+    onAnchor?.(anchor)
     removed++
     return ''
   })
@@ -221,8 +276,10 @@ function planDigest(
   baseline: AdaptiveEffort,
   markerCount: number,
   transitionTokens: readonly string[],
+  currentBoundary?: string,
 ): string {
-  const planToken = `plan:${scope}:${EFFORT_CODES[baseline]}:${markerCount.toString(36)}`
+  const boundaryToken = currentBoundary ? `:${currentBoundary}` : ''
+  const planToken = `plan:${scope}:${EFFORT_CODES[baseline]}:${markerCount.toString(36)}${boundaryToken}`
   return digest([planToken, ...transitionTokens].join('\n'))
 }
 
@@ -338,16 +395,25 @@ export function markOpenCodeEffortTransitions(
   }
 
   if (!baseline) return null
+  const planHash = planDigest(
+    scope,
+    baseline,
+    transitionTokens.length,
+    transitionTokens,
+    transitionTokens.length > 0 ? messageId : undefined,
+  )
+  const anchorToken =
+    transitionTokens.length > 0
+      ? effortAnchor(scope, messageId, activeEffort ?? baseline, planHash)
+      : undefined
+  if (anchorToken) currentUser.parts.push({ type: 'text', text: anchorToken })
   return {
     scope,
     baseline,
     markerCount: transitionTokens.length,
-    digest: planDigest(
-      scope,
-      baseline,
-      transitionTokens.length,
-      transitionTokens,
-    ),
+    digest: planHash,
+    transitionTokens,
+    anchorToken,
     sessionId,
     messageId,
   }
@@ -361,13 +427,18 @@ function consumeInternalMarkers(body: Record<string, unknown>): {
 
   for (const value of values) {
     const transitions: ParsedTransitionMarker[] = []
+    const anchors: ParsedEffortAnchor[] = []
     if (!isRecord(value) || value.role !== 'user') {
-      messages.push({ value, transitions })
+      messages.push({ value, transitions, anchors })
       continue
     }
 
     const stripText = (text: string) =>
-      stripMarkers(text, (transition) => transitions.push(transition))
+      stripMarkers(
+        text,
+        (transition) => transitions.push(transition),
+        (anchor) => anchors.push(anchor),
+      )
 
     if (typeof value.content === 'string') {
       const stripped = stripText(value.content)
@@ -394,11 +465,66 @@ function consumeInternalMarkers(body: Record<string, unknown>): {
         return [{ ...block, text: stripped.text }]
       })
     }
-    messages.push({ value, transitions })
+    messages.push({ value, transitions, anchors })
   }
 
   body.messages = messages.map((message) => message.value)
   return { messages }
+}
+
+function resolveExpectedPlan(
+  requestPlan: RequestEffortPlan,
+  resolvedPlan: OpenCodeEffortMarkerPlan | undefined,
+): {
+  transitions: ParsedTransitionMarker[]
+  anchor: ParsedEffortAnchor | null
+} | null {
+  if (!resolvedPlan) return null
+  if (
+    resolvedPlan.scope !== requestPlan.scope ||
+    resolvedPlan.baseline !== requestPlan.baseline ||
+    resolvedPlan.markerCount !== requestPlan.markerCount ||
+    resolvedPlan.digest !== requestPlan.digest ||
+    resolvedPlan.transitionTokens.length !== requestPlan.markerCount
+  ) {
+    throw new EffortMarkerCorrelationError(
+      'Fable 5.1 effort marker request plan mismatch',
+    )
+  }
+  const transitions = resolvedPlan.transitionTokens.map((token) =>
+    parseTransitionMarker(token),
+  )
+  const anchor = resolvedPlan.anchorToken
+    ? parseEffortAnchor(resolvedPlan.anchorToken)
+    : null
+  const expectedEffort = transitions.at(-1)?.effort ?? requestPlan.baseline
+  if (
+    transitions.some((transition) => transition === null) ||
+    transitions.some((transition) => transition?.scope !== requestPlan.scope) ||
+    (requestPlan.markerCount > 0 &&
+      (!anchor ||
+        anchor.scope !== requestPlan.scope ||
+        anchor.boundary !== resolvedPlan.messageId ||
+        anchor.effort !== expectedEffort ||
+        anchor.digest !== requestPlan.digest)) ||
+    (requestPlan.markerCount === 0 && anchor !== null) ||
+    requestPlan.digest !==
+      planDigest(
+        requestPlan.scope,
+        requestPlan.baseline,
+        requestPlan.markerCount,
+        resolvedPlan.transitionTokens,
+        resolvedPlan.markerCount > 0 ? resolvedPlan.messageId : undefined,
+      )
+  ) {
+    throw new EffortMarkerCorrelationError(
+      'Fable 5.1 effort marker request plan mismatch',
+    )
+  }
+  return {
+    transitions: transitions as ParsedTransitionMarker[],
+    anchor,
+  }
 }
 
 /** Consume request-correlated markers and insert Anthropic effort system messages. */
@@ -406,6 +532,7 @@ export function applyOpenCodeEffortMarkers(
   body: Record<string, unknown>,
   enabled: boolean,
   requestPlanHeader?: string,
+  resolvedPlan?: OpenCodeEffortMarkerPlan,
 ): { found: number; inserted: number } {
   if (!Array.isArray(body.messages)) return { found: 0, inserted: 0 }
   const requestPlan = parseRequestEffortPlan(requestPlanHeader)
@@ -414,6 +541,11 @@ export function applyOpenCodeEffortMarkers(
       'Missing or invalid internal Fable 5.1 effort request plan',
     )
   }
+
+  const expectedPlan = requestPlan
+    ? resolveExpectedPlan(requestPlan, resolvedPlan)
+    : null
+  const expectedTransitions = expectedPlan?.transitions ?? null
 
   const hasCandidate = body.messages.some((value) => {
     if (!isRecord(value) || value.role !== 'user') return false
@@ -443,8 +575,9 @@ export function applyOpenCodeEffortMarkers(
       )
     }
     if (
+      !expectedTransitions &&
       requestPlan.digest !==
-      planDigest(requestPlan.scope, requestPlan.baseline, 0, [])
+        planDigest(requestPlan.scope, requestPlan.baseline, 0, [])
     ) {
       throw new EffortMarkerCorrelationError(
         'Fable 5.1 effort marker request plan mismatch',
@@ -454,7 +587,8 @@ export function applyOpenCodeEffortMarkers(
       const outputConfig = isRecord(body.output_config)
         ? { ...body.output_config }
         : {}
-      outputConfig.effort = requestPlan.baseline
+      outputConfig.effort =
+        expectedTransitions?.at(-1)?.effort ?? requestPlan.baseline
       body.output_config = outputConfig
     }
     return { found: 0, inserted: 0 }
@@ -464,6 +598,7 @@ export function applyOpenCodeEffortMarkers(
   const transitions = consumed.messages.flatMap(
     (message) => message.transitions,
   )
+  const anchors = consumed.messages.flatMap((message) => message.anchors)
   const found = transitions.length
   if (!requestPlan) {
     // Marker-shaped user text without a trusted internal plan remains untouched.
@@ -485,22 +620,99 @@ export function applyOpenCodeEffortMarkers(
         'Fable 5.1 effort marker scope mismatch',
       )
     }
+    if (message.anchors.length > 1) {
+      throw new EffortMarkerCorrelationError(
+        'Multiple internal Fable 5.1 effort anchors on one user boundary',
+      )
+    }
   }
-  if (found !== requestPlan.markerCount) {
-    throw new EffortMarkerCorrelationError(
-      `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found ${found}`,
-    )
-  }
-  const actualDigest = planDigest(
-    requestPlan.scope,
-    requestPlan.baseline,
-    requestPlan.markerCount,
-    transitions.map((transition) => transition.token),
+  const anchorMessageIndex = consumed.messages.findIndex(
+    (message) => message.anchors.length === 1,
   )
-  if (requestPlan.digest !== actualDigest) {
+  const lastUserMessageIndex = consumed.messages.findLastIndex(
+    (message) => isRecord(message.value) && message.value.role === 'user',
+  )
+  const anchor = anchors[0]
+  if (
+    requestPlan.markerCount > 0 &&
+    (anchors.length !== 1 ||
+      anchorMessageIndex !== lastUserMessageIndex ||
+      !anchor ||
+      anchor.scope !== requestPlan.scope)
+  ) {
     throw new EffortMarkerCorrelationError(
-      'Fable 5.1 effort marker request plan mismatch',
+      'Missing or invalid internal Fable 5.1 effort anchor',
     )
+  }
+  if (requestPlan.markerCount === 0 && anchors.length !== 0) {
+    throw new EffortMarkerCorrelationError(
+      'Unexpected internal Fable 5.1 effort anchor',
+    )
+  }
+  if (expectedPlan?.anchor && anchor?.token !== expectedPlan.anchor.token) {
+    throw new EffortMarkerCorrelationError(
+      'Missing or invalid internal Fable 5.1 effort anchor',
+    )
+  }
+  let effectiveBaseline = requestPlan.baseline
+  if (expectedTransitions) {
+    const trimmedPrefix = expectedTransitions.length - found
+    if (trimmedPrefix < 0) {
+      throw new EffortMarkerCorrelationError(
+        `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found ${found}`,
+      )
+    }
+    const expectedSuffix = expectedTransitions.slice(trimmedPrefix)
+    if (
+      transitions.some(
+        (transition, index) =>
+          transition.token !== expectedSuffix[index]?.token,
+      )
+    ) {
+      throw new EffortMarkerCorrelationError(
+        'Fable 5.1 effort marker non-prefix loss',
+      )
+    }
+    const removedTransitions = expectedTransitions.slice(0, trimmedPrefix)
+    if (
+      anchor &&
+      removedTransitions.some(
+        (transition) => transition.boundary === anchor.boundary,
+      )
+    ) {
+      throw new EffortMarkerCorrelationError(
+        'Fable 5.1 effort marker non-prefix loss',
+      )
+    }
+    effectiveBaseline =
+      removedTransitions.at(-1)?.effort ?? requestPlan.baseline
+  } else {
+    if (found !== requestPlan.markerCount) {
+      throw new EffortMarkerCorrelationError(
+        `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found ${found}`,
+      )
+    }
+    const actualDigest = planDigest(
+      requestPlan.scope,
+      requestPlan.baseline,
+      requestPlan.markerCount,
+      transitions.map((transition) => transition.token),
+      anchor?.boundary,
+    )
+    if (requestPlan.digest !== actualDigest) {
+      throw new EffortMarkerCorrelationError(
+        'Fable 5.1 effort marker request plan mismatch',
+      )
+    }
+    const expectedEffort = transitions.at(-1)?.effort ?? requestPlan.baseline
+    if (
+      anchor &&
+      (anchor.effort !== expectedEffort || anchor.digest !== requestPlan.digest)
+    ) {
+      throw new EffortMarkerCorrelationError(
+        'Missing or invalid internal Fable 5.1 effort anchor',
+      )
+    }
   }
 
   const applyConfig = enabled && isClaudeFable51Model(body.model)
@@ -523,19 +735,22 @@ export function applyOpenCodeEffortMarkers(
     const outputConfig = isRecord(body.output_config)
       ? { ...body.output_config }
       : {}
-    outputConfig.effort = requestPlan.baseline
+    outputConfig.effort = effectiveBaseline
     body.output_config = outputConfig
   }
   return { found, inserted }
 }
 
 export class OpenCodeEffortPlanTracker {
-  private readonly plans = new Map<string, string>()
+  private readonly plans = new Map<string, OpenCodeEffortMarkerPlan>()
 
   record(plan: OpenCodeEffortMarkerPlan): void {
     const key = this.key(plan.sessionId, plan.messageId)
     this.plans.delete(key)
-    this.plans.set(key, encodeOpenCodeEffortPlan(plan))
+    this.plans.set(key, {
+      ...plan,
+      transitionTokens: [...plan.transitionTokens],
+    })
     while (this.plans.size > MAX_TRACKED_EFFORT_PLANS) {
       const oldest = this.plans.keys().next().value
       if (typeof oldest !== 'string') break
@@ -555,9 +770,24 @@ export class OpenCodeEffortPlanTracker {
     const key = this.key(input.sessionId, input.messageId)
     const plan = this.plans.get(key)
     if (!plan) return false
-    input.headers[EFFORT_PLAN_REQUEST_HEADER] = plan
+    input.headers[EFFORT_PLAN_REQUEST_HEADER] = encodeOpenCodeEffortPlan(plan)
+    // OpenCode retries the same StreamInput after transient provider failures.
+    // Its message transform runs once before the retry loop, while chat.headers
+    // runs for every attempt, so keep the plan available for the same message.
+    // Refresh its insertion order so an actively retried plan remains recent.
     this.plans.delete(key)
+    this.plans.set(key, plan)
     return true
+  }
+
+  resolveHeader(
+    value: string | undefined,
+  ): OpenCodeEffortMarkerPlan | undefined {
+    if (!value) return undefined
+    for (const plan of this.plans.values()) {
+      if (encodeOpenCodeEffortPlan(plan) === value) return plan
+    }
+    return undefined
   }
 
   private key(sessionId: string, messageId: string): string {

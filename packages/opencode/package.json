@@ -45,9 +45,10 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
     "build:tui": "bun scripts/build-tui.ts",
     "smoke:tui": "bun scripts/smoke-tui-pack-install.ts",
+    "check:bundle": "bun scripts/check-bundle-globals.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",

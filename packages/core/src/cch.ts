@@ -2,6 +2,24 @@ import { createHash } from 'node:crypto'
 import xxhashInit from 'xxhash-wasm'
 import { CCH_POSITIONS, CCH_SALT, CLAUDE_CODE_VERSION } from './constants.ts'
 
+const ANTHROPIC_REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]{8,128}$/
+const PROMPT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const BILLING_LINEAGE_FIELD_PATTERN = / cc_(?:prev_req|prompt_id)=[^;\r\n]*;/g
+
+export interface BillingLineageFields {
+  previousRequestId?: string
+  promptId?: string
+}
+
+export function isValidAnthropicRequestId(value: string): boolean {
+  return ANTHROPIC_REQUEST_ID_PATTERN.test(value)
+}
+
+export function isValidBillingPromptId(value: string): boolean {
+  return PROMPT_ID_PATTERN.test(value)
+}
+
 type Message = {
   role?: string
   content?: string | Array<{ type?: string; text?: string }>
@@ -163,16 +181,54 @@ export function buildBillingHeaderValue(
   version: string = CLAUDE_CODE_VERSION,
   entrypoint: string,
   pinnedFirstUserText?: string,
+  lineage?: BillingLineageFields,
 ): string {
   const suffix = computeCcVersionSuffix(
     pinnedFirstUserText ?? extractFirstUserMessageText(messages),
     version,
   )
 
-  return (
+  let value =
     'x-anthropic-billing-header: ' +
     `cc_version=${version}.${suffix}; ` +
     `cc_entrypoint=${entrypoint}; ` +
     'cch=00000;'
-  )
+  if (
+    lineage?.previousRequestId &&
+    isValidAnthropicRequestId(lineage.previousRequestId)
+  ) {
+    value += ` cc_prev_req=${lineage.previousRequestId};`
+  }
+  if (lineage?.promptId && isValidBillingPromptId(lineage.promptId)) {
+    value += ` cc_prompt_id=${lineage.promptId};`
+  }
+  return value
+}
+
+/** Remove request-scoped Claude Code lineage from a billing header string. */
+export function stripBillingLineageFields(value: string): string {
+  return value.replace(BILLING_LINEAGE_FIELD_PATTERN, '')
+}
+
+/** Remove request-scoped Claude Code lineage before reusing a request body. */
+export function stripBillingLineageFromBody(body: unknown): number {
+  if (!body || typeof body !== 'object') return 0
+  const system = (body as { system?: unknown }).system
+  if (!Array.isArray(system)) return 0
+  let stripped = 0
+  for (const block of system) {
+    if (!block || typeof block !== 'object') continue
+    const text = (block as { text?: unknown }).text
+    if (
+      typeof text !== 'string' ||
+      !text.startsWith('x-anthropic-billing-header:')
+    ) {
+      continue
+    }
+    const clean = stripBillingLineageFields(text)
+    if (clean === text) continue
+    ;(block as { text: string }).text = clean
+    stripped += 1
+  }
+  return stripped
 }
