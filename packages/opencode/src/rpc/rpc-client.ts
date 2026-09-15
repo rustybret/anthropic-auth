@@ -4,7 +4,7 @@ import type { ApplyRequest, ApplyResult, RpcNotification } from './protocol'
 export interface RpcClient {
   pending: (
     lastReceivedId: number,
-    sessionId?: string,
+    sessionId: string,
   ) => Promise<RpcNotification[]>
   apply: (request: ApplyRequest) => Promise<ApplyResult>
 }

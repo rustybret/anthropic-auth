@@ -2,6 +2,7 @@ import {
   CLAUDE_FABLE_5_1_MODEL_ID,
   CLAUDE_FABLE_5_MODEL_ID,
   isClaudeOpus5Model,
+  normalizeAnthropicModelId,
 } from '@cortexkit/anthropic-auth-core'
 
 export const FABLE_FALLBACK_MODEL_ID = 'claude-opus-4-8'
@@ -56,16 +57,17 @@ export function recoverableRefusalFamily(
   model: unknown,
 ): RecoverableRefusalFamily | null {
   if (typeof model !== 'string') return null
-  if (isClaudeOpus5Model(model)) return 'opus-5'
+  const normalized = normalizeAnthropicModelId(model)
+  if (isClaudeOpus5Model(normalized)) return 'opus-5'
   if (
-    model === CLAUDE_FABLE_5_1_MODEL_ID ||
-    model.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
+    normalized === CLAUDE_FABLE_5_1_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
   ) {
     return 'fable-5-1'
   }
   if (
-    model === CLAUDE_FABLE_5_MODEL_ID ||
-    model.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`)
+    normalized === CLAUDE_FABLE_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`)
   ) {
     return 'fable-5'
   }

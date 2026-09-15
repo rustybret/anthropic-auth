@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   applyOpenCodeEffortMarkers,
+  EFFORT_ANCHOR_PREFIX,
   EFFORT_MARKER_PREFIX,
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
@@ -213,6 +214,157 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(secondPlan?.markerCount).toBe(2)
   })
 
+  test('folds a downstream-trimmed transition prefix into the retained baseline', () => {
+    const messages = [
+      user('msg_low', 'ses_prefix_trim', 'claude-fable-5-1', 'low'),
+      user('msg_medium', 'ses_prefix_trim', 'claude-fable-5-1', 'medium'),
+      user('msg_high', 'ses_prefix_trim', 'claude-fable-5-1', 'high'),
+      user('msg_current', 'ses_prefix_trim', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    expect(plan?.markerCount).toBe(2)
+
+    const retained = messages.slice(2)
+    const body: {
+      model: string
+      output_config: { effort: string }
+      messages: unknown[]
+    } = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: retained.map((message) => ({
+        role: 'user',
+        content: message.parts.map((part) => ({
+          type: 'text',
+          text: part.text,
+        })),
+      })),
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toEqual({ found: 1, inserted: 1 })
+    expect(body.output_config).toEqual({ effort: 'medium' })
+    expect(body.messages).toEqual([
+      {
+        role: 'system',
+        content: [],
+        output_config: { effort: 'high' },
+      },
+      { role: 'user', content: [{ type: 'text', text: 'msg_high' }] },
+      { role: 'user', content: [{ type: 'text', text: 'msg_current' }] },
+    ])
+  })
+
+  test('folds all downstream-trimmed transitions into the current baseline', () => {
+    const messages = [
+      user('msg_low', 'ses_full_trim', 'claude-fable-5-1', 'low'),
+      user('msg_medium', 'ses_full_trim', 'claude-fable-5-1', 'medium'),
+      user('msg_high', 'ses_full_trim', 'claude-fable-5-1', 'high'),
+      user('msg_current', 'ses_full_trim', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+
+    const missingAnchorBody = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'msg_current' }],
+        },
+      ],
+    }
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        missingAnchorBody,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
+
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        {
+          role: 'user',
+          content: messages[3]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text.includes(EFFORT_ANCHOR_PREFIX)
+              ? `§991§ ${part.text}`
+              : part.text,
+          })),
+        },
+      ],
+    }
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toEqual({ found: 0, inserted: 0 })
+    expect(body.output_config).toEqual({ effort: 'high' })
+    expect(body.messages).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'msg_current' }],
+      },
+    ])
+  })
+
+  test('rejects non-prefix transition loss even with the resolved plan', () => {
+    const messages = [
+      user('msg_low', 'ses_non_prefix', 'claude-fable-5-1', 'low'),
+      user('msg_medium', 'ses_non_prefix', 'claude-fable-5-1', 'medium'),
+      user('msg_high', 'ses_non_prefix', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        {
+          role: 'user',
+          content: messages[1]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text,
+          })),
+        },
+        {
+          role: 'user',
+          content: messages[2]?.parts
+            .filter(
+              (part) =>
+                typeof part.text === 'string' &&
+                part.text.includes('cortexkit-internal-effort-anchor'),
+            )
+            .map((part) => ({ type: 'text', text: part.text })),
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker non-prefix loss')
+  })
+
   test('rejects a lowered marker sequence that differs from the post-transform request plan', () => {
     const messages = [
       user('msg_low', 'ses_digest', 'claude-fable-5-1', 'low'),
@@ -316,7 +468,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(markerTexts([current])[0]).toContain('effort="x"')
   })
 
-  test('correlates a transform plan to the matching chat headers request', () => {
+  test('reuses a transform plan for retries of the matching chat request', () => {
     const plan = markOpenCodeEffortTransitions([
       user('msg_low', 'ses_headers', 'claude-fable-5-1', 'low'),
       user('msg_high', 'ses_headers', 'claude-fable-5-1', 'high'),
@@ -345,6 +497,22 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(headers['x-cortexkit-effort-plan']).toBe(
       encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
     )
+    const retryHeaders: Record<string, string> = {}
+    expect(
+      tracker.markHeaders({
+        sessionId: 'ses_headers',
+        messageId: 'msg_high',
+        headers: retryHeaders,
+      }),
+    ).toBe(true)
+    expect(retryHeaders['x-cortexkit-effort-plan']).toBe(
+      headers['x-cortexkit-effort-plan'],
+    )
+    expect(
+      tracker.resolveHeader(retryHeaders['x-cortexkit-effort-plan']),
+    ).toEqual(plan as NonNullable<typeof plan>)
+
+    tracker.clear('ses_headers', 'msg_high')
     expect(
       tracker.markHeaders({
         sessionId: 'ses_headers',
@@ -352,6 +520,35 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         headers: {},
       }),
     ).toBe(false)
+  })
+
+  test('distinguishes concurrent current messages with the same transition timeline', () => {
+    const first = markOpenCodeEffortTransitions([
+      user('msg_low', 'ses_concurrent', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_concurrent', 'claude-fable-5-1', 'high'),
+      user('msg_current_a', 'ses_concurrent', 'claude-fable-5-1', 'high'),
+    ])
+    const second = markOpenCodeEffortTransitions([
+      user('msg_low', 'ses_concurrent', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_concurrent', 'claude-fable-5-1', 'high'),
+      user('msg_current_b', 'ses_concurrent', 'claude-fable-5-1', 'high'),
+    ])
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+
+    const tracker = new OpenCodeEffortPlanTracker()
+    tracker.record(first as NonNullable<typeof first>)
+    tracker.record(second as NonNullable<typeof second>)
+    const firstHeader = encodeOpenCodeEffortPlan(
+      first as NonNullable<typeof first>,
+    )
+    const secondHeader = encodeOpenCodeEffortPlan(
+      second as NonNullable<typeof second>,
+    )
+
+    expect(firstHeader).not.toBe(secondHeader)
+    expect(tracker.resolveHeader(firstHeader)?.messageId).toBe('msg_current_a')
+    expect(tracker.resolveHeader(secondHeader)?.messageId).toBe('msg_current_b')
   })
 
   test('defaults absent variants to high and does not mark non-Fable requests', () => {

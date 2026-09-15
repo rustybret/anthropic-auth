@@ -1,7 +1,11 @@
 import { join } from 'node:path'
 import { MockAnthropicServer, type MockResponse } from './mock-anthropic.ts'
 import { MockRelayServer } from './mock-relay.ts'
-import { type SpawnedOpencode, spawnOpencode } from './opencode-runner.ts'
+import {
+  type IsolatedEnv,
+  type SpawnedOpencode,
+  spawnOpencode,
+} from './opencode-runner.ts'
 
 type SdkClient = {
   session: {
@@ -17,6 +21,18 @@ type SdkClient = {
         variant?: string
       }
     }) => Promise<{ data?: unknown }>
+    promptAsync: (options: {
+      path: { id: string }
+      body: {
+        model: { providerID: string; modelID: string }
+        parts: Array<{ type: 'text'; text: string }>
+        variant?: string
+      }
+    }) => Promise<{ data?: unknown }>
+    abort: (options: { path: { id: string } }) => Promise<{ data?: unknown }>
+    status: () => Promise<{
+      data?: Record<string, { type?: string }>
+    }>
     messages: (options: {
       path: { id: string }
     }) => Promise<{ data?: unknown[] }>
@@ -30,6 +46,8 @@ export type E2EHarnessOptions = {
   hybridCache?: boolean
   fallbackMode?: 'server' | 'legacy'
   childTmpDir?: string
+  childEnv?: Record<string, string | undefined>
+  beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
 }
 
 export class E2EHarness {
@@ -77,6 +95,8 @@ export class E2EHarness {
       fallbackMode: options.fallbackMode,
       childTmpDir: options.childTmpDir,
       quotaFeed: options.quotaFeed,
+      childEnv: options.childEnv,
+      beforeSpawn: options.beforeSpawn,
     })
     const sdk = await import('@opencode-ai/sdk')
     const client = sdk.createOpencodeClient({
@@ -130,6 +150,43 @@ export class E2EHarness {
       'session.prompt',
     )
     return result
+  }
+
+  async startPrompt(
+    sessionId: string,
+    text: string,
+    modelID = 'claude-sonnet-4-5',
+    variant?: string,
+  ) {
+    return this.client.session.promptAsync({
+      path: { id: sessionId },
+      body: {
+        model: { providerID: 'anthropic', modelID },
+        parts: [{ type: 'text', text }],
+        variant,
+      },
+    })
+  }
+
+  async abortSession(sessionId: string) {
+    return this.client.session.abort({ path: { id: sessionId } })
+  }
+
+  async waitForSessionStatusType(
+    sessionId: string,
+    type: string,
+    timeoutMs = 15_000,
+  ) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const response = await this.client.session.status()
+      const status = response.data?.[sessionId]
+      if (status?.type === type) return status
+      await Bun.sleep(50)
+    }
+    throw new Error(
+      `session did not reach ${type}: ${sessionId}\n--- stdout ---\n${this.opencode.stdout()}\n--- stderr ---\n${this.opencode.stderr()}`,
+    )
   }
 
   async waitForSessionText(

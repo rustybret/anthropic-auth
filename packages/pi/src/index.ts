@@ -17,7 +17,10 @@ import type {
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
-import { collectPiEffortHistory } from './effort-history.ts'
+import {
+  collectPiEffortHistory,
+  deriveContextEntries,
+} from './effort-history.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 
 async function loginAnthropic(
@@ -71,10 +74,23 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (!sessionId) return
-    const transitions = collectPiEffortHistory(
-      ctx.sessionManager.buildContextEntries(),
-      ctx.sessionManager.getBranch(),
-    )
+    // This hook only adds mid-conversation effort markers to Fable/Mythos 5.1
+    // requests. A host whose session entries do not match what this reads must
+    // cost the session its transitions and nothing else: the handler runs
+    // before every turn, and an exception here surfaced as a per-turn extension
+    // error while collecting no effort history at all (issue #200).
+    //
+    // The catch stays quiet: `ExtensionAPI` carries no log surface on either
+    // host, and writing to stdout from a per-turn hook corrupts the host's
+    // rendering — which is the same per-turn noise this fix removes. The
+    // degraded state is observable in the request: no effort markers.
+    let transitions: MidConversationEffortTransition[]
+    try {
+      const branch = ctx.sessionManager.getBranch()
+      transitions = collectPiEffortHistory(deriveContextEntries(branch), branch)
+    } catch {
+      transitions = []
+    }
     effortHistoryBySession.delete(sessionId)
     effortHistoryBySession.set(sessionId, transitions)
     while (effortHistoryBySession.size > 128) {

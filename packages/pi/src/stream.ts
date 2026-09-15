@@ -1,6 +1,7 @@
 import {
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
+  applyCustomHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
@@ -283,7 +284,14 @@ function updateUsage(
 
 export function buildExplicitBaseMessagesUrl(baseURL: string) {
   const url = new URL(baseURL)
-  url.pathname = `${url.pathname.replace(/\/$/, '')}/v1/messages`
+  const basePath = url.pathname.replace(/\/$/, '')
+  if (/\/v\d[^/]*\/messages$/.test(basePath)) {
+    url.pathname = basePath
+  } else if (/\/v\d[^/]*$/.test(basePath)) {
+    url.pathname = `${basePath}/messages`
+  } else {
+    url.pathname = `${basePath}/v1/messages`
+  }
   url.searchParams.set('beta', 'true')
   return url
 }
@@ -308,6 +316,7 @@ export function configureApiRouteHeaders(
       mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
     )
   }
+  applyCustomHeaders(headers)
   return headers
 }
 

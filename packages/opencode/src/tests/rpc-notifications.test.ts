@@ -16,6 +16,17 @@ const payload = (command: OpenDialogPayload['command']): OpenDialogPayload => ({
 describe('notifications', () => {
   beforeEach(() => resetNotificationsForTest())
 
+  test('a session-scoped drain prunes only its own acknowledged notices', () => {
+    pushNotification(payload('claude-quota'), 's1')
+    pushNotification(payload('claude-dump'), 's2')
+
+    const s1 = drainNotifications(0, 's1')
+    expect(drainNotifications(s1[0]?.id ?? 0, 's1')).toEqual([])
+    expect(drainNotifications(0, 's2').map((n) => n.payload.command)).toEqual([
+      'claude-dump',
+    ])
+  })
+
   test('push then drain returns the item once, ordered', () => {
     pushNotification(payload('claude-quota'), 's1')
     pushNotification(payload('claude-fast'), 's1')
@@ -29,12 +40,14 @@ describe('notifications', () => {
     expect(second).toEqual([])
   })
 
-  test('session scoping: a session only drains its own + global', () => {
+  test('every queued notice carries its session id and stays scoped to it', () => {
     pushNotification(payload('claude-quota'), 's1')
     pushNotification(payload('claude-dump'), 's2')
-    expect(drainNotifications(0, 's1').map((n) => n.payload.command)).toEqual([
-      'claude-quota',
-    ])
+    const s1 = drainNotifications(0, 's1')
+
+    expect(s1).toHaveLength(1)
+    expect(s1[0]?.sessionId).toBe('s1')
+    expect(s1.map((n) => n.payload.command)).toEqual(['claude-quota'])
     expect(drainNotifications(0, 's2').map((n) => n.payload.command)).toEqual([
       'claude-dump',
     ])
@@ -46,6 +59,14 @@ describe('notifications', () => {
     expect(isTuiConnected('s1')).toBe(true)
   })
 
+  test('a drain only marks its own session as connected', () => {
+    drainNotifications(0, 's2')
+    expect(isTuiConnected('s1')).toBe(false)
+    expect(isTuiConnected('s2')).toBe(true)
+    // @ts-expect-error isTuiConnected requires a session id
+    expect(isTuiConnected()).toBe(false)
+  })
+
   test('queue cap evicts oldest beyond 100', () => {
     for (let i = 0; i < 130; i++)
       pushNotification(payload('claude-quota'), 's1')
@@ -53,15 +74,14 @@ describe('notifications', () => {
     expect(all.length).toBe(100)
   })
 
-  test('a global notification reaches every session and is not pruned by one ack', () => {
-    // push a global (no sessionId) notification
-    pushNotification(payload('claude-quota'))
-    const a = drainNotifications(0, 's1')
-    expect(a.length).toBe(1)
-    // s1 acks it
-    drainNotifications(a[0]?.id as number, 's1')
-    // s2 must STILL receive it
-    const b = drainNotifications(0, 's2')
-    expect(b.length).toBe(1)
+  test('producers and drains reject a missing session id', () => {
+    expect(() => {
+      // @ts-expect-error pushNotification requires a session id
+      pushNotification(payload('claude-quota'))
+    }).toThrow('sessionId is required')
+    expect(() => {
+      // @ts-expect-error drainNotifications requires a session id
+      drainNotifications(0)
+    }).toThrow('sessionId is required')
   })
 })

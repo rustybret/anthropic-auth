@@ -930,6 +930,7 @@ const tui: TuiPlugin = async (api) => {
       const sessionId = (
         resolved as { params?: { sessionID?: string } } | undefined
       )?.params?.sessionID
+      if (!sessionId) return
       rpcInFlight = true
       void rpcClient
         .pending(lastNotificationId, sessionId)

@@ -46,14 +46,14 @@ This package is part of the `rustybret/anthropic-auth` downstream fork of upstre
 - **Host-local quota feed**: optionally publish sanitized response-header quota observations so another local CortexKit process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
-- **Claude-compatible request hardening**: Claude Code 2.1.258 identity and final-body billing signing, live-session-stable billing suffixes, Fable 5.1 thinking-prefix recovery, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
+- **Claude-compatible request hardening**: Claude Code 2.1.258 identity and final-body billing signing, user-turn prompt and request lineage across tool loops, live-session-stable billing suffixes, Fable 5.1 thinking-prefix recovery, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
 
 ## What these integrations do
 
 - Let OpenCode and Pi use Claude Pro/Max OAuth credentials instead of an Anthropic API key.
 - In OpenCode, intercept the final Anthropic request and rewrite it into the Claude-compatible shape expected by Anthropic OAuth access.
 - In Pi, replace Pi's built-in Anthropic provider with a CortexKit provider override that uses the same Claude-compatible request path.
-- Add Claude billing headers with stable `cc_version` and body-derived `cch` signing.
+- Add Claude billing headers with stable `cc_version`, user-turn `cc_prompt_id`/`cc_prev_req` lineage, and body-derived `cch` signing.
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
@@ -249,7 +249,7 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 
 `quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
 
-`claustrum.accounts.<fallback-account-id>.enabled` is a per-account opt-in for fallback credential custody. It is inert unless that account's capability handle has been provisioned in `anthropic-auth-state.json`; handles are bearer credentials and must not be copied into the public config file.
+`claustrum.accounts` remains loadable only so configurations can safely downgrade to older releases; it does not gate custody per account. Capability handles are bearer credentials and must not be copied into the public config file.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
@@ -301,23 +301,13 @@ Fallback OAuth tokens refresh in the background so idle accounts do not expire b
 
 If Anthropic reports `invalid_grant`, that account must be logged in again. `/claude-account reset-backoff` manually clears the main account's refresh backoff and its matching quota backoff.
 
-### Optional Claustrum custody
+### Claustrum manifest service
 
-OpenCode can obtain an opted-in fallback OAuth account's access credential from a local [Claustrum](https://github.com/cortexkit/claustrum) daemon instead of refreshing that account independently. After provisioning the account's runtime handle, enable custody by account ID:
+In global Claustrum mode, `/claude-account claustrum` serves OAuth routes that have a binding present in the Claustrum handle manifest; `/claude-account local` returns authority to local OAuth refresh. The vault serves credentials, and the plugin discovers only its own provider block.
 
-```json
-{
-  "claustrum": {
-    "accounts": {
-      "personal-alt": { "enabled": true }
-    }
-  }
-}
-```
+The request path reads only a resident in-memory credential. Startup warming and periodic reconciliation perform vault I/O and keep idle credentials refreshed. In Claustrum mode, a cold or unavailable vault must return a typed provider-unavailable response; it does not fall back to the sidecar credential path. That cold-route behavior lands with the dedicated cold-route task. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show manifest-binding presence, current vault service, and vault reauthentication state without exposing capability handles.
 
-The request path reads only a resident in-memory credential. Startup warming and periodic custody ticks perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault falls back to the sidecar credential path. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show the gate, current vault service, and vault reauthentication state without exposing capability handles.
-
-Custody currently applies only to fallback OAuth accounts. Main-account vault service is not implemented. If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state.
+If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state. API-key routes are unaffected.
 
 ## Quota-aware routing
 
@@ -694,6 +684,12 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | Variable | Description |
 | --- | --- |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
+| `ANTHROPIC_CUSTOM_HEADERS` | Add proxy-specific headers on API-key and proxy routes. Authentication, protocol, framing, and internal correlation headers cannot be overridden. Ignored for OAuth requests. |
+| `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model. Ignored for OAuth requests. |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Proxy alias for `claude-sonnet-*` models. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Proxy alias for `claude-opus-*` models. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Proxy alias for `claude-haiku-*` models. |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Proxy alias for `claude-fable-*` and `claude-mythos-*` models. |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
@@ -701,6 +697,10 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID used by relay setup. |
+
+`ANTHROPIC_CUSTOM_HEADERS` and the model-alias variables apply only to API-key and proxy routes. OAuth requests keep the Claude Code header and model identity unchanged. Custom headers accept either a JSON object or comma/newline-separated `name: value` entries. A configuration containing an invalid or protected header is ignored as a whole with one redacted warning; it cannot replace route authentication, Anthropic protocol headers, body framing, or plugin-internal correlation headers.
+
+An `ANTHROPIC_BASE_URL` path is preserved. For example, `https://proxy.example/anthropic` sends requests to `/anthropic/v1/messages`, while a versioned base such as `https://proxy.example/anthropic/v2` sends to `/anthropic/v2/messages`. Existing version segments are not duplicated, and unrelated paths ending in `/messages` are not rewritten.
 
 ## Request rewriting
 

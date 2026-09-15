@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { unlink } from 'node:fs/promises'
+import { readFile, unlink } from 'node:fs/promises'
 import {
   createServer,
   type IncomingMessage,
@@ -74,9 +74,15 @@ export async function startRpcServer(
         unknown
       >
       if (method === 'pending-notifications') {
+        if (
+          typeof params.sessionId !== 'string' ||
+          params.sessionId.length === 0
+        ) {
+          return json(400, { error: 'sessionId is required' })
+        }
         const messages = options.drain(
           Number(params.lastReceivedId ?? 0),
-          typeof params.sessionId === 'string' ? params.sessionId : undefined,
+          params.sessionId,
         )
         return json(200, { messages })
       }
@@ -115,9 +121,16 @@ export async function startRpcServer(
     token,
     async stop() {
       await new Promise<void>((resolve) => server.close(() => resolve()))
-      await unlink(join(options.dir, `port-${process.pid}.json`)).catch(
-        () => {},
-      )
+      try {
+        const portFile = join(options.dir, `port-${process.pid}.json`)
+        const current = JSON.parse(await readFile(portFile, 'utf8')) as {
+          port?: unknown
+          pid?: unknown
+        }
+        if (current.port === port && current.pid === process.pid) {
+          await unlink(portFile)
+        }
+      } catch {}
     },
   }
 }

@@ -25,6 +25,20 @@ describe('FableFallbackManager', () => {
     expect(JSON.parse(plan!.bodyText).model).toBe('claude-fable-5')
   })
 
+  test('recognizes OpenCode 1m-qualified recoverable model ids', () => {
+    const manager = new FableFallbackManager()
+    for (const model of [
+      'claude-fable-5[1m]',
+      'claude-fable-5-1[1m]',
+      'claude-opus-5[1m]',
+    ]) {
+      const plan = manager.plan(`session-${model}`, body(model))
+      expect(plan?.requestedModel).toBe(model)
+      expect(plan?.downgraded).toBe(false)
+      expect(manager.activate(plan!)).toBe(FABLE_FALLBACK_TURNS)
+    }
+  })
+
   test('routes the next ten successful Fable requests to Opus 4.8', () => {
     const manager = new FableFallbackManager()
     const filtered = manager.plan('session-a', body())!

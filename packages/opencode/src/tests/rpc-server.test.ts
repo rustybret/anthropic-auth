@@ -7,6 +7,7 @@ import {
   pushNotification,
   resetNotificationsForTest,
 } from '../rpc/notifications'
+import { discoverPortFile } from '../rpc/port-file'
 import { startRpcServer } from '../rpc/rpc-server'
 
 let stop: (() => Promise<void>) | null = null
@@ -41,6 +42,19 @@ describe('rpc-server', () => {
     expect(noAuth.status).toBe(401)
 
     pushNotification({ command: 'claude-quota', text: 'x', knobs: {} }, 's1')
+    const missingSession = await fetch(`${base}/rpc/pending-notifications`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${server.token}`,
+      },
+      body: JSON.stringify({ lastReceivedId: 0 }),
+    })
+    expect(missingSession.status).toBe(400)
+    expect(await missingSession.json()).toEqual({
+      error: 'sessionId is required',
+    })
+
     const ok = await fetch(`${base}/rpc/pending-notifications`, {
       method: 'POST',
       headers: {
@@ -173,5 +187,27 @@ describe('rpc-server', () => {
     await new Promise((r) => setTimeout(r, 50))
     process.removeListener('uncaughtException', onUnhandled)
     expect(unhandledError).toBeNull()
+  })
+
+  test('stopping a stale server preserves its successor port file', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'aa-rpcsrv-'))
+    const first = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    const second = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = second.stop
+
+    await first.stop()
+
+    expect((await discoverPortFile(dir))?.port).toBe(second.port)
+    expect((await fetch(`http://127.0.0.1:${second.port}/health`)).status).toBe(
+      200,
+    )
   })
 })

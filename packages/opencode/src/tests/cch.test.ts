@@ -5,6 +5,8 @@ import {
   computeCcVersionSuffix,
   extractFirstUserMessageText,
   signRequestBody,
+  stripBillingLineageFields,
+  stripBillingLineageFromBody,
 } from '@cortexkit/anthropic-auth-core'
 
 describe('billing header helpers', () => {
@@ -91,6 +93,30 @@ describe('billing header helpers', () => {
     })
 
     expect(await signRequestBody(body)).toContain('cch=12a77;')
+  })
+
+  test('includes request lineage in the canonical cch input like Claude Code', async () => {
+    const base = {
+      messages: [{ role: 'user', content: 'hello' }],
+      system: [
+        {
+          type: 'text',
+          text: 'x-anthropic-billing-header: cc_version=2.1.258.123; cc_entrypoint=cli; cch=00000;',
+        },
+      ],
+    }
+    const lineage = structuredClone(base)
+    lineage.system[0]!.text +=
+      ' cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;'
+
+    const baseCch = (await signRequestBody(JSON.stringify(base))).match(
+      /cch=([0-9a-f]{5});/,
+    )?.[1]
+    const lineageCch = (await signRequestBody(JSON.stringify(lineage))).match(
+      /cch=([0-9a-f]{5});/,
+    )?.[1]
+
+    expect(lineageCch).not.toBe(baseCch)
   })
 
   test('signing an already-signed body is idempotent', async () => {
@@ -203,6 +229,68 @@ describe('billing header helpers', () => {
       ),
     ).toBe(
       'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=00000;',
+    )
+  })
+
+  test('appends validated request lineage in Claude Code wire order', () => {
+    expect(
+      buildBillingHeaderValue(
+        [{ role: 'user', content: 'hello world test message' }],
+        '2.1.258',
+        'cli',
+        undefined,
+        {
+          previousRequestId: 'req_011111111111111111111111',
+          promptId: '00000000-0000-4000-8000-000000000001',
+        },
+      ),
+    ).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=00000; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+    )
+  })
+
+  test('strips lineage only from the generated billing block', () => {
+    const body = {
+      system: [
+        {
+          type: 'text',
+          text: 'Keep this user text cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+        },
+        {
+          type: 'text',
+          text: 'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+        },
+      ],
+    }
+
+    expect(stripBillingLineageFromBody(body)).toBe(1)
+    expect(body.system[0]?.text).toContain('cc_prompt_id=')
+    expect(body.system[1]?.text).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde;',
+    )
+  })
+
+  test('omits malformed lineage values and strips lineage from reusable bodies', () => {
+    expect(
+      buildBillingHeaderValue(
+        [{ role: 'user', content: 'hello world test message' }],
+        '2.1.258',
+        'cli',
+        undefined,
+        {
+          previousRequestId: 'req_bad; injected=true',
+          promptId: 'not-a-uuid',
+        },
+      ),
+    ).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=00000;',
+    )
+    expect(
+      stripBillingLineageFields(
+        'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+      ),
+    ).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde;',
     )
   })
 })

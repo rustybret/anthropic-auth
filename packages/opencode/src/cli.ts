@@ -6,15 +6,25 @@ import {
   type AccountStorage,
   addAccountPersistent,
   authorize,
+  custodyCredentialId,
   exchange,
   generateRelayToken,
+  getAccountStatePath,
   getAccountStoragePath,
+  getClaustrumMode,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
+  resolveCustodyHandlesPath,
   saveAccounts,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
+
+import {
+  acknowledgeLocalOAuthLoginFromStorage,
+  lastVaultServedRecordVersion,
+  localAuthFingerprint,
+} from './local-login.ts'
 
 function defaultStorage(): AccountStorage {
   return {
@@ -299,6 +309,9 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
+  if (getClaustrumMode(await loadAccounts()) === 'claustrum') {
+    throw new Error('Exit Claustrum mode first: /claude-account local')
+  }
   const label =
     labelArg?.trim() || (await ask('Fallback account label (optional): '))
   const authorization = await authorizeImpl('max')
@@ -320,7 +333,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   }
 
   const now = Date.now()
-  await addAccountPersistent({
+  const account = {
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'oauth',
@@ -332,7 +345,34 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     addedAt: now,
     lastUsed: now,
     lastRefreshedAt: now,
-  })
+  } as const
+  const credentialId = custodyCredentialId(account.label ?? account.id)
+  await addAccountPersistent(account)
+  await acknowledgeLocalOAuthLoginFromStorage(
+    {
+      accountId: account.id,
+      credentialId,
+      authFingerprint: localAuthFingerprint(result.access, result.refresh),
+      completedAt: now,
+    },
+    {
+      accountStoragePath: getAccountStoragePath(),
+      manifestPath: resolveCustodyHandlesPath(
+        (await loadAccounts())?.claustrum,
+        process.env,
+      ),
+      divergence: {
+        statePath: getAccountStatePath(getAccountStoragePath()),
+        lastVaultServedRecordVersion: lastVaultServedRecordVersion({
+          accountId: account.id,
+          warn: (accountId) =>
+            console.warn(
+              `Fallback login had no served vault record for ${accountId}`,
+            ),
+        }),
+      },
+    },
+  )
 
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }

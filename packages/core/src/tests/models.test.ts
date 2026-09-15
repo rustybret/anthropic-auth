@@ -14,6 +14,7 @@ import {
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
+  normalizeAnthropicModelId,
 } from '../models'
 
 describe('Claude Fable/Mythos 5.1 models', () => {
@@ -43,6 +44,9 @@ describe('Claude Fable/Mythos 5.1 models', () => {
     expect(getClaudeFableMythos5ReleaseDate('claude-mythos-5')).toBe(
       '2026-06-09',
     )
+    expect(normalizeAnthropicModelId('claude-fable-5-1[1m]')).toBe(
+      'claude-fable-5-1',
+    )
     expect(CLAUDE_FABLE_MYTHOS_5_1_PRICING).toEqual({
       input: 10,
       output: 50,
@@ -62,6 +66,8 @@ describe('Claude Fable/Mythos 5.1 models', () => {
       'claude-mythos-5-1',
       'claude-fable-5-1-20260701',
       'claude-mythos-5-1-20260701',
+      'claude-fable-5[1m]',
+      'claude-mythos-5-1[1m]',
     ]) {
       expect(isClaudeFableOrMythos5Model(model)).toBe(true)
     }
@@ -72,6 +78,7 @@ describe('isClaudeFable51Model', () => {
   test('matches exact and dated Fable 5.1 ids only', () => {
     expect(isClaudeFable51Model('claude-fable-5-1')).toBe(true)
     expect(isClaudeFable51Model('claude-fable-5-1-20260830')).toBe(true)
+    expect(isClaudeFable51Model('claude-fable-5-1[1m]')).toBe(true)
     expect(isClaudeFable51Model('claude-mythos-5-1')).toBe(false)
     expect(isClaudeFable51Model('claude-fable-5')).toBe(false)
     expect(isClaudeFable51Model('claude-mythos-5')).toBe(false)
@@ -83,6 +90,7 @@ describe('isClaudeFable51Model', () => {
 describe('isClaudeSonnet5Model', () => {
   test('matches the bare claude-sonnet-5 id', () => {
     expect(isClaudeSonnet5Model('claude-sonnet-5')).toBe(true)
+    expect(isClaudeSonnet5Model('claude-sonnet-5[1m]')).toBe(true)
   })
 
   test('matches a dated claude-sonnet-5 snapshot', () => {
@@ -115,6 +123,7 @@ describe('isClaudeOpus5Model', () => {
 
   test('matches the bare claude-opus-5 id', () => {
     expect(isClaudeOpus5Model('claude-opus-5')).toBe(true)
+    expect(isClaudeOpus5Model('claude-opus-5[1m]')).toBe(true)
   })
 
   test('matches the catalog claude-opus-5-fast variant', () => {

@@ -180,7 +180,8 @@ export type SpawnOptions = {
     transport: 'websocket' | 'http'
   }
   port?: number
-  beforeSpawn?: (env: IsolatedEnv) => void
+  beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
+  childEnv?: Record<string, string | undefined>
   childTmpDir?: string
   quotaFeed?: boolean
 }
@@ -378,9 +379,9 @@ export async function spawnOpencode(
   let stdout = ''
   let stderr = ''
   try {
-    options.beforeSpawn?.(env)
     const port = options.port ?? (await pickFreePort())
     writeConfigs(env, options)
+    await options.beforeSpawn?.(env)
 
     const childEnv: Record<string, string> = {}
     for (const [key, value] of Object.entries(process.env)) {
@@ -441,6 +442,10 @@ export async function spawnOpencode(
     })
     childEnv.ANTHROPIC_BASE_URL = options.anthropicBaseURL
     childEnv.ANTHROPIC_API_KEY = 'test-key-not-real'
+    for (const [key, value] of Object.entries(options.childEnv ?? {})) {
+      if (value === undefined) delete childEnv[key]
+      else childEnv[key] = value
+    }
 
     child = spawn(
       'opencode',

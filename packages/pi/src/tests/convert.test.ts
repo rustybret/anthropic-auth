@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { computeCcVersionSuffix } from '@cortexkit/anthropic-auth-core'
-import type { Message } from '@earendil-works/pi-ai'
+import {
+  computeCcVersionSuffix,
+  type ProviderAccountUuid,
+} from '@cortexkit/anthropic-auth-core'
+import type { Context, Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 
 function userMsg(text: string): Message {
@@ -15,10 +18,14 @@ function assistantMsg(text: string): Message {
   } as Message
 }
 
-function toolCallMsg(id: string, name: string): Message {
+function toolCallMsg(
+  id: string,
+  name: string,
+  args: Record<string, unknown> = {},
+): Message {
   return {
     role: 'assistant',
-    content: [{ type: 'toolCall', id, name, arguments: {} }],
+    content: [{ type: 'toolCall', id, name, arguments: args }],
     timestamp: 0,
   } as Message
 }
@@ -517,7 +524,7 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     const identity = {
       deviceId: 'd'.repeat(64),
       accountIdentity: 'main',
-      accountUuid: 'account-uuid',
+      accountUuid: 'account-uuid' as ProviderAccountUuid,
       sessionId: 'identity-session',
     }
     const { body } = await buildAnthropicRequest(
@@ -614,7 +621,7 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
       {
         deviceId: 'd'.repeat(64),
         accountIdentity: 'main',
-        accountUuid: 'account-uuid',
+        accountUuid: 'account-uuid' as ProviderAccountUuid,
         sessionId: 'identity-session',
       },
     )
@@ -1052,4 +1059,186 @@ describe('convertMessages — signed thinking blocks', () => {
       signature: 'sig-B',
     })
   })
+})
+
+describe('buildAnthropicRequest — host system prompt shapes', () => {
+  // Oh My Pi types Context.systemPrompt as ordered prompt blocks and hands the
+  // array straight to the provider, where `.trim()` threw and no request was
+  // ever built (issue #201). Blocks must classify exactly like the joined text.
+  // The cast is the point of these cases: the host contradicts the `string`
+  // declaration in Pi's Context type at runtime.
+  async function buildBody(systemPrompt: unknown) {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [userMsg('hello')],
+        systemPrompt,
+        tools: [],
+      } as unknown as Context,
+      undefined,
+      defaultCache,
+    )
+    return body
+  }
+
+  test('splits an ordered block array exactly like the joined prompt', async () => {
+    const blocks = PI_PROMPT.split('\n\n')
+    expect(blocks).toHaveLength(3)
+
+    const fromBlocks = await buildBody(blocks)
+    const fromString = await buildBody(PI_PROMPT)
+
+    expect(fromBlocks.system).toEqual(fromString.system)
+    expect(fromBlocks.messages).toEqual(fromString.messages)
+    expect(String(fromBlocks.system?.[2]?.text)).toContain('KEEP TWO')
+    const content = fromBlocks.messages[0]?.content as Array<
+      Record<string, unknown>
+    >
+    expect(String(content[0]?.text)).toContain('MOVE THIS')
+  })
+
+  test('reads structured text blocks for their text', async () => {
+    const body = await buildBody(
+      PI_PROMPT.split('\n\n').map((text) => ({ type: 'text', text })),
+    )
+    expect(String(body.system?.[2]?.text)).toContain('KEEP ONE')
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>
+    expect(String(content[0]?.text)).toContain('MOVE THIS')
+  })
+
+  test('drops non-text blocks instead of flattening their metadata', async () => {
+    const paragraphs = PI_PROMPT.split('\n\n')
+    const body = await buildBody([
+      { type: 'text', text: paragraphs[0] },
+      { type: 'image', text: 'IMAGE METADATA' },
+      { type: 'tool_use', name: 'read', text: 'TOOL METADATA' },
+      paragraphs[1],
+      { type: 'text', text: paragraphs[2] },
+    ])
+
+    const sent = JSON.stringify(body)
+    expect(sent).toContain('KEEP ONE')
+    expect(sent).toContain('KEEP TWO')
+    expect(sent).toContain('MOVE THIS')
+    expect(sent).not.toContain('IMAGE METADATA')
+    expect(sent).not.toContain('TOOL METADATA')
+  })
+
+  test('treats an empty block list as no prompt', async () => {
+    const body = await buildBody([])
+    expect(body.system).toHaveLength(2)
+    expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
+  })
+})
+
+describe('buildAnthropicRequest — cache breakpoint budget', () => {
+  // Anthropic accepts at most four cache breakpoints per request, and this
+  // converter places four itself: the last tool, the last system block, the
+  // cached prompt block on the first user message, and the last user block.
+  // Adding the top-level control on top of them made five and Anthropic
+  // rejected the request before it reached the model (issue #201).
+  async function buildBody(cache: {
+    enabled: boolean
+    mode: 'explicit' | 'automatic' | 'hybrid'
+  }) {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [userMsg('hello')],
+        systemPrompt: PI_PROMPT,
+        tools: [
+          {
+            name: 'read',
+            description: 'read a file',
+            parameters: { properties: {}, required: [] },
+          },
+        ],
+      } satisfies Context,
+      undefined,
+      cache,
+    )
+    return body
+  }
+
+  const countBreakpoints = (body: unknown) =>
+    JSON.stringify(body).split('"cache_control"').length - 1
+
+  test('places four breakpoints and no top-level control by default', async () => {
+    const body = await buildBody({ enabled: false, mode: 'hybrid' })
+    expect(countBreakpoints(body)).toBe(4)
+    expect(body.cache_control).toBeUndefined()
+  })
+
+  test('keeps hybrid within the budget by extending those four to 1h', async () => {
+    const body = await buildBody({ enabled: true, mode: 'hybrid' })
+    expect(countBreakpoints(body)).toBe(4)
+    expect(body.cache_control).toBeUndefined()
+    expect(body.system?.at(-1)?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(body.tools?.at(-1)?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
+  test('spends the whole budget on the top-level control in automatic', async () => {
+    const body = await buildBody({ enabled: true, mode: 'automatic' })
+    expect(countBreakpoints(body)).toBe(1)
+    expect(body.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    expect(body.system?.at(-1)?.cache_control).toBeUndefined()
+    expect(body.tools?.at(-1)?.cache_control).toBeUndefined()
+  })
+
+  // A tool parameter or tool argument that happens to be named cache_control is
+  // caller data, not a breakpoint. A deep walk would delete it in automatic and
+  // write ttl into it in hybrid/explicit, silently corrupting the tool contract.
+  test.each(['explicit', 'automatic', 'hybrid'] as const)(
+    'leaves a tool parameter named cache_control untouched in %s',
+    async (mode) => {
+      const { body } = await buildAnthropicRequest(
+        TEST_MODEL_ID,
+        {
+          messages: [
+            userMsg('hello'),
+            toolCallMsg('tool_1', 'store', {
+              cache_control: { type: 'ephemeral' },
+            }),
+            toolResultMsg('tool_1', 'stored'),
+          ],
+          systemPrompt: PI_PROMPT,
+          tools: [
+            {
+              name: 'store',
+              description: 'store a value',
+              parameters: {
+                properties: {
+                  cache_control: { type: 'string', description: 'a header' },
+                },
+                required: [],
+              },
+            },
+          ],
+        } satisfies Context,
+        undefined,
+        { enabled: true, mode },
+      )
+
+      const schema = body.tools?.[0]?.input_schema as {
+        properties: Record<string, unknown>
+      }
+      expect(schema.properties.cache_control).toEqual({
+        type: 'string',
+        description: 'a header',
+      })
+
+      const assistant = body.messages[1] as {
+        content: Array<Record<string, unknown>>
+      }
+      expect(assistant.content[0]?.input).toEqual({
+        cache_control: { type: 'ephemeral' },
+      })
+    },
+  )
 })

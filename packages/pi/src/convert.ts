@@ -68,7 +68,7 @@ export type AnthropicRequestBody = {
     | { type: 'enabled'; budget_tokens: number }
     | { type: 'adaptive'; display: 'summarized' }
   output_config?: { effort: string }
-  cache_control?: { type: 'ephemeral' }
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' }
   speed?: 'fast'
 }
 
@@ -386,6 +386,49 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
   }
 }
 
+/**
+ * Flatten a host system prompt to text.
+ *
+ * Pi types `Context.systemPrompt` as `string`, but Oh My Pi 18.x types it as
+ * `string[]` — "ordered system prompt blocks" — and hands that array to the
+ * provider unflattened, where `.trim()` is not a function and no request was
+ * ever built (issue #201).
+ *
+ * Blocks join on a blank line, which is how the host's own providers flatten
+ * them (`normalizeSystemPrompts(prompt).join('\n\n')`), so the paragraph split
+ * below classifies the same text on either host. The host asks providers to
+ * preserve its entries as distinct blocks, and that is deliberately not done
+ * here: an unrecognized prompt shape is carried in messages[] precisely because
+ * placing the host prompt in top-level system[] is the request shape Anthropic
+ * rejects with 400 "You're out of extra usage" (see splitPiSystemPrompt).
+ * Joining loses no text and no paragraph boundary; re-emitting the entries as
+ * system[] blocks would reintroduce that rejection.
+ *
+ * Only a `{ type: 'text', text }` block is read. The host declares strings, so
+ * that branch is for the next drift in this same field: returning '' there
+ * would silently ship requests with no host prompt at all, which is worse than
+ * the crash this replaces. `type` is checked rather than reading any object's
+ * `text` field, so a tool, image, or other structured block never has its
+ * metadata flattened into the prompt.
+ */
+function systemPromptText(prompt: unknown): string {
+  if (typeof prompt === 'string') return prompt
+  if (!Array.isArray(prompt)) return ''
+
+  const parts: string[] = []
+  for (const block of prompt) {
+    if (typeof block === 'string') {
+      parts.push(block)
+      continue
+    }
+    const record = block as { type?: unknown; text?: unknown } | null
+    if (record?.type === 'text' && typeof record.text === 'string') {
+      parts.push(record.text)
+    }
+  }
+  return parts.join('\n\n')
+}
+
 function splitPiSystemPrompt(prompt: string): {
   systemText?: string
   messageText: string
@@ -431,33 +474,73 @@ function prependCachedPromptBlock(
   }
 }
 
+/**
+ * Visit every object that can legitimately hold an Anthropic cache breakpoint:
+ * the request root, each `system[]` block, each tool, and each message with its
+ * content blocks — exactly where addEphemeralCacheControl and
+ * prependCachedPromptBlock place them.
+ *
+ * Deliberately not a deep walk. A tool's `input_schema` and a replayed
+ * `tool_use.input` are arbitrary caller data, so a nested field named
+ * `cache_control` there is a tool parameter or argument, not a breakpoint:
+ * deleting it or writing `ttl` into it would corrupt the tool contract.
+ */
+function walkCacheControlHolders(
+  body: AnthropicRequestBody,
+  visit: (holder: Record<string, unknown>) => void,
+): void {
+  const holders: unknown[] = [body]
+  if (body.system) holders.push(...body.system)
+  if (body.tools) holders.push(...body.tools)
+  for (const message of body.messages) {
+    holders.push(message)
+    if (Array.isArray(message.content)) holders.push(...message.content)
+  }
+
+  for (const holder of holders) {
+    if (!holder || typeof holder !== 'object') continue
+    const record = holder as Record<string, unknown>
+    const cacheControl = record.cache_control
+    if (cacheControl && typeof cacheControl === 'object') visit(record)
+  }
+}
+
+/**
+ * Anthropic accepts at most four cache breakpoints per request. This provider
+ * composes its own body and has already placed exactly four
+ * (addEphemeralCacheControl's last tool, last system block and last user block,
+ * plus the cached prompt block on the first user message), so the top-level
+ * control this used to add on top of them made five cache_control sites in one
+ * body — the shape behind "A maximum of 4 blocks with cache_control may be
+ * provided. Found 5." on a request that never reached the model (issue #201).
+ *
+ * Each mode now places its own breakpoints and nothing else, as the OpenCode
+ * rewrite path does (`applyAutomaticCache1h` / `applyHybridCache1h` both clear
+ * every breakpoint first):
+ * - `automatic`: the top-level control alone, at 1h.
+ * - `hybrid`: the four block breakpoints extended to 1h, no top-level control.
+ *   That is the placement OpenCode's hybrid anchors reconstruct by hand and
+ *   this converter emits natively.
+ * - `explicit`: the same four breakpoints, TTL only.
+ */
 function applyCacheMode(
   body: AnthropicRequestBody,
   enabled: boolean,
   mode: Cache1hMode,
 ): void {
   if (!enabled) return
+
   if (mode === 'automatic') {
-    body.cache_control = { type: 'ephemeral' }
+    walkCacheControlHolders(body, (holder) => {
+      delete holder.cache_control
+    })
+    body.cache_control = { type: 'ephemeral', ttl: '1h' }
     return
   }
 
-  const addTtl = (value: unknown): void => {
-    if (!value || typeof value !== 'object') return
-    if (Array.isArray(value)) {
-      for (const item of value) addTtl(item)
-      return
-    }
-    const record = value as Record<string, unknown>
-    const cacheControl = record.cache_control
-    if (cacheControl && typeof cacheControl === 'object') {
-      ;(cacheControl as Record<string, unknown>).ttl = '1h'
-    }
-    for (const child of Object.values(record)) addTtl(child)
-  }
-
-  if (mode === 'hybrid') body.cache_control = { type: 'ephemeral' }
-  addTtl(body)
+  walkCacheControlHolders(body, (holder) => {
+    ;(holder.cache_control as Record<string, unknown>).ttl = '1h'
+  })
 }
 
 export async function buildAnthropicRequest(
@@ -494,7 +577,8 @@ export async function buildAnthropicRequest(
     },
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
-  if (context.systemPrompt?.trim()) {
+  const systemPrompt = systemPromptText(context.systemPrompt)
+  if (systemPrompt.trim()) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make
@@ -519,7 +603,7 @@ export async function buildAnthropicRequest(
     // cache_control is set explicitly because addEphemeralCacheControl's
     // message-level breakpoint only fires for array content on the *last* user
     // message, which is not this one after the first turn.
-    const prompt = splitPiSystemPrompt(context.systemPrompt)
+    const prompt = splitPiSystemPrompt(systemPrompt)
     if (prompt.systemText) {
       system.push({ type: 'text', text: prompt.systemText })
     }
