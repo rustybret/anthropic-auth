@@ -27,7 +27,7 @@
     "types": "tsc"
   },
   "dependencies": {
-    "@cortexkit/subc-client": "^0.8.1",
+    "@cortexkit/subc-client": "^0.11.1",
     "xxhash-wasm": "^1.1.0"
   }
 }

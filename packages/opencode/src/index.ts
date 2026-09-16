@@ -50,6 +50,7 @@ import {
   createEmptyStorage,
   createStickyNoRouteResponse,
   custodyCredentialId,
+  custodyCredentialIdFromResolution,
   type DumpHandle,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
@@ -625,6 +626,7 @@ async function sendIgnoredMessage(
     noReply?: boolean
     beforeActiveAssistant?: boolean
     canSend?: () => boolean
+    onPreparedMessageId?: (messageId: string) => void
   } = {},
 ): Promise<boolean> {
   const session = ctx.client.session as PluginSessionClient | undefined
@@ -653,6 +655,9 @@ async function sendIgnoredMessage(
   // A new user prompt can start while that request is in flight, so re-check the
   // caller's delivery lease immediately before inserting the ignored message.
   if (options.canSend && !options.canSend()) return false
+  if (request.body.messageID) {
+    options.onPreparedMessageId?.(request.body.messageID)
+  }
 
   if (typeof session?.promptAsync === 'function') {
     await session.promptAsync(request)
@@ -1087,6 +1092,7 @@ const anthropicAuthPlugin = async (
   const desktopNoticeSafeSessions = new Set<string>()
   const desktopNoticeLatestUserMessages = new Map<string, string>()
   const desktopNoticeIdleUserMessages = new Map<string, string>()
+  const desktopNoticeMessageIds = new Map<string, Set<string>>()
   const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
     path:
@@ -1973,7 +1979,10 @@ const anthropicAuthPlugin = async (
   ): Promise<void> {
     const completion = completedLocalLogin
     if (!completion) return
-    const storage = await loadAccounts(accountStoragePath)
+    // Best-effort metadata read — same shape as the OAuth callback path
+    // (~8775). A corrupt store must not reject the post-login ack; fall
+    // through to the missing-entry branch the ternary below already handles.
+    const storage = await loadAccounts(accountStoragePath).catch(() => null)
     if (getClaustrumMode(storage) !== 'local') return
     const account = mainCustodyAccount(await getAuth().catch(() => ({})))
     const resolution = storage
@@ -1992,7 +2001,7 @@ const anthropicAuthPlugin = async (
         entry: {
           label: 'main',
           handle: resolution.handle,
-          credentialId: resolution.credentialId ?? custodyCredentialId('main'),
+          credentialId: custodyCredentialIdFromResolution(resolution, 'main'),
         },
         beforeRemove: async () => {
           await persistCustodyDivergenceState(
@@ -2052,7 +2061,7 @@ const anthropicAuthPlugin = async (
               code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
               retryable: false,
               message:
-                "Claustrum main binding is not active while local main material remains; onboard main into the vault with Claustrum's tooling first.",
+                'Claustrum main binding is not active while local main material remains; mint a handle with `ck auth mint-handle` so this plugin can write the manifest entry.',
             }
           : state === 'identity-mismatch'
             ? {
@@ -2451,7 +2460,7 @@ const anthropicAuthPlugin = async (
     const timeout = new Promise<undefined>((resolve) => {
       resolveTimeout = () => resolve(undefined)
     })
-    const timer = globalThis.setTimeout(
+    const timer = runtimeTimers.setTimeout(
       resolveTimeout,
       CLAUSTRUM_WARMUP_TIMEOUT_MS,
     )
@@ -2459,7 +2468,7 @@ const anthropicAuthPlugin = async (
     try {
       return await Promise.race([cache.get(handle, minTtlMs), timeout])
     } finally {
-      globalThis.clearTimeout(timer)
+      runtimeTimers.clearTimeout(timer)
     }
   }
 
@@ -2608,6 +2617,13 @@ const anthropicAuthPlugin = async (
                   // Refuse malformed labels before taking the cross-tenant lock.
                   isValidCustodyLabel(account.label)
                 ) {
+                  // Safe to derive here: this migrates a LEGACY handle into
+                  // our manifest block, and every legacy handle file on disk
+                  // today names a labelled credential whose real vault id
+                  // matches `oauth:anthropic:<label>` (the only one is
+                  // `.claustrum-handle-work-alt` -> `oauth:anthropic:work-alt`).
+                  // A legacy file naming an unlabelled credential would derive
+                  // to nothing and the removal branch would fail closed.
                   const write = await writeCustodyHandleManifestEntry({
                     path: custodyHandleManifestPath,
                     entry: {
@@ -4042,6 +4058,26 @@ const anthropicAuthPlugin = async (
     if (desktopText) queueDesktopNotice(notice.sessionId, desktopText)
   }
 
+  function trackDesktopNoticeMessageId(sessionId: string, messageId: string) {
+    const messageIds =
+      desktopNoticeMessageIds.get(sessionId) ?? new Set<string>()
+    messageIds.delete(messageId)
+    messageIds.add(messageId)
+    while (messageIds.size > 4) {
+      const oldest = messageIds.values().next().value
+      if (typeof oldest !== 'string') break
+      messageIds.delete(oldest)
+    }
+    desktopNoticeMessageIds.set(sessionId, messageIds)
+  }
+
+  function isDesktopNoticeMessage(sessionId: string, messageId?: string) {
+    return (
+      typeof messageId === 'string' &&
+      desktopNoticeMessageIds.get(sessionId)?.has(messageId) === true
+    )
+  }
+
   function queueDesktopNotice(sessionId: string, text: string) {
     if (isTuiConnected(sessionId)) return
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
@@ -4150,13 +4186,26 @@ const anthropicAuthPlugin = async (
           return
         }
         try {
+          const isCurrentNotice = () =>
+            pendingDesktopNotices.get(sessionId) === queue && queue[0] === text
           const sent = await sendIgnoredMessage(ctx, sessionId, text, {
             noReply: true,
             beforeActiveAssistant: true,
-            canSend: () => desktopNoticeSafeSessions.has(sessionId),
+            canSend: () =>
+              desktopNoticeSafeSessions.has(sessionId) && isCurrentNotice(),
+            onPreparedMessageId: (messageId) =>
+              trackDesktopNoticeMessageId(sessionId, messageId),
           })
-          if (!sent) return
-          queue.shift()
+          if (!sent) {
+            if (
+              desktopNoticeSafeSessions.has(sessionId) &&
+              !isCurrentNotice()
+            ) {
+              continue
+            }
+            return
+          }
+          if (isCurrentNotice()) queue.shift()
         } catch (error) {
           logger.warn('fable-fallback', 'Desktop notification failed', {
             session: sessionId,
@@ -4633,7 +4682,10 @@ const anthropicAuthPlugin = async (
         await acknowledgeLocalOAuthLoginFromStorage(
           {
             accountId: account.id,
-            credentialId: custodyCredentialId(account.label ?? account.id),
+            credentialId: custodyCredentialIdFromResolution(
+              fallbackBinding,
+              account.label ?? account.id,
+            ),
             authFingerprint: localAuthFingerprint(
               result.access,
               result.refresh,
@@ -5236,7 +5288,11 @@ const anthropicAuthPlugin = async (
         value.properties?.sessionID ?? info?.sessionID ?? info?.id
       if (!sessionId) return
 
-      if (value.type === 'message.updated' && info?.role === 'user') {
+      if (
+        value.type === 'message.updated' &&
+        info?.role === 'user' &&
+        !isDesktopNoticeMessage(sessionId, info.id)
+      ) {
         if (typeof info.id === 'string') {
           desktopNoticeLatestUserMessages.set(sessionId, info.id)
           if (
@@ -5297,6 +5353,7 @@ const anthropicAuthPlugin = async (
         desktopNoticeSafeSessions.delete(sessionId)
         desktopNoticeLatestUserMessages.delete(sessionId)
         desktopNoticeIdleUserMessages.delete(sessionId)
+        desktopNoticeMessageIds.delete(sessionId)
         for (const recoveryKey of pendingRecoveryDesktopNotices.keys()) {
           if (recoveryKey.startsWith(`${sessionId}\0`)) {
             pendingRecoveryDesktopNotices.delete(recoveryKey)
@@ -8758,9 +8815,35 @@ const anthropicAuthPlugin = async (
                   result.state,
                 )
                 if (exchanged.type === 'success') {
+                  // Mirror `acknowledgeMainLocalLogin` (~1995): prefer the
+                  // manifest-resolved credential id so divergence state and
+                  // removal match the actual vault id, not the derived form.
+                  // This lookup only supplies the credential id; a corrupt or
+                  // partially-written store must NOT reject the OAuth callback
+                  // and discard the just-exchanged credentials — exactly the
+                  // case a re-logging-in user is trying to recover from.
+                  const reentryStorage = await loadAccounts(
+                    accountStoragePath,
+                  ).catch(() => null)
+                  const reentryResolution = reentryStorage
+                    ? resolveAccountCustodyHandle(
+                        mainCustodyAccount({
+                          access: exchanged.access,
+                          refresh: exchanged.refresh,
+                        }),
+                        reentryStorage,
+                      )
+                    : ({
+                        status: 'unresolved',
+                        reason: 'missing-entry',
+                      } as const)
+                  const reentryCredentialId = custodyCredentialIdFromResolution(
+                    reentryResolution,
+                    'main',
+                  )
                   completedLocalLogin = {
                     accountId: 'main',
-                    credentialId: custodyCredentialId('main'),
+                    credentialId: reentryCredentialId,
                     authFingerprint: localAuthFingerprint(
                       exchanged.access,
                       exchanged.refresh,

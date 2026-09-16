@@ -143,7 +143,7 @@
 **ClaustrumClient / ClaustrumCredentialCache:**
 - Purpose: Provide optional global local-vault custody for every OpenCode OAuth route while keeping vault I/O off provider response paths
 - Location: `packages/core/src/claustrum.ts`, integrated through `packages/opencode/src/custody-mode.ts`, `packages/opencode/src/custody-live.ts`, and `packages/opencode/src/index.ts`
-- Pattern: A global mode and manifest bindings determine authority. The client clears inherited subc identity, uses a stable store-scoped bind identity, caches decoded credentials by capability handle and record version, refreshes near expiry under per-handle backoff and single-flight, version-fences auth-failure reports, reconnects terminal resident clients, and rejects custody tombstones before OAuth refresh or dispatch. Mode transitions are resumable and mode-last; handles remain runtime-only bearer credentials and never enter public projections, dumps, or logs.
+- Pattern: A global mode and manifest bindings determine authority. Manifest lock acquisition sweeps stale quarantine directories using basename-derived prefixes across platforms. The client clears inherited subc identity, uses a stable store-scoped bind identity, caches decoded credentials by capability handle and record version, refreshes near expiry under per-handle backoff and single-flight, version-fences auth-failure reports, reconnects terminal resident clients, and rejects custody tombstones before OAuth refresh or dispatch. Mode transitions are resumable and mode-last; handles remain runtime-only bearer credentials and never enter public projections, dumps, or logs.
 
 **StickySessionRouter:**
 - Purpose: Quota-balance cold sessions without moving an established prompt cache between OAuth accounts
