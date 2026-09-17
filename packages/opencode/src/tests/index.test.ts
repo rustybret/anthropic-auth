@@ -679,6 +679,7 @@ function fireConcurrentFetches(result: { fetch: typeof fetch }) {
 type PluginRuntimeOverrides = Partial<{
   authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
   setTimeout: typeof globalThis.setTimeout
+  clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   claustrumConnector: (options: unknown) => Promise<unknown>
@@ -732,6 +733,39 @@ async function getPlugin(
     fallbackRefreshes.add(plugin.__fallbackRefreshReady)
   }
   return plugin
+}
+
+async function withoutClaustrumWarmupDeadline<T>(
+  fn: (timerOverrides: PluginRuntimeOverrides) => Promise<T>,
+): Promise<T> {
+  const disabledHandles = new Set<ReturnType<typeof globalThis.setTimeout>>()
+  const setTimeoutImpl = ((
+    ...arguments_: Parameters<typeof globalThis.setTimeout>
+  ) => {
+    if (arguments_[1] === 100) {
+      const handle = {
+        unref() {},
+      } as ReturnType<typeof globalThis.setTimeout>
+      disabledHandles.add(handle)
+      return handle
+    }
+    return globalThis.setTimeout(...arguments_)
+  }) as typeof globalThis.setTimeout
+  const clearTimeoutImpl = ((
+    handle: Parameters<typeof globalThis.clearTimeout>[0],
+  ) => {
+    if (
+      disabledHandles.delete(handle as ReturnType<typeof globalThis.setTimeout>)
+    ) {
+      return
+    }
+    globalThis.clearTimeout(handle)
+  }) as typeof globalThis.clearTimeout
+  return withDeadlockGuard(
+    fn({ setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl }),
+    4_000,
+    'Claustrum warmup test deadlocked',
+  )
 }
 
 function installRelayResponseStart(
@@ -837,6 +871,52 @@ type CredentialCall = {
   method: string
   params: Record<string, unknown>
 }
+
+describe('desktop notice identity (#230)', () => {
+  test('orders repeated notices before the same assistant with bounded IDs', async () => {
+    const plugin = await getPlugin()
+    const mint = plugin.__notificationMessageIdBeforeAssistantForTest
+    const assistant = 'msg_0000000f0000BBBBBBBBBBBBBB'
+    let previous = 'msg_0000000efffeAAAAAAAAAAAAAA'
+    for (let index = 0; index < 20; index++) {
+      const next = mint(assistant, previous)
+      expect(typeof next).toBe('string')
+      expect(next > previous).toBe(true)
+      expect(next < assistant).toBe(true)
+      previous = next
+    }
+    expect(mint(assistant, assistant)).toBeUndefined()
+    expect(mint(assistant, 'msg_ffffffffffffAAAAAAAAAAAAAA')).toBeUndefined()
+    expect(mint('invalid', previous)).toBeUndefined()
+    expect(mint('msg_000000000000AAAAAAAAAAAAAA')).toBeUndefined()
+    expect(
+      mint(assistant, `msg_0000000effff${'z'.repeat(112)}`),
+    ).toBeUndefined()
+  })
+
+  test('bounds notice identities by session and message, retaining recently used sessions', async () => {
+    const plugin = await getPlugin()
+    const track = plugin.__trackDesktopNoticeMessageIdForTest
+    const has = plugin.__isDesktopNoticeMessageForTest
+    for (let index = 0; index < 128; index++) track(`ses_${index}`, 'msg_first')
+    track('ses_0', 'msg_recent')
+    track('ses_128', 'msg_first')
+    expect(has('ses_0', 'msg_recent')).toBe(true)
+    expect(has('ses_1', 'msg_first')).toBe(false)
+    expect(has('ses_128', 'msg_first')).toBe(true)
+    for (let index = 0; index < 5; index++) track('ses_128', `msg_${index}`)
+    expect(has('ses_128', 'msg_0')).toBe(false)
+    expect(has('ses_128', 'msg_1')).toBe(true)
+    expect(has('ses_128', 'msg_4')).toBe(true)
+    await plugin.event?.({
+      event: {
+        type: 'session.deleted',
+        properties: { info: { id: 'ses_128' } },
+      },
+    })
+    expect(has('ses_128', 'msg_4')).toBe(false)
+  })
+})
 
 describe('sidebar needsReauth (dead-fallback indicator)', () => {
   const originalFetch = globalThis.fetch
@@ -1474,23 +1554,55 @@ describe('fallback Claustrum credential resolution', () => {
         releaseCredential = () =>
           resolve(credentialResponse('late-main-access', 1))
       })
+      let releaseWarmupTimeout!: () => void
+      const warmupTimeoutScheduled = new Promise<void>((resolve) => {
+        releaseWarmupTimeout = resolve
+      })
+      let fireWarmupTimeout: (() => void) | undefined
+      const warmupTimer = {
+        unref() {},
+      } as unknown as ReturnType<typeof setTimeout>
+      const clearTimeoutImpl = mock(
+        (timer: ReturnType<typeof setTimeout> | undefined) => {
+          if (timer !== warmupTimer) globalThis.clearTimeout(timer)
+        },
+      )
+      let captureWarmupTimer = true
       const plugin = await getPlugin(undefined, undefined, {
         claustrumConnector: connectorFor([], (method) =>
           method === 'credential.get' ? credential : { result: {} },
         ),
+        setTimeout: mock((handler: TestTimerHandler, delay?: number) => {
+          if (captureWarmupTimer && delay === 100) {
+            captureWarmupTimer = false
+            fireWarmupTimeout = () => {
+              if (typeof handler === 'function') handler()
+            }
+            releaseWarmupTimeout()
+            return warmupTimer
+          }
+          return globalThis.setTimeout(handler, delay)
+        }) as unknown as typeof setTimeout,
+        clearTimeout: clearTimeoutImpl as unknown as typeof clearTimeout,
       })
 
       try {
-        const startedAt = performance.now()
-        const result = (await withDeadlockGuard(
-          plugin.auth.loader(
+        let loaderResolved = false
+        const loaderPromise = plugin.auth
+          .loader(
             () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
             { models: {} },
-          ),
-          150,
-          'tombstoned main loader exceeded 150ms',
-        )) as { fetch: typeof fetch }
-        expect(performance.now() - startedAt).toBeLessThan(150)
+          )
+          .then((result: unknown) => {
+            loaderResolved = true
+            return result
+          })
+        await warmupTimeoutScheduled
+        expect(loaderResolved).toBeFalse()
+        expect(fireWarmupTimeout).toBeDefined()
+        fireWarmupTimeout?.()
+        const result = (await loaderPromise) as { fetch: typeof fetch }
+        expect(clearTimeoutImpl).toHaveBeenCalledWith(warmupTimer)
         await expect(
           result.fetch(MESSAGES_URL, EMPTY_POST),
         ).rejects.toMatchObject({
@@ -2442,12 +2554,15 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        const plugin = await getPlugin(undefined, undefined, {
-          claustrumConnector: manifestConnector(
-            [],
-            new Map([[legacyHandle, 'migration-order-access']]),
-          ),
-        })
+        const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
+          getPlugin(undefined, undefined, {
+            ...timerOverrides,
+            claustrumConnector: manifestConnector(
+              [],
+              new Map([[legacyHandle, 'migration-order-access']]),
+            ),
+          }),
+        )
         expect(stateAtManifestWrite).toContain(legacyHandle)
         expect(await readFile(accountStatePath, 'utf8')).not.toContain(
           legacyHandle,
@@ -2588,11 +2703,16 @@ describe('fallback Claustrum credential resolution', () => {
     },
   )
 
-  async function withShortManifestLockTiming<T>(fn: () => Promise<T>) {
+  async function withFixedManifestLockClock<T>(
+    fn: () => Promise<T>,
+    now?: () => number,
+  ) {
+    const fixedNow = Date.now()
     __setCustodyManifestLockTestOptions({
       ttlMs: 150,
       retryMinMs: 5,
       retryMaxMs: 5,
+      now: now ?? (() => fixedNow),
     })
     try {
       return await fn()
@@ -2621,14 +2741,17 @@ describe('fallback Claustrum credential resolution', () => {
     const manifestPath = await writeManifest([])
     const restore = await configureClaustrumConnection()
     const calls: CredentialCall[] = []
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector:
-        input.connector?.(calls) ??
-        manifestConnector(
-          calls,
-          new Map([[input.handle, `${input.label}-access`]]),
-        ),
-    })
+    const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
+      getPlugin(undefined, undefined, {
+        ...timerOverrides,
+        claustrumConnector:
+          input.connector?.(calls) ??
+          manifestConnector(
+            calls,
+            new Map([[input.handle, `${input.label}-access`]]),
+          ),
+      }),
+    )
     return { calls, manifestPath, plugin, restore }
   }
 
@@ -2671,12 +2794,15 @@ describe('fallback Claustrum credential resolution', () => {
       const manifestPath = await writeManifest([])
       const restore = await configureClaustrumConnection()
       const calls: CredentialCall[] = []
-      const plugin = await getPlugin(undefined, undefined, {
-        claustrumConnector: manifestConnector(
-          calls,
-          new Map([[legacyHandle, 'retry-migration-access']]),
-        ),
-      })
+      const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
+        getPlugin(undefined, undefined, {
+          ...timerOverrides,
+          claustrumConnector: manifestConnector(
+            calls,
+            new Map([[legacyHandle, 'retry-migration-access']]),
+          ),
+        }),
+      )
       try {
         await plugin.__fallbackRefreshReady
         expect(
@@ -2820,72 +2946,61 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'reports a corrupt manifest lock after its bounded wait and keeps the legacy handle',
     async () => {
-      await withShortManifestLockTiming(async () => {
-        await useTempAccountFile(
-          manifestStorage({ label: 'fresh-lock', legacy: legacyHandle }),
-        )
-        const manifestPath = await writeManifest([])
-        const restore = await configureClaustrumConnection()
-        const lockPath = `${manifestPath}.lock`
-        await mkdir(lockPath, { mode: 0o700 })
-        await writeFile(
-          join(lockPath, 'owner'),
-          `${JSON.stringify({ claimed_at_ms: Date.now(), tenant: 'test' })}\n`,
-        )
-        const logs: LogTestRecord[] = []
-        __setLogTestSink((record) => logs.push(record))
-        const startedAt = Date.now()
-        let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
-        try {
-          plugin = await Promise.race([
-            getPlugin(undefined, undefined, {
-              claustrumConnector: manifestConnector(
-                [],
-                new Map([[legacyHandle, 'fresh-lock-access']]),
-              ),
-            }),
-            Bun.sleep(1_000).then(() => {
-              throw new Error('manifest lock busy did not respect its deadline')
-            }),
-          ])
-          for (let attempt = 0; attempt < 100; attempt++) {
-            if (
+      const times = [0, 150]
+      let timeIndex = 0
+      await withFixedManifestLockClock(
+        async () => {
+          await useTempAccountFile(
+            manifestStorage({ label: 'fresh-lock', legacy: legacyHandle }),
+          )
+          const manifestPath = await writeManifest([])
+          const restore = await configureClaustrumConnection()
+          const lockPath = `${manifestPath}.lock`
+          await mkdir(lockPath, { mode: 0o700 })
+          await writeFile(
+            join(lockPath, 'owner'),
+            `${JSON.stringify({ claimed_at_ms: 0, tenant: 'test' })}\n`,
+          )
+          const logs: LogTestRecord[] = []
+          __setLogTestSink((record) => logs.push(record))
+          let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
+          try {
+            plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
+              getPlugin(undefined, undefined, {
+                ...timerOverrides,
+                claustrumConnector: manifestConnector(
+                  [],
+                  new Map([[legacyHandle, 'fresh-lock-access']]),
+                ),
+              }),
+            )
+            await plugin.__fallbackRefreshReady
+            expect(
               logs.some(
                 (record) =>
                   record.message === 'manifest write failed' &&
                   record.payload?.reason === 'manifest lock owner invalid',
-              )
-            )
-              break
-            await Bun.sleep(10)
+              ),
+            ).toBe(true)
+            expect(
+              await readFile(
+                getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+                'utf8',
+              ),
+            ).toContain(legacyHandle)
+          } finally {
+            __setLogTestSink(null)
+            await plugin?.dispose?.()
+            restore()
           }
-          const elapsedMs = Date.now() - startedAt
-          expect(elapsedMs).toBeGreaterThanOrEqual(120)
-          expect(elapsedMs).toBeLessThan(1_000)
-          expect(
-            logs.some(
-              (record) =>
-                record.message === 'manifest write failed' &&
-                record.payload?.reason === 'manifest lock owner invalid',
-            ),
-          ).toBe(true)
-          expect(
-            await readFile(
-              getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
-              'utf8',
-            ),
-          ).toContain(legacyHandle)
-        } finally {
-          __setLogTestSink(null)
-          await plugin?.dispose?.()
-          restore()
-        }
-      })
+        },
+        () => times[Math.min(timeIndex++, times.length - 1)]!,
+      )
     },
   )
 
   test.serial('renames a stale manifest lock before writing', async () => {
-    await withShortManifestLockTiming(async () => {
+    await withFixedManifestLockClock(async () => {
       await useTempAccountFile(
         manifestStorage({ label: 'stale-lock', legacy: legacyHandle }),
       )
@@ -2945,12 +3060,15 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        const plugin = await getPlugin(undefined, undefined, {
-          claustrumConnector: manifestConnector(
-            [],
-            new Map([[legacyHandle, 'lock-owner-access']]),
-          ),
-        })
+        const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
+          getPlugin(undefined, undefined, {
+            ...timerOverrides,
+            claustrumConnector: manifestConnector(
+              [],
+              new Map([[legacyHandle, 'lock-owner-access']]),
+            ),
+          }),
+        )
         expect(owner).toMatchObject({ tenant: 'anthropic-auth' })
         expect(typeof owner?.claimed_at_ms).toBe('number')
         await expect(fs.stat(lockPath)).rejects.toThrow()
@@ -2966,7 +3084,7 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'preserves two concurrent legacy migrations in one manifest',
     async () => {
-      await withShortManifestLockTiming(async () => {
+      await withFixedManifestLockClock(async () => {
         const storageA = fallbackWithClaustrum({
           id: 'fallback-a',
           label: 'migration-a',
@@ -2976,8 +3094,10 @@ describe('fallback Claustrum credential resolution', () => {
         })
         await useTempAccountFile(storageA)
         const accountPathA = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
         const manifestPath = await writeManifest([])
         const restore = await configureClaustrumConnection()
+        const firstEntered = deferred()
         const entered = deferred()
         const release = deferred()
         let credentialGets = 0
@@ -2988,6 +3108,7 @@ describe('fallback Claustrum credential resolution', () => {
             if (method !== 'credential.get')
               throw new Error(`unexpected method: ${method}`)
             credentialGets += 1
+            if (credentialGets === 1) firstEntered.resolve()
             if (credentialGets === 2) entered.resolve()
             await release.promise
             return credentialResponse(
@@ -2996,27 +3117,8 @@ describe('fallback Claustrum credential resolution', () => {
             )
           },
         )
-        const pluginA = await getPlugin(undefined, undefined, {
-          claustrumConnector: concurrentConnector,
-        })
-
-        const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
-        const storageB = fallbackWithClaustrum({
-          id: 'fallback-b',
-          label: 'migration-b',
-          enabled: true,
-          claustrumHandle: `ckh_${'B'.repeat(43)}`,
-          claustrum: { mode: 'claustrum' },
-        })
-        await saveAccounts(storageB, accountPathB)
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
-        process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-          tempConfigDir!,
-          'sidebar-state-b.json',
-        )
-        const pluginB = await getPlugin(undefined, undefined, {
-          claustrumConnector: concurrentConnector,
-        })
+        let pluginA: Awaited<ReturnType<typeof getPlugin>> | undefined
+        let pluginB: Awaited<ReturnType<typeof getPlugin>> | undefined
         const originalRename = fs.rename
         const secondManifestRename = deferred()
         let manifestRenames = 0
@@ -3032,21 +3134,38 @@ describe('fallback Claustrum credential resolution', () => {
           },
         )
         try {
-          await Promise.race([
-            entered.promise,
-            Bun.sleep(5_000).then(() => {
-              throw new Error(
-                `concurrent credential calls did not both start (${credentialGets})`,
-              )
-            }),
-          ])
-          release.resolve()
-          await Promise.race([
-            secondManifestRename.promise,
-            Bun.sleep(5_000).then(() => {
-              throw new Error('concurrent migrations did not finish')
-            }),
-          ])
+          await withoutClaustrumWarmupDeadline(async (timerOverrides) => {
+            const pluginAPromise = getPlugin(undefined, undefined, {
+              ...timerOverrides,
+              claustrumConnector: concurrentConnector,
+            })
+            await firstEntered.promise
+
+            const storageB = fallbackWithClaustrum({
+              id: 'fallback-b',
+              label: 'migration-b',
+              enabled: true,
+              claustrumHandle: `ckh_${'B'.repeat(43)}`,
+              claustrum: { mode: 'claustrum' },
+            })
+            await saveAccounts(storageB, accountPathB)
+            process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
+            process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+              tempConfigDir!,
+              'sidebar-state-b.json',
+            )
+            const pluginBPromise = getPlugin(undefined, undefined, {
+              ...timerOverrides,
+              claustrumConnector: concurrentConnector,
+            })
+            await entered.promise
+            release.resolve()
+            ;[pluginA, pluginB] = await Promise.all([
+              pluginAPromise,
+              pluginBPromise,
+            ])
+          })
+          await secondManifestRename.promise
           const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
             providers: Array<{
               provider: string
@@ -3065,8 +3184,8 @@ describe('fallback Claustrum credential resolution', () => {
           ])
         } finally {
           rename.mockRestore()
-          await pluginA.dispose?.()
-          await pluginB.dispose?.()
+          await pluginA?.dispose?.()
+          await pluginB?.dispose?.()
           restore()
         }
       })
@@ -4742,6 +4861,48 @@ describe('fallback Claustrum credential resolution', () => {
           previousConnectionFile
     }
   })
+
+  test.serial(
+    'projects persisted quota for a vault-served tombstoned fallback without credentials',
+    async () => {
+      const handle = `ckh_${'Q'.repeat(43)}`
+      const vaultAccess = 'vault-work-alt-access'
+      const fixture = await bootRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [
+          {
+            label: 'work-alt',
+            handle,
+            access: vaultAccess,
+            account: { id: 'work-alt' },
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+      })
+
+      await drainSidebarWrites()
+      const state = await getSidebarState()
+      const fallback = state.fallbacks.find(
+        (account) => account.id === 'work-alt',
+      )
+      expect(fallback?.enabled).toBe(true)
+      expect(fallback?.vaultServed).toBe(true)
+      expect(fallback?.custodyState).toBe('on-vault-served')
+      expect(fallback?.quota?.five_hour?.remainingPercent).toBe(90)
+      expect(fallback?.quota?.seven_day?.remainingPercent).toBe(90)
+
+      const serialized = await readFile(getSidebarStateFile(), 'utf8')
+      expect(serialized).not.toContain(handle)
+      expect(serialized).not.toContain(vaultAccess)
+      expect(serialized).not.toContain('claustrum-tombstone:v1:anthropic')
+      await fixture.plugin.dispose?.()
+    },
+  )
 
   test.serial(
     'does not route a manifest-resolved account through a legacy per-account flag',
@@ -18864,6 +19025,48 @@ describe('auth.loader', () => {
       }),
     )
 
+    // Model the real host: the first ignored notice becomes the newest user
+    // message. A second notice must have a distinct ordered ID, registered
+    // before promptAsync emits its user-message event.
+    const firstNotice = mockClient.session.promptAsync.mock.calls[0]?.[0] as {
+      body: { messageID: string }
+    }
+    const originalMessages = await mockClient.session.messages!()
+    mockClient.session.messages = mock(async () => ({
+      data: [
+        ...originalMessages.data,
+        { info: { id: firstNotice.body.messageID, role: 'user' } },
+      ],
+    }))
+    const noticeWasTrackedAtDispatch: boolean[] = []
+    mockClient.session.promptAsync.mockImplementation(
+      async (input: unknown) => {
+        const notice = input as {
+          path: { id: string }
+          body: { messageID: string }
+        }
+        noticeWasTrackedAtDispatch.push(
+          typeof notice.body.messageID === 'string' &&
+            plugin.__isDesktopNoticeMessageForTest(
+              notice.path.id,
+              notice.body.messageID,
+            ),
+        )
+        await plugin.event?.({
+          event: {
+            type: 'message.updated',
+            properties: {
+              info: {
+                id: notice.body.messageID,
+                sessionID: notice.path.id,
+                role: 'user',
+              },
+            },
+          },
+        })
+      },
+    )
+
     const restoredResponse = await result.fetch(MESSAGES_URL, request)
     // OpenCode can publish the assistant-completed event before the wrapped
     // response emits its final fallback outcome. The idle event must flush a notice
@@ -18918,6 +19121,133 @@ describe('auth.loader', () => {
         }),
       }),
     )
+
+    const secondNotice = mockClient.session.promptAsync.mock.calls[1]?.[0] as {
+      body: { messageID: string }
+    }
+    expect(noticeWasTrackedAtDispatch).toEqual([true])
+    expect(secondNotice.body.messageID > firstNotice.body.messageID).toBe(true)
+    expect(secondNotice.body.messageID < latestAssistantMessageId).toBe(true)
+
+    // The host history still contains only notice 1. Notice 2's own event must
+    // leave the idle lease intact, and local allocation must avoid reusing its
+    // ID even before session.messages catches up. No new idle event is sent.
+    modelRequest = 0
+    const thirdTransition = await result.fetch(MESSAGES_URL, request)
+    await thirdTransition.text()
+    await waitForMockCall({
+      mock: {
+        get calls() {
+          return mockClient.session.promptAsync.mock.calls.slice(2)
+        },
+      },
+    })
+    const thirdNotice = mockClient.session.promptAsync.mock.calls[2]?.[0] as {
+      body: { messageID: string }
+    }
+    expect(thirdNotice.body.messageID > secondNotice.body.messageID).toBe(true)
+    expect(thirdNotice.body.messageID < latestAssistantMessageId).toBe(true)
+    expect(noticeWasTrackedAtDispatch).toEqual([true, true])
+
+    // A rapid fallback cycle can replace the pending switch notice while its
+    // asynchronous prompt-context lookup is still in flight. The stale send
+    // must stand down and the active flush must continue with the replacement.
+    mockClient.session.promptAsync.mockClear()
+    modelRequest = 0
+    const immediateMessages = mockClient.session.messages
+    let releasePromptContext: (() => void) | undefined
+    let messageLookups = 0
+    mockClient.session.messages = mock(() => {
+      messageLookups++
+      if (messageLookups > 1) {
+        return immediateMessages?.() ?? Promise.resolve({ data: [] })
+      }
+      return new Promise<{ data: unknown[] }>((resolve) => {
+        releasePromptContext = () => {
+          void Promise.resolve(immediateMessages?.()).then((response) =>
+            resolve(response ?? { data: [] }),
+          )
+        }
+      })
+    })
+    const overtakenRequest = {
+      ...request,
+      headers: { 'x-session-affinity': 'ses_server_fallback_overtaken' },
+    }
+    const overtakenFallback = await result.fetch(MESSAGES_URL, overtakenRequest)
+    await overtakenFallback.text()
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestUserMessageId,
+            sessionID: 'ses_server_fallback_overtaken',
+            role: 'user',
+          },
+        },
+      },
+    })
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_server_fallback_overtaken' },
+      },
+    })
+    for (let attempt = 0; attempt < 100 && !releasePromptContext; attempt++) {
+      await Bun.sleep(1)
+    }
+    expect(releasePromptContext).toBeDefined()
+
+    const overtakenRestoration = await result.fetch(
+      MESSAGES_URL,
+      overtakenRequest,
+    )
+    await overtakenRestoration.text()
+    releasePromptContext?.()
+    await waitForMockCall(mockClient.session.promptAsync)
+
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
+    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              text: expect.stringContaining('Returning to Fable 5.1'),
+            }),
+          ],
+        }),
+      }),
+    )
+    // Missing ordering context must retain the notice, never send a host-minted
+    // user ID. Once the host exposes a safe boundary, the same notice can drain.
+    mockClient.session.promptAsync.mockClear()
+    mockClient.session.messages = mock(async () => ({ data: [] }))
+    modelRequest = 0
+    const unplaced = await result.fetch(MESSAGES_URL, {
+      ...request,
+      headers: { 'x-session-affinity': 'ses_notice_unplaced' },
+    })
+    await unplaced.text()
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_notice_unplaced' },
+      },
+    })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(mockClient.session.messages).toHaveBeenCalled()
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+    mockClient.session.messages = immediateMessages
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_notice_unplaced' },
+      },
+    })
+    await waitForMockCall(mockClient.session.promptAsync)
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
   })
 
   test('downgrades a filtered Fable session for ten successful Opus turns and warms Fable after each', async () => {
@@ -19344,6 +19674,20 @@ describe('auth.loader', () => {
       event: {
         type: 'session.updated',
         properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    // The ignored switch notice is itself stored as a user message. Its event
+    // must not revoke the real user's idle-delivery lease for a newer notice.
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: switchNotificationMessageId,
+            sessionID: 'ses_fable_filter',
+            role: 'user',
+          },
+        },
       },
     })
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)

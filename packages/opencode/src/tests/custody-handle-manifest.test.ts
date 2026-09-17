@@ -446,7 +446,7 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
-  test('refuses a valid-shaped credential id that is not canonical for its label', async () => {
+  test('accepts an in-provider non-canonical credential id via the writer', async () => {
     await withTempDirectory(async (directory) => {
       const parent = join(directory, 'manifest')
       const path = join(parent, 'handles.json')
@@ -456,7 +456,33 @@ describe('writeCustodyHandleManifestEntry', () => {
       await expect(
         writeCustodyHandleManifestEntry({
           path,
-          entry: { ...writerEntry, credentialId: 'oauth:anthropic:other' },
+          entry: { ...writerEntry, credentialId: 'oauth:anthropic' },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+      const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+        providers: Array<{ accounts: Array<Record<string, unknown>> }>
+      }
+      expect(output.providers[0]?.accounts).toEqual([
+        {
+          label: writerEntry.label,
+          handle: writerEntry.handle,
+          credential_id: 'oauth:anthropic',
+        },
+      ])
+    })
+  })
+
+  test('refuses a credential id scoped to another provider', async () => {
+    await withTempDirectory(async (directory) => {
+      const parent = join(directory, 'manifest')
+      const path = join(parent, 'handles.json')
+      await fs.mkdir(parent)
+      await fs.chmod(parent, 0o700)
+
+      await expect(
+        writeCustodyHandleManifestEntry({
+          path,
+          entry: { ...writerEntry, credentialId: 'chatgpt:openai' },
         }),
       ).resolves.toEqual({ status: 'refused', reason: 'invalid entry' })
       await expect(fs.lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
@@ -517,6 +543,63 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('repairs a missing OAuth shape while retaining all accounts and foreign blocks', async () => {
+    const existingAccount = {
+      label: 'existing',
+      handle: `ckh_${'A'.repeat(43)}`,
+      credential_id: 'oauth:anthropic:existing',
+    }
+    const foreign = {
+      provider: 'minimax',
+      shape: 'api',
+      serve: 'minimax-auth',
+      accounts: [
+        {
+          label: 'shared',
+          handle: `ckh_${'B'.repeat(43)}`,
+          credential_id: 'api:minimax:shared',
+        },
+      ],
+      retained: { source: 'co-tenant' },
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          foreign,
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [existingAccount],
+          },
+        ],
+      }),
+      async (path) => {
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({ status: 'written' })
+
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<Record<string, unknown>>
+        }
+        expect(output.providers[0]).toEqual(foreign)
+        expect(output.providers[1]).toEqual({
+          provider: 'anthropic',
+          shape: 'oauth',
+          serve: 'anthropic-auth',
+          accounts: [
+            existingAccount,
+            {
+              label: writerEntry.label,
+              handle: writerEntry.handle,
+              credential_id: writerEntry.credentialId,
+            },
+          ],
+        })
+      },
+    )
+  })
+
   test('preserves an oddly formatted foreign block structurally', async () => {
     const foreign = {
       provider: 'deepseek',
@@ -542,6 +625,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         providers: [
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -589,6 +673,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         providers: [
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -1026,6 +1111,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         providers: [
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -1079,6 +1165,7 @@ describe('removeCustodyHandleManifestEntry', () => {
           foreign,
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -1101,6 +1188,7 @@ describe('removeCustodyHandleManifestEntry', () => {
         expect(serialize(output.providers[0])).toBe(beforeForeign)
         expect(output.providers[1]).toEqual({
           provider: 'anthropic',
+          shape: 'oauth',
           serve: 'anthropic-auth',
           accounts: [],
         })
@@ -1655,27 +1743,30 @@ describe('withCustodyManifestLock', () => {
   test.serial('reports a held lock as lock_busy', async () => {
     await withTempDirectory(async (directory) => {
       const path = join(directory, 'handles.json')
-      const firstEntered = Promise.withResolvers<void>()
-      const releaseFirst = Promise.withResolvers<void>()
+      const lockPath = `${path}.lock`
+      const times = [0, 29, 30]
+      let timeIndex = 0
+      await fs.mkdir(lockPath, { mode: 0o700 })
+      await fs.writeFile(
+        join(lockPath, 'owner'),
+        `${JSON.stringify({
+          tenant: 'anthropic-auth',
+          pid: process.pid,
+          claimed_at_ms: 0,
+          nonce: 'held-test',
+        })}\n`,
+      )
       __setCustodyManifestLockTestOptions({
-        ttlMs: 150,
-        retryMinMs: 5,
-        retryMaxMs: 5,
-        renewalIntervalMs: 15,
+        ttlMs: 30,
+        retryMinMs: 1,
+        retryMaxMs: 1,
+        now: () => times[Math.min(timeIndex++, times.length - 1)]!,
       })
-      const first = withCustodyManifestLock(path, async () => {
-        firstEntered.resolve()
-        await releaseFirst.promise
-      })
-      try {
-        await firstEntered.promise
-        await expect(
-          withCustodyManifestLock(path, async () => 'acquired'),
-        ).rejects.toMatchObject({ code: 'lock_busy' })
-      } finally {
-        releaseFirst.resolve()
-        await first
-      }
+
+      await expect(
+        withCustodyManifestLock(path, async () => 'acquired'),
+      ).rejects.toMatchObject({ code: 'lock_busy' })
+      await expect(fs.lstat(lockPath)).resolves.toBeDefined()
     })
   })
 
@@ -1998,7 +2089,8 @@ describe('resolveCustodyHandle', () => {
       | 'duplicate-label'
       | 'missing-entry'
       | 'foreign-serve'
-      | 'superseded',
+      | 'superseded'
+      | 'corrupt-binding',
   ) {
     expect(result.status).toBe('unresolved')
     if (result.status !== 'unresolved')
@@ -2098,21 +2190,67 @@ describe('resolveCustodyHandle', () => {
     )
   })
 
-  test('requires the canonical OAuth credential ID rather than the UUID', () => {
+  test("returns the entry's own credential id verbatim", () => {
     const result = resolveCustodyHandle({
-      account: account({ id: 'uuid-not-a-label', label: 'alice' }),
+      account: account({ id: 'uuid-not-a-label', label: 'main' }),
       manifest: manifest({
         accounts: [
           {
-            label: 'alice',
+            label: 'main',
             handle: activeHandle,
-            credential_id: 'uuid-not-a-label',
+            credential_id: 'oauth:anthropic',
           },
         ],
       }),
     })
 
-    expectUnresolvedReason(result, 'missing-entry')
+    expect(result.status).toBe('resolved')
+    if (result.status !== 'resolved')
+      throw new Error('expected resolved handle')
+    expect(result.source).toBe('manifest')
+    if (result.source !== 'manifest')
+      throw new Error('expected manifest source')
+    expect(result.credentialId).toBe('oauth:anthropic')
+  })
+
+  test('marks every duplicate-label entry as corrupt-binding and refuses to resolve', () => {
+    const parsed = readCustodyHandles(
+      {
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'alice',
+                handle: activeHandle,
+                credential_id: 'oauth:anthropic:alice',
+              },
+              {
+                label: 'alice',
+                handle: otherHandle,
+                credential_id: 'oauth:anthropic:alice',
+              },
+            ],
+          },
+        ],
+      },
+      'anthropic',
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set(['alice']))
+    expect(parsed.accounts).toEqual([])
+
+    const result = resolveCustodyHandle({
+      account: account({ label: 'alice' }),
+      manifest: {
+        ...manifest(),
+        accounts: parsed.accounts,
+        corruptLabels: parsed.corruptLabels,
+      },
+    })
+    expectUnresolvedReason(result, 'corrupt-binding')
   })
 
   test('never falls back to legacy for a foreign serve', () => {
