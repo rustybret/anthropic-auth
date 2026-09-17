@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
+import { testRender } from '@opentui/solid'
 import type { AccountDialogKnobs } from '../rpc/protocol'
 import {
   buildAccountDialogL1,
@@ -9,6 +10,7 @@ import {
   buildPrimeStatusRows,
   handlePrimeStatusOption,
   normalizeAccountDialogPayload,
+  openCommandDialog,
   PRIME_DIALOG_OPTIONS,
   retainAccountDialogProjection,
 } from '../tui/command-dialogs'
@@ -364,5 +366,157 @@ describe('openCommandDialog — global custody mode', () => {
       command: 'claude-account',
       arguments: 'local',
     })
+  })
+
+  test('renders refusal message directly in the dialog without hidden toast', async () => {
+    let currentRender: (() => unknown) | undefined
+    let toastCall: { message: string } | undefined
+    let selectProps:
+      | {
+          options: { value: string }[]
+          onSelect: (opt: { value: string }) => void
+        }
+      | undefined
+
+    const mockApi = {
+      ui: {
+        dialog: {
+          setSize: () => {},
+          replace: (fn: () => unknown) => {
+            currentRender = fn
+          },
+          clear: () => {},
+        },
+        toast: (opts: { message: string }) => {
+          toastCall = opts
+        },
+        DialogSelect: (props: any) => {
+          selectProps = props
+          return null
+        },
+      },
+    } as any
+
+    const apply = async () => ({
+      text: 'Custody takeover refused:\n- main: TAKEOVER_INCOMPLETE_MAIN_REAL',
+      knobs: {},
+    })
+
+    openCommandDialog(
+      mockApi,
+      {
+        command: 'claude-account',
+        text: 'Claude Accounts',
+        knobs: {
+          accounts: accountRows,
+          claustrumDetection: 'ready',
+          custodyMode: 'local',
+          custodyModeKnown: true,
+        },
+      },
+      apply,
+    )
+
+    expect(currentRender).toBeDefined()
+    const t1 = await testRender(currentRender!)
+    t1.renderOnce()
+    expect(selectProps).toBeDefined()
+
+    const custodyOption = selectProps!.options.find(
+      (o) => o.value === '__custody-mode__',
+    )
+    expect(custodyOption).toBeDefined()
+
+    selectProps!.onSelect(custodyOption!)
+    await Bun.sleep(50)
+
+    // Verify rendered output has the error in red
+    const t2 = await testRender(currentRender!)
+    await t2.flush()
+    t2.renderOnce()
+    const allText = t2
+      .captureSpans()
+      .lines.map((l) => l.spans.map((s) => s.text).join(''))
+      .join('\n')
+    expect(allText).toContain('Custody takeover refused:')
+    expect(allText).toContain('- main: TAKEOVER_INCOMPLETE_MAIN_REAL')
+
+    const redSpan = t2
+      .captureSpans()
+      .lines.flatMap((l) => l.spans)
+      .find((s) => s.text.includes('Custody takeover refused:'))
+    expect(redSpan?.fg?.toInts()).toEqual([239, 68, 68, 255])
+    // Toast should not be shown on refusal/error
+    expect(toastCall).toBeUndefined()
+  })
+
+  test('renders unexpected apply rejection error in the dialog', async () => {
+    let currentRender: (() => unknown) | undefined
+    let selectProps:
+      | {
+          options: { value: string }[]
+          onSelect: (opt: { value: string }) => void
+        }
+      | undefined
+
+    const mockApi = {
+      ui: {
+        dialog: {
+          setSize: () => {},
+          replace: (fn: () => unknown) => {
+            currentRender = fn
+          },
+          clear: () => {},
+        },
+        toast: () => {},
+        DialogSelect: (props: any) => {
+          selectProps = props
+          return null
+        },
+      },
+    } as any
+
+    const apply = async () => {
+      throw new Error('daemon connection reset')
+    }
+
+    openCommandDialog(
+      mockApi,
+      {
+        command: 'claude-account',
+        text: 'Claude Accounts',
+        knobs: {
+          accounts: accountRows,
+          claustrumDetection: 'ready',
+          custodyMode: 'local',
+          custodyModeKnown: true,
+        },
+      },
+      apply,
+    )
+
+    const t1 = await testRender(currentRender!)
+    t1.renderOnce()
+
+    const custodyOption = selectProps!.options.find(
+      (o) => o.value === '__custody-mode__',
+    )
+    selectProps!.onSelect(custodyOption!)
+    await Bun.sleep(50)
+
+    const t2 = await testRender(currentRender!)
+    await t2.flush()
+    t2.renderOnce()
+    const allText = t2
+      .captureSpans()
+      .lines.map((l) => l.spans.map((s) => s.text).join(''))
+      .join('\n')
+    expect(allText).toContain('Error: daemon connection reset')
+
+    const redSpan = t2
+      .captureSpans()
+      .lines.flatMap((l) => l.spans)
+      .find((s) => s.text.includes('Error: daemon connection reset'))
+    expect(redSpan?.fg?.toInts()).toEqual([239, 68, 68, 255])
   })
 })

@@ -961,7 +961,8 @@ const CLAUSTRUM_REAUTH_WARM_BACKOFF_MS = FALLBACK_BACKGROUND_TICK_MS
 
 function getConfiguredClaustrumConnectionFile(): string | undefined {
   const configured =
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim()
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim() ||
+    process.env.CLAUSTRUM_SUBC_CONNECTION?.trim()
   return configured || undefined
 }
 
@@ -3663,12 +3664,15 @@ const anthropicAuthPlugin = async (
             id: account.id,
             label: account.label,
             tierLabel: formatOAuthAccountTier(account.profile),
-            // Token-aware read: if a fallback account was re-logged with the same
-            // id/label, an old in-memory quota snapshot must not be shown as the
-            // new account's quota.
+            // Token-aware read: local access or a live vault-served tombstone
+            // qualifies the lineage-bound cache read. If a fallback account was
+            // re-logged with the same id/label, an old in-memory quota snapshot
+            // must not be shown as the new account's quota; vault-served
+            // tombstones have no local access by design, but their live binding
+            // proves the snapshot belongs to the currently served account.
             quota: options.skipFallbackQuotaSeed
               ? null
-              : account.access
+              : account.access || vaultServed
                 ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
                 : null,
             // A fallback with a permanently-dead refresh token (400 invalid_grant)
@@ -5545,6 +5549,7 @@ const anthropicAuthPlugin = async (
             if (!(error instanceof CustodyStateMismatchError)) throw error
             custodyStartupMismatchVerdict = error.verdict
             return {
+              apiKey: '',
               fetch: async () => {
                 throw error
               },
@@ -5567,6 +5572,7 @@ const anthropicAuthPlugin = async (
             !isCustodyTombstoneOAuth(auth, 'anthropic')
           ) {
             return {
+              apiKey: '',
               fetch: async () => claustrumMainRefusal('takeover-incomplete'),
             }
           }
@@ -5585,6 +5591,8 @@ const anthropicAuthPlugin = async (
             }
           }
           mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
+          mainQuotaAccountId ??=
+            mainCustody.anthropicAccountUuid ?? mainAccountId
           if (auth.access) {
             await resolveMainQuotaAccountIdentity(auth.access)
           }
@@ -6427,7 +6435,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-opencode-session')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
-            let body = init?.body
+            let body = await fetchBody(input, init)
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
               : null

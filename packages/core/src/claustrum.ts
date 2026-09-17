@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { type Dirent, constants as fsConstants } from 'node:fs'
+import {
+  type Dirent,
+  constants as fsConstants,
+  readdirSync,
+  statSync,
+} from 'node:fs'
 import * as fs from 'node:fs/promises'
-import { homedir, userInfo } from 'node:os'
+import { homedir, tmpdir, userInfo } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import {
   type BindIdentity,
@@ -46,9 +51,106 @@ export type ClaustrumDetection =
       reason: string
     }
 
-export function getDefaultClaustrumConnectionPath(): string {
+export const PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME = 'subc-connection.json'
+const CLAUSTRUM_TEMP_PREFIX = 'subc-'
+const CLAUSTRUM_TEMP_SUFFIX = '.connection.json'
+
+function safeIsFile(path: string): boolean {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+function listSubcTempConnectionFiles(dir: string): string[] {
+  let entries: string[]
+  try {
+    entries = readdirSync(dir) as string[]
+  } catch {
+    return []
+  }
+  const matches: string[] = []
+  for (const name of entries) {
+    if (typeof name !== 'string') continue
+    if (
+      !name.startsWith(CLAUSTRUM_TEMP_PREFIX) ||
+      !name.endsWith(CLAUSTRUM_TEMP_SUFFIX)
+    ) {
+      continue
+    }
+    const candidate = join(dir, name)
+    if (safeIsFile(candidate)) matches.push(candidate)
+  }
+  matches.sort()
+  return matches
+}
+
+export function findExistingClaustrumConnectionPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const runtime = env.XDG_RUNTIME_DIR?.trim()
+  if (runtime) {
+    const candidate = join(runtime, PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME)
+    if (safeIsFile(candidate)) return candidate
+  }
+  const home = env.HOME?.trim()
+  if (home) {
+    const candidate = join(
+      home,
+      '.local',
+      'share',
+      'cortexkit',
+      'run',
+      PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME,
+    )
+    if (safeIsFile(candidate)) return candidate
+  }
   const uid = process.getuid?.() ?? userInfo().uid
-  return `/run/user/${uid}/subc-connection.json`
+  const linuxRun = `/run/user/${uid}/${PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME}`
+  if (safeIsFile(linuxRun)) return linuxRun
+
+  const tempMatches = listSubcTempConnectionFiles(tmpdir())
+  if (tempMatches.length === 1) return tempMatches[0]
+
+  return undefined
+}
+
+export function getDefaultClaustrumConnectionPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const existing = findExistingClaustrumConnectionPath(env)
+  if (existing) return existing
+
+  const runtime = env.XDG_RUNTIME_DIR?.trim()
+  if (runtime && (process.platform !== 'darwin' || safeIsFile(runtime))) {
+    return join(runtime, PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME)
+  }
+  if (process.platform === 'darwin') {
+    const home = env.HOME?.trim() || userInfo().homedir
+    return join(
+      home,
+      '.local',
+      'share',
+      'cortexkit',
+      'run',
+      PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME,
+    )
+  }
+  const uid = process.getuid?.() ?? userInfo().uid
+  return `/run/user/${uid}/${PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME}`
+}
+
+export function resolveClaustrumConnectionPath(
+  explicit?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return (
+    explicit?.trim() ||
+    env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim() ||
+    env.CLAUSTRUM_SUBC_CONNECTION?.trim() ||
+    getDefaultClaustrumConnectionPath(env)
+  )
 }
 
 type CustodyHandlesEnvironment = Readonly<Record<string, string | undefined>>
@@ -89,8 +191,9 @@ function isEndpoint(value: unknown): value is ClaustrumEndpoint {
 }
 
 export async function detectClaustrumConnection(
-  path = getDefaultClaustrumConnectionPath(),
+  explicitPath?: string,
 ): Promise<ClaustrumDetection> {
+  const path = resolveClaustrumConnectionPath(explicitPath)
   let raw: string
   try {
     raw = await fs.readFile(path, 'utf8')
@@ -1272,6 +1375,7 @@ export async function writeCustodyHandleManifestEntryLocked(
       ...providers,
       {
         provider: 'anthropic',
+        shape: 'oauth',
         serve: 'anthropic-auth',
         accounts: [
           {
@@ -1293,6 +1397,7 @@ export async function writeCustodyHandleManifestEntryLocked(
       matching.length === 1 &&
       matching[0]?.handle === input.entry.handle &&
       matching[0]?.credential_id === input.entry.credentialId &&
+      block.shape === 'oauth' &&
       !corruptLabels.has(input.entry.label)
     ) {
       return { status: 'unchanged' }
@@ -1317,7 +1422,7 @@ export async function writeCustodyHandleManifestEntryLocked(
       replacement,
     )
     nextProviders = providers.map((provider, index) =>
-      index === blockIndex ? { ...block, accounts } : provider,
+      index === blockIndex ? { ...block, shape: 'oauth', accounts } : provider,
     )
   }
 
@@ -1404,7 +1509,7 @@ export class ClaustrumClient {
     options: ClaustrumClientOptions = {},
   ): Promise<ClaustrumClient> {
     const connectionFile =
-      options.connectionFile ?? getDefaultClaustrumConnectionPath()
+      options.connectionFile ?? resolveClaustrumConnectionPath()
     const connector =
       options.connector ??
       ((connectOptions) => SubcClient.connect(connectOptions))

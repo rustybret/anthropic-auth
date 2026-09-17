@@ -561,6 +561,7 @@ export function openCommandDialog(
   if (payload.command === 'claude-account') {
     let accountKnobs: Record<string, unknown> = payload.knobs
     const accounts = normalizeAccountDialogPayload(accountKnobs).accounts
+    let statusMessage: { text: string; error?: boolean } | undefined
 
     const updateAccounts = (r: {
       text: string
@@ -582,26 +583,50 @@ export function openCommandDialog(
         <box flexDirection='column' padding={1} width='100%'>
           <text>{`Claustrum: ${normalizeAccountDialogPayload(accountKnobs).claustrumDetection}`}</text>
           <text>{l1.header}</text>
+          {statusMessage && (
+            <box marginTop={1}>
+              <text fg={statusMessage.error ? '#ef4444' : '#22c55e'}>
+                {statusMessage.text}
+              </text>
+            </box>
+          )}
           <box marginTop={1}>
             <DialogSelect
               title='Claude accounts'
               options={l1.options}
               onSelect={(option) => {
                 if (option.value === '__add__') {
+                  statusMessage = undefined
                   openAddType()
                   return
                 }
                 if (option.value === '__custody-mode__' && l1.modeAction) {
-                  void apply(
-                    l1.modeAction.command,
-                    l1.modeAction.arguments,
-                  ).then((r) => {
-                    api.ui.toast({ message: r.text })
-                    updateAccounts(r)
-                    buildL1()
-                  })
+                  void apply(l1.modeAction.command, l1.modeAction.arguments)
+                    .then((r) => {
+                      const isRefusalOrError =
+                        r.text.includes('refused') ||
+                        r.text.includes('unavailable') ||
+                        r.text.includes('failed') ||
+                        r.text.includes('Error') ||
+                        r.text.includes('error')
+                      if (isRefusalOrError) {
+                        statusMessage = { text: r.text, error: true }
+                      } else {
+                        statusMessage = { text: r.text, error: false }
+                        api.ui.toast({ message: r.text })
+                      }
+                      updateAccounts(r)
+                      buildL1()
+                    })
+                    .catch((err) => {
+                      const msg =
+                        err instanceof Error ? err.message : String(err)
+                      statusMessage = { text: `Error: ${msg}`, error: true }
+                      buildL1()
+                    })
                   return
                 }
+                statusMessage = undefined
                 const account = accounts.find((a) => a.id === option.value)
                 if (!account) return
                 if (account.role === 'main') {
@@ -939,13 +964,18 @@ export function openCommandDialog(
                   title={`Remove ${account.label}?`}
                   message={`Are you sure you want to remove the fallback account "${account.label}"?`}
                   onConfirm={() => {
-                    void apply('claude-account', `remove ${account.id}`).then(
-                      (r) => {
+                    void apply('claude-account', `remove ${account.id}`)
+                      .then((r) => {
                         api.ui.toast({ message: r.text })
                         updateAccounts(r)
                         buildL1()
-                      },
-                    )
+                      })
+                      .catch((err) => {
+                        const msg =
+                          err instanceof Error ? err.message : String(err)
+                        statusMessage = { text: `Error: ${msg}`, error: true }
+                        buildL1()
+                      })
                   }}
                   onCancel={() => openManage(account, isMain)}
                 />
@@ -954,18 +984,24 @@ export function openCommandDialog(
             }
 
             const args = `${option.value} ${account.id}`
-            void apply('claude-account', args).then((r) => {
-              api.ui.toast({ message: r.text })
-              updateAccounts(r)
-              const updatedList = normalizeAccountDialogPayload(
-                r.knobs,
-              ).accounts
-              const refreshed =
-                (updatedList && updatedList.length > 0
-                  ? updatedList.find((a) => a.id === account.id)
-                  : undefined) ?? account
-              openManage(refreshed, isMain)
-            })
+            void apply('claude-account', args)
+              .then((r) => {
+                api.ui.toast({ message: r.text })
+                updateAccounts(r)
+                const updatedList = normalizeAccountDialogPayload(
+                  r.knobs,
+                ).accounts
+                const refreshed =
+                  (updatedList && updatedList.length > 0
+                    ? updatedList.find((a) => a.id === account.id)
+                    : undefined) ?? account
+                openManage(refreshed, isMain)
+              })
+              .catch((err) => {
+                const msg = err instanceof Error ? err.message : String(err)
+                statusMessage = { text: `Error: ${msg}`, error: true }
+                buildL1()
+              })
           }}
         />
       ))

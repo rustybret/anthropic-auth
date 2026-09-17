@@ -543,6 +543,63 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('repairs a missing OAuth shape while retaining all accounts and foreign blocks', async () => {
+    const existingAccount = {
+      label: 'existing',
+      handle: `ckh_${'A'.repeat(43)}`,
+      credential_id: 'oauth:anthropic:existing',
+    }
+    const foreign = {
+      provider: 'minimax',
+      shape: 'api',
+      serve: 'minimax-auth',
+      accounts: [
+        {
+          label: 'shared',
+          handle: `ckh_${'B'.repeat(43)}`,
+          credential_id: 'api:minimax:shared',
+        },
+      ],
+      retained: { source: 'co-tenant' },
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          foreign,
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [existingAccount],
+          },
+        ],
+      }),
+      async (path) => {
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({ status: 'written' })
+
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<Record<string, unknown>>
+        }
+        expect(output.providers[0]).toEqual(foreign)
+        expect(output.providers[1]).toEqual({
+          provider: 'anthropic',
+          shape: 'oauth',
+          serve: 'anthropic-auth',
+          accounts: [
+            existingAccount,
+            {
+              label: writerEntry.label,
+              handle: writerEntry.handle,
+              credential_id: writerEntry.credentialId,
+            },
+          ],
+        })
+      },
+    )
+  })
+
   test('preserves an oddly formatted foreign block structurally', async () => {
     const foreign = {
       provider: 'deepseek',
@@ -568,6 +625,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         providers: [
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -615,6 +673,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         providers: [
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -1052,6 +1111,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         providers: [
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -1105,6 +1165,7 @@ describe('removeCustodyHandleManifestEntry', () => {
           foreign,
           {
             provider: 'anthropic',
+            shape: 'oauth',
             serve: 'anthropic-auth',
             accounts: [
               {
@@ -1127,6 +1188,7 @@ describe('removeCustodyHandleManifestEntry', () => {
         expect(serialize(output.providers[0])).toBe(beforeForeign)
         expect(output.providers[1]).toEqual({
           provider: 'anthropic',
+          shape: 'oauth',
           serve: 'anthropic-auth',
           accounts: [],
         })

@@ -69,5 +69,8 @@
     "@opentui/solid": "0.5.11",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@ai-sdk/anthropic": "3.0.111"
   }
 }

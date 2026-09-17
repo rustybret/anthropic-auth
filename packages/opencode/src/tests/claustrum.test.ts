@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -166,15 +173,45 @@ describe('Claustrum connection detection', () => {
     })
   })
 
-  test('derives the default connection path from the current uid', async () => {
+  test('resolves an existing connection file from HOME or XDG_RUNTIME_DIR', async () => {
+    const customHome = join(tempDir, 'home')
+    const customRunDir = join(customHome, '.local', 'share', 'cortexkit', 'run')
+    await mkdir(customRunDir, { recursive: true })
+    const homeConn = join(customRunDir, 'subc-connection.json')
+    await writeFile(homeConn, '{}')
+
+    expect(getDefaultClaustrumConnectionPath({ HOME: customHome })).toBe(
+      homeConn,
+    )
+
+    const customRuntime = join(tempDir, 'runtime')
+    await mkdir(customRuntime, { recursive: true })
+    const runtimeConn = join(customRuntime, 'subc-connection.json')
+    await writeFile(runtimeConn, '{}')
+
+    expect(
+      getDefaultClaustrumConnectionPath({
+        HOME: customHome,
+        XDG_RUNTIME_DIR: customRuntime,
+      }),
+    ).toBe(runtimeConn)
+  })
+
+  test('derives the default connection path from the current uid on linux fallback', async () => {
     const originalGetuid = process.getuid
+    const originalPlatform = process.platform
     Object.defineProperty(process, 'getuid', { value: () => 4242 })
+    Object.defineProperty(process, 'platform', { value: 'linux' })
     try {
-      expect(getDefaultClaustrumConnectionPath()).toBe(
-        '/run/user/4242/subc-connection.json',
-      )
+      expect(
+        getDefaultClaustrumConnectionPath({
+          HOME: join(tempDir, 'empty-home'),
+          XDG_RUNTIME_DIR: undefined,
+        }),
+      ).toBe('/run/user/4242/subc-connection.json')
     } finally {
       Object.defineProperty(process, 'getuid', { value: originalGetuid })
+      Object.defineProperty(process, 'platform', { value: originalPlatform })
     }
   })
 })

@@ -3,6 +3,7 @@ import { dirname } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import {
   type ClaustrumTakeoverPlan,
+  CUSTODY_PREFLIGHT_MIN_TTL_MS,
   type CustodyCacheCredential,
   type CustodyPreflightRefusal,
   CustodyPreflightRefusedError,
@@ -382,7 +383,7 @@ export function createLiveCustodyDeps(input: {
         for (const account of plan.accounts) {
           const credential = await getCredential(
             account.handle,
-            core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
+            CUSTODY_PREFLIGHT_MIN_TTL_MS,
           )
           if (
             credential.state !== 'usable' ||
@@ -390,8 +391,7 @@ export function createLiveCustodyDeps(input: {
               credential.credentialId !== account.credentialId) ||
             credential.recordVersion < account.recordVersion ||
             (credential.expiresAt !== null &&
-              credential.expiresAt <
-                now() + core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000)
+              credential.expiresAt < now() + CUSTODY_PREFLIGHT_MIN_TTL_MS)
           )
             return false
           if (account.id === 'main') continue

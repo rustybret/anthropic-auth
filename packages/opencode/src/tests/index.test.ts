@@ -4817,6 +4817,48 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test.serial(
+    'projects persisted quota for a vault-served tombstoned fallback without credentials',
+    async () => {
+      const handle = `ckh_${'Q'.repeat(43)}`
+      const vaultAccess = 'vault-work-alt-access'
+      const fixture = await bootRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [
+          {
+            label: 'work-alt',
+            handle,
+            access: vaultAccess,
+            account: { id: 'work-alt' },
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+      })
+
+      await drainSidebarWrites()
+      const state = await getSidebarState()
+      const fallback = state.fallbacks.find(
+        (account) => account.id === 'work-alt',
+      )
+      expect(fallback?.enabled).toBe(true)
+      expect(fallback?.vaultServed).toBe(true)
+      expect(fallback?.custodyState).toBe('on-vault-served')
+      expect(fallback?.quota?.five_hour?.remainingPercent).toBe(90)
+      expect(fallback?.quota?.seven_day?.remainingPercent).toBe(90)
+
+      const serialized = await readFile(getSidebarStateFile(), 'utf8')
+      expect(serialized).not.toContain(handle)
+      expect(serialized).not.toContain(vaultAccess)
+      expect(serialized).not.toContain('claustrum-tombstone:v1:anthropic')
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
     'does not route a manifest-resolved account through a legacy per-account flag',
     async () => {
       const calls: CredentialCall[] = []
