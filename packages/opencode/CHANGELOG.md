@@ -10,6 +10,8 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Give consecutive Desktop fallback notices distinct, pre-registered message IDs before the assistant; defer delivery when safe ordering is unavailable and bound notice tracking across sessions (#230).
+
 - Publish account UUIDs and credential-lineage provenance in the sanitized quota-header feed while fencing stale lease cleanup.
 - Bind persisted main-quota ordering to the account-bound snapshot's embedded `checkedAt` value, preventing a concurrent unbound `mainQuotaCheckedAt` value from making stale state replace a newer in-memory or on-disk observation.
 - Harden global Claustrum takeover as a resumable fail-closed transition: repeated commands accept already tombstoned fallbacks, failed partial commits never restore whole-file snapshots over concurrent account edits, local fallback login is refused before OAuth while custody is active, and main-account Prime uses the resident vault credential for quota checks and sends with version-fenced 401 reporting.

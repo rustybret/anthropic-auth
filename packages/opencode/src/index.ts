@@ -614,8 +614,17 @@ function notificationMessageIdBeforeAssistant(
   if (encoded <= 0n) return undefined
   const previous = (encoded - 1n).toString(16).padStart(12, '0')
   const candidate = `msg_${previous}${'z'.repeat(14)}`
-  if (latestUserMessageId && candidate <= latestUserMessageId) return undefined
-  return candidate
+  // A previous ignored notice is itself a user message. Extend that lower
+  // bound rather than falling back to a host-assigned (post-assistant) ID.
+  const ordered =
+    latestUserMessageId && candidate <= latestUserMessageId
+      ? `${latestUserMessageId}z`
+      : candidate
+  // Bound repeated suffix growth and fail closed for incompatible host IDs.
+  if (ordered.length > 128 || ordered >= latestAssistantMessageId) {
+    return undefined
+  }
+  return ordered
 }
 
 async function sendIgnoredMessage(
@@ -627,6 +636,7 @@ async function sendIgnoredMessage(
     beforeActiveAssistant?: boolean
     canSend?: () => boolean
     onPreparedMessageId?: (messageId: string) => void
+    latestPreparedMessageId?: () => string | undefined
   } = {},
 ): Promise<boolean> {
   const session = ctx.client.session as PluginSessionClient | undefined
@@ -639,13 +649,20 @@ async function sendIgnoredMessage(
     },
   }
   if (options.beforeActiveAssistant) {
+    const preparedId = options.latestPreparedMessageId?.()
+    const userId = promptContext?.latestUserMessageId
+    const lowerBound =
+      preparedId && (!userId || preparedId > userId) ? preparedId : userId
     const messageID = promptContext?.latestAssistantMessageId
       ? notificationMessageIdBeforeAssistant(
           promptContext.latestAssistantMessageId,
-          promptContext.latestUserMessageId,
+          lowerBound,
         )
       : undefined
-    if (messageID) request.body.messageID = messageID
+    // Never let the host mint a newer user ID for a desktop notice: it can
+    // become pending work. Retain the notice for a later safe boundary instead.
+    if (!messageID) return false
+    request.body.messageID = messageID
   }
   if (promptContext?.agent) request.body.agent = promptContext.agent
   if (promptContext?.model) request.body.model = promptContext.model
@@ -4072,7 +4089,13 @@ const anthropicAuthPlugin = async (
       if (typeof oldest !== 'string') break
       messageIds.delete(oldest)
     }
+    desktopNoticeMessageIds.delete(sessionId)
     desktopNoticeMessageIds.set(sessionId, messageIds)
+    while (desktopNoticeMessageIds.size > 128) {
+      const oldestSession = desktopNoticeMessageIds.keys().next().value
+      if (typeof oldestSession !== 'string') break
+      desktopNoticeMessageIds.delete(oldestSession)
+    }
   }
 
   function isDesktopNoticeMessage(sessionId: string, messageId?: string) {
@@ -4199,6 +4222,8 @@ const anthropicAuthPlugin = async (
               desktopNoticeSafeSessions.has(sessionId) && isCurrentNotice(),
             onPreparedMessageId: (messageId) =>
               trackDesktopNoticeMessageId(sessionId, messageId),
+            latestPreparedMessageId: () =>
+              [...(desktopNoticeMessageIds.get(sessionId) ?? [])].at(-1),
           })
           if (!sent) {
             if (
@@ -8915,6 +8940,11 @@ const anthropicAuthPlugin = async (
     get __claustrumCredentialCache() {
       return claustrumCredentialCache
     },
+    __notificationMessageIdBeforeAssistantForTest:
+      notificationMessageIdBeforeAssistant,
+    __trackDesktopNoticeMessageIdForTest: trackDesktopNoticeMessageId,
+    __isDesktopNoticeMessageForTest: isDesktopNoticeMessage,
+
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }
