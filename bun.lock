@@ -15,16 +15,16 @@
         "dedent": "^1.7.2",
         "lefthook": "2.1.12",
         "miniflare": "^4.20260730.0",
-        "typescript": "7.0.2"
-      }
+        "typescript": "7.0.2",
+      },
     },
     "packages/core": {
       "name": "@cortexkit/anthropic-auth-core",
       "version": "1.22.0",
       "dependencies": {
         "@cortexkit/subc-client": "^0.11.1",
-        "xxhash-wasm": "^1.1.0"
-      }
+        "xxhash-wasm": "^1.1.0",
+      },
     },
     "packages/e2e-tests": {
       "name": "@cortexkit/anthropic-auth-e2e",
@@ -36,22 +36,22 @@
       "name": "@cortexkit/opencode-anthropic-auth",
       "version": "1.22.0",
       "bin": {
-        "opencode-anthropic-auth": "dist/cli.js"
+        "opencode-anthropic-auth": "dist/cli.js",
       },
       "dependencies": {
         "@cortexkit/anthropic-auth-core": "1.22.0",
         "@opentui/core": "0.5.11",
         "@opentui/solid": "0.5.11",
         "jsonc-parser": "^3.3.1",
-        "solid-js": "1.9.12"
+        "solid-js": "1.9.12",
       },
       "devDependencies": {
         "@ai-sdk/anthropic": "3.0.111",
-        "@cortexkit/subc-client": "^0.8.1"
+        "@cortexkit/subc-client": "^0.11.1",
       },
       "peerDependencies": {
-        "@opencode-ai/plugin": "*"
-      }
+        "@opencode-ai/plugin": "*",
+      },
     },
     "packages/pi": {
       "name": "@cortexkit/pi-anthropic-auth",
@@ -62,9 +62,9 @@
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
-        "@earendil-works/pi-tui": "*"
-      }
-    }
+        "@earendil-works/pi-tui": "*",
+      },
+    },
   },
   "packages": {
     "@ai-sdk/anthropic": ["@ai-sdk/anthropic@3.0.111", "", { "dependencies": { "@ai-sdk/provider": "3.0.15", "@ai-sdk/provider-utils": "4.0.46" }, "peerDependencies": { "zod": "^3.25.76 || ^4.1.8" } }, "sha512-atgBW8jZPr/KuaKX5FvDIHuXBI8VCol6kVeoD4P0657+VXR73QsLogXQVN/Zt5FHtq9WzpdIZseCJiXPqkgwwA=="],
@@ -922,8 +922,6 @@
     "@babel/helper-compilation-targets/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@babel/helper-create-class-features-plugin/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
-
-    "@cortexkit/opencode-anthropic-auth/@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
 
     "@google/genai/ws": ["ws@8.20.0", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA=="],
 

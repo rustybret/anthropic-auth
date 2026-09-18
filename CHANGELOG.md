@@ -12,6 +12,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Enroll newly bound Claustrum OAuth accounts into the OpenCode routing pool at startup or live without a restart, after exact credential-ID and provider-account verification; immediately prime quota for sticky-balanced routing, persist only secret-free tombstone rows, preserve disabled accounts, and recover missed manifest watch events with one process-shared metadata poll.
+- Remove obsolete root-level build output before workspace builds so stale pre-custody CLI artifacts cannot bypass current account and Claustrum safeguards.
 - Give consecutive Desktop fallback notices distinct, pre-registered message IDs before the assistant; defer delivery when safe ordering is unavailable and bound notice tracking across sessions (#230).
 - Publish account UUIDs and credential-lineage provenance in the sanitized quota-header feed while fencing stale lease cleanup.
 - Make Pi effort history compatible with both host context-entry APIs, preserve ordered structured system-prompt blocks, and keep every cache strategy within Anthropic's four-breakpoint limit.

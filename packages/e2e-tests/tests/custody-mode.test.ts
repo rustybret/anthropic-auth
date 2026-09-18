@@ -7,6 +7,9 @@ import { join } from 'node:path'
 import {
   custodyCredentialId,
   custodyTombstoneKey,
+  type FallbackAccount,
+  isOAuthAccount,
+  loadAccounts,
   saveAccounts,
   setClaustrumModePersistent,
   setRoutingMode,
@@ -143,6 +146,137 @@ describe('custody mode', () => {
     const publicOutput = `${harness.opencode.stdout()}\n${harness.opencode.stderr()}\n${pluginLog}`
     expect(publicOutput).not.toContain(mainHandle)
     expect(publicOutput).not.toContain(fallbackHandle)
+  }, 120_000)
+
+  it('enrolls and serves a newly bound fallback without restarting OpenCode', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
+    roots.push(root)
+    const mainHandle = `ckh_${'M'.repeat(43)}`
+    const addedHandle = `ckh_${'N'.repeat(43)}`
+    const manifestPath = join(root, 'claustrum-handles.json')
+    const daemon = await startFakeClaustrumDaemon({
+      directory: root,
+      credentials: {
+        [mainHandle]: {
+          payload: JSON.stringify({ access_token: 'vault-main' }),
+          account_id: 'account-main',
+          credential_id: custodyCredentialId('main'),
+          record_version: 31,
+          expires_at_ms: Date.now() + 60 * 60 * 1000,
+        },
+        [addedHandle]: {
+          payload: JSON.stringify({ access_token: 'vault-added' }),
+          account_id: 'account-added',
+          credential_id: custodyCredentialId('added'),
+          record_version: 32,
+          expires_at_ms: Date.now() + 60 * 60 * 1000,
+        },
+      },
+    })
+    daemons.push(daemon)
+    await writeCustodyHandleManifestEntry({
+      path: manifestPath,
+      entry: {
+        label: 'main',
+        handle: mainHandle,
+        credentialId: custodyCredentialId('main'),
+      },
+    })
+
+    harness = await E2EHarness.create({
+      childEnv: {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
+          daemon.connectionFile,
+        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
+        OPENCODE_AUTH_CONTENT: JSON.stringify({
+          anthropic: {
+            type: 'oauth',
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+          },
+        }),
+      },
+      beforeSpawn: async (env) => {
+        const accountPath = join(env.configDir, 'anthropic-auth.json')
+        await saveAccounts(
+          {
+            version: 1,
+            accounts: [],
+            claustrum: { handlesFile: manifestPath },
+          },
+          accountPath,
+        )
+        await setClaustrumModePersistent('claustrum', accountPath)
+        await setRoutingMode('fallback-first', accountPath)
+      },
+    })
+    harness.script([
+      { type: 'text', text: 'main ready' },
+      { type: 'text', text: 'new account served' },
+    ])
+    const initialSession = await harness.createSession()
+    await harness.sendPrompt(initialSession, 'initialize the active plugin')
+    await harness.waitForSessionText(initialSession, 'main ready')
+    expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
+      'Bearer vault-main',
+    )
+
+    await expect(
+      writeCustodyHandleManifestEntry({
+        path: manifestPath,
+        entry: {
+          label: 'added',
+          handle: addedHandle,
+          credentialId: custodyCredentialId('added'),
+        },
+      }),
+    ).resolves.toEqual({ status: 'written' })
+    await Promise.race([
+      daemon.waitForCredentialGet(addedHandle),
+      Bun.sleep(5_000).then(() => {
+        throw new Error('new manifest binding was not verified')
+      }),
+    ])
+
+    const accountPath = join(
+      harness.opencode.env.configDir,
+      'anthropic-auth.json',
+    )
+    const enrollmentDeadline = Date.now() + 5_000
+    let addedAccount: FallbackAccount | undefined
+    while (Date.now() < enrollmentDeadline) {
+      const storage = await loadAccounts(accountPath)
+      addedAccount = storage?.accounts.find(
+        (account) => account.label === 'added',
+      )
+      if (
+        addedAccount &&
+        isOAuthAccount(addedAccount) &&
+        addedAccount.refresh === custodyTombstoneKey('anthropic')
+      ) {
+        break
+      }
+      await Bun.sleep(20)
+    }
+    expect(addedAccount).toMatchObject({
+      id: 'added',
+      label: 'added',
+      enabled: true,
+      type: 'oauth',
+      access: '',
+      refresh: custodyTombstoneKey('anthropic'),
+      anthropicAccountUuid: 'account-added',
+    })
+    expect(JSON.stringify(addedAccount)).not.toContain(addedHandle)
+
+    const session = await harness.createSession()
+    await harness.sendPrompt(session, 'use the newly bound vault credential')
+    await harness.waitForSessionText(session, 'new account served')
+    expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
+      'Bearer vault-added',
+    )
+    expect(harness.anthropic.tokenRequests()).toBe(0)
   }, 120_000)
 
   it('keeps an initially cold vault main fail-closed while fallback-first serves', async () => {

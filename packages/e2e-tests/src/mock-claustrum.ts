@@ -20,6 +20,7 @@ const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 200 + index)
 export type FakeClaustrumCredential = {
   payload: string | Uint8Array | number[]
   account_id: string
+  credential_id?: string
   record_version: number
   expires_at_ms: number
   cold?: boolean
@@ -144,6 +145,7 @@ export async function startFakeClaustrumDaemon(input: {
               ? {
                   payload: payloadBytes(credential.payload),
                   account_id: credential.account_id,
+                  credential_id: credential.credential_id,
                   record_version: credential.record_version,
                   expires_at_ms: credential.expires_at_ms,
                 }

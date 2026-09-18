@@ -564,6 +564,27 @@ describe('executeAccountCommand remove', () => {
     })
   })
 
+  test('refuses to remove a manifest-bound OAuth row in Claustrum mode', async () => {
+    const storage = {
+      ...baseStorage(),
+      claustrum: { mode: 'claustrum' as const },
+    }
+    const result = await executeAccountCommand({
+      argumentsText: 'remove fallback-1',
+      storage,
+      resolveCustodyBinding: () => ({
+        status: 'resolved',
+        source: 'manifest',
+        handle: `ckh_${'A'.repeat(43)}`,
+        credentialId: 'oauth:anthropic:fallback-1',
+      }),
+    })
+
+    expect(result.text).toContain('bound by the Claustrum manifest')
+    expect(result.text).toContain('Disable it')
+    expect(result.updated).toBeUndefined()
+  })
+
   test('remove main is rejected', async () => {
     const storage = baseStorage()
     const result = await executeAccountCommand({

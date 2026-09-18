@@ -3,7 +3,11 @@ import type {
   ClaustrumMode,
   FallbackAccount,
 } from '../accounts.ts'
-import { getClaustrumMode, isOAuthAccountVaultOwned } from '../accounts.ts'
+import {
+  getClaustrumMode,
+  isOAuthAccount,
+  isOAuthAccountVaultOwned,
+} from '../accounts.ts'
 import type {
   ClaustrumDetection,
   CustodyHandleResolution,
@@ -355,6 +359,17 @@ export async function executeAccountCommand(input: {
     const target = accounts.find((a) => a.id === id)
     if (!target) {
       return { text: `Account "${id}" not found.` }
+    }
+    const binding = input.resolveCustodyBinding?.(target)
+    if (
+      getClaustrumMode(input.storage) === 'claustrum' &&
+      isOAuthAccount(target) &&
+      binding?.status === 'resolved' &&
+      binding.source === 'manifest'
+    ) {
+      return {
+        text: `Account "${target.label ?? id}" is bound by the Claustrum manifest. Disable it to stop routing, or remove its Claustrum binding before removing the routing row.`,
+      }
     }
     return {
       text: `Account "${target.label ?? id}" removed.`,

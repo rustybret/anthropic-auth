@@ -113,7 +113,11 @@ export function manifestConnector(
 
 export async function writeManifest(
   tempConfigDir: string,
-  entries: Array<{ label: string; handle: string }>,
+  entries: Array<{
+    label: string
+    handle: string
+    credentialId?: string
+  }>,
   serve = 'anthropic-auth',
 ) {
   const path = join(tempConfigDir, 'handles.json')
@@ -133,10 +137,10 @@ export async function writeManifest(
           // what `credential.get` returns. Provider scoping only requires the second
           // segment to be `anthropic`, so a labelled id is valid here and would still
           // mismatch the vault in production. Read this before inferring a shape.
-          accounts: entries.map(({ label, handle }) => ({
+          accounts: entries.map(({ label, handle, credentialId }) => ({
             label,
             handle,
-            credential_id: custodyCredentialId(label),
+            credential_id: credentialId ?? custodyCredentialId(label),
           })),
         },
       ],

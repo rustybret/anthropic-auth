@@ -34,6 +34,7 @@ import {
   CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
+  custodyTombstoneKey,
   custodyTombstoneOAuth,
   extractBillingHeaderCCH,
   FALLBACK_BACKGROUND_TICK_MS,
@@ -682,6 +683,7 @@ type PluginRuntimeOverrides = Partial<{
   clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
+  custodyManifestPollIntervalMs: number
   claustrumConnector: (options: unknown) => Promise<unknown>
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
@@ -697,6 +699,7 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
       () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
     ) as unknown as typeof setInterval,
     clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    custodyManifestPollIntervalMs: 0,
   }
 }
 
@@ -1149,7 +1152,11 @@ describe('fallback Claustrum credential resolution', () => {
   }
 
   const writeManifest = (
-    entries: Array<{ label: string; handle: string }>,
+    entries: Array<{
+      label: string
+      handle: string
+      credentialId?: string
+    }>,
     serve?: string,
   ) => writeSharedManifest(tempConfigDir!, entries, serve)
 
@@ -1537,6 +1544,284 @@ describe('fallback Claustrum credential resolution', () => {
     ).toHaveLength(1)
     await plugin.dispose?.()
   })
+
+  test.serial(
+    'materializes a bound manifest account on plugin startup',
+    async () => {
+      const startupHandle = `ckh_${'S'.repeat(43)}`
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'startup-bound', handle: startupHandle }])
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor([], (method) => {
+          if (method !== 'credential.get') return { result: {} }
+          return credentialResponse(
+            'vault-startup',
+            1,
+            Date.now() + 8 * 60 * 60_000,
+            'provider-startup',
+            'oauth:anthropic:startup-bound',
+          )
+        }),
+      })
+      await plugin.__fallbackRefreshReady
+
+      const saved = await loadAccounts()
+      expect(
+        saved?.accounts.find((account) => account.label === 'startup-bound'),
+      ).toMatchObject({
+        enabled: true,
+        type: 'oauth',
+        refresh: custodyTombstoneKey('anthropic'),
+        anthropicAccountUuid: 'provider-startup',
+      })
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'materializes a newly bound manifest account without restarting the plugin',
+    async () => {
+      const existingHandle = `ckh_${'E'.repeat(43)}`
+      const addedHandle = `ckh_${'N'.repeat(43)}`
+      const mainHandle = `ckh_${'Q'.repeat(43)}`
+      const storage = manifestStorage({
+        label: 'existing',
+        enabled: false,
+        tombstone: true,
+      })
+      storage.quota = {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        failClosedOnUnknownQuota: true,
+      }
+      await useTempAccountFile(storage)
+      await writeManifest([
+        {
+          label: 'main',
+          handle: mainHandle,
+          credentialId: 'oauth:anthropic',
+        },
+        { label: 'existing', handle: existingHandle },
+      ])
+      const credentials = new Map([
+        [
+          mainHandle,
+          {
+            access: 'vault-main',
+            accountId: 'provider-main',
+            credentialId: 'oauth:anthropic',
+          },
+        ],
+        [
+          existingHandle,
+          {
+            access: 'vault-existing',
+            accountId: 'provider-existing',
+            credentialId: 'oauth:anthropic:existing',
+          },
+        ],
+        [
+          addedHandle,
+          {
+            access: 'vault-added',
+            accountId: 'provider-added',
+            credentialId: 'oauth:anthropic:added',
+          },
+        ],
+      ])
+      const calls: CredentialCall[] = []
+      const modelAuthorizations: string[] = []
+      const quotaAuthorizations: string[] = []
+      globalThis.fetch = mock(async (input, init) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          quotaAuthorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.1 },
+              seven_day: { utilization: 0.2 },
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          )
+        }
+        if (extractUrl(input).includes('/v1/messages')) {
+          modelAuthorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return new Response(null, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' },
+          })
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          const credential = credentials.get(String(params.handle))
+          if (!credential) throw new Error('unexpected handle')
+          return credentialResponse(
+            credential.access,
+            1,
+            Date.now() + 8 * 60 * 60_000,
+            credential.accountId,
+            credential.credentialId,
+          )
+        }),
+      })
+      await plugin.__fallbackRefreshReady
+      // Let the watcher's adoption reconciliation settle so this write must be
+      // observed as a live filesystem event, not folded into the startup pass.
+      await Bun.sleep(50)
+
+      await writeManifest([
+        {
+          label: 'main',
+          handle: mainHandle,
+          credentialId: 'oauth:anthropic',
+        },
+        { label: 'existing', handle: existingHandle },
+        { label: 'added', handle: addedHandle },
+      ])
+      const enrollmentDeadline = Date.now() + 2_000
+      let saved = await loadAccounts()
+      while (
+        !saved?.accounts.some(
+          (account) =>
+            account.label === 'added' &&
+            isOAuthAccount(account) &&
+            account.refresh === custodyTombstoneKey('anthropic') &&
+            account.quota?.five_hour?.usedPercent === 0.1,
+        ) &&
+        Date.now() < enrollmentDeadline
+      ) {
+        await Bun.sleep(10)
+        saved = await loadAccounts()
+      }
+      const added = saved?.accounts.find((account) => account.label === 'added')
+      expect(added).toMatchObject({
+        id: 'added',
+        label: 'added',
+        enabled: true,
+        type: 'oauth',
+        access: '',
+        refresh: custodyTombstoneKey('anthropic'),
+        expires: 0,
+        anthropicAccountUuid: 'provider-added',
+      })
+      expect(
+        added && isOAuthAccount(added) ? added.claustrumHandle : undefined,
+      ).toBeUndefined()
+      expect(JSON.stringify(added)).not.toContain(addedHandle)
+      expect(quotaAuthorizations).toContain('Bearer vault-added')
+      expect(
+        added && isOAuthAccount(added)
+          ? added.quota?.five_hour?.usedPercent
+          : null,
+      ).toBe(0.1)
+      expect(
+        saved?.accounts.find((account) => account.label === 'existing')
+          ?.enabled,
+      ).toBe(false)
+      expect(
+        calls.some(
+          (call) =>
+            call.method === 'credential.get' &&
+            call.params.handle === addedHandle,
+        ),
+      ).toBe(true)
+
+      const authResult = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+      const response = await authResult.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'claude-opus-5',
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      expect(response.status).toBe(200)
+      expect(modelAuthorizations).toEqual(['Bearer vault-added'])
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'refuses to materialize a manifest binding without exact vault identity evidence',
+    async () => {
+      for (const testCase of [
+        {
+          label: 'mismatched-id',
+          servedCredentialId: 'oauth:anthropic:other',
+          servedAccountId: 'provider-mismatched-id',
+        },
+        {
+          label: 'missing-account-id',
+          servedCredentialId: 'oauth:anthropic:missing-account-id',
+          servedAccountId: undefined,
+        },
+      ]) {
+        const existingHandle = `ckh_${'E'.repeat(43)}`
+        const handleCharacter = testCase.label === 'mismatched-id' ? 'X' : 'Y'
+        const candidateHandle = `ckh_${handleCharacter.repeat(43)}`
+        await useTempAccountFile(
+          manifestStorage({
+            label: 'existing',
+            enabled: false,
+            tombstone: true,
+          }),
+        )
+        await writeManifest([
+          { label: 'existing', handle: existingHandle },
+          { label: testCase.label, handle: candidateHandle },
+        ])
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: connectorFor([], (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            if (params.handle === existingHandle) {
+              return credentialResponse(
+                'vault-existing',
+                1,
+                Date.now() + 8 * 60 * 60_000,
+                'provider-existing',
+                'oauth:anthropic:existing',
+              )
+            }
+            return credentialResponse(
+              'vault-candidate',
+              1,
+              Date.now() + 8 * 60 * 60_000,
+              testCase.servedAccountId,
+              testCase.servedCredentialId,
+            )
+          }),
+        })
+        await plugin.__fallbackRefreshReady
+
+        const saved = await loadAccounts()
+        expect(
+          saved?.accounts.some((account) => account.label === testCase.label),
+        ).toBe(false)
+        await plugin.dispose?.()
+      }
+    },
+  )
 
   test.serial(
     'bounds a tombstoned main loader when the vault stays cold',
@@ -3879,13 +4164,12 @@ describe('fallback Claustrum credential resolution', () => {
     ) as OAuthAccount
     expect(response.status).toBe(200)
     expect(fixture.authorizations).toEqual(['Bearer vault-recovered-access'])
-    expect(
-      fixture.calls.filter(
-        (call) =>
-          call.method === 'credential.get' &&
-          call.params.handle === fallbackHandle,
-      ),
-    ).toHaveLength(1)
+    const fallbackCredentialGets = fixture.calls.filter(
+      (call) =>
+        call.method === 'credential.get' &&
+        call.params.handle === fallbackHandle,
+    )
+    expect(fallbackCredentialGets).toHaveLength(1)
     expect(plain.lastRefreshError?.permanent).toBe(true)
     await fixture.plugin.dispose?.()
   })

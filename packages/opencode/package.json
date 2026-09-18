@@ -68,7 +68,7 @@
     "solid-js": "1.9.12"
   },
   "devDependencies": {
-    "@cortexkit/subc-client": "^0.8.1",
+    "@cortexkit/subc-client": "^0.11.1",
     "@ai-sdk/anthropic": "3.0.111"
   }
 }

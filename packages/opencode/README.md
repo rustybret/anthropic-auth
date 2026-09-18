@@ -307,6 +307,8 @@ In global Claustrum mode, `/claude-account claustrum` serves OAuth routes that h
 
 The request path reads only a resident in-memory credential. Startup warming and periodic reconciliation perform vault I/O and keep idle credentials refreshed. In Claustrum mode, a cold or unavailable vault must return a typed provider-unavailable response; it does not fall back to the sidecar credential path. That cold-route behavior lands with the dedicated cold-route task. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show manifest-binding presence, current vault service, and vault reauthentication state without exposing capability handles.
 
+After a new Anthropic credential is explicitly bound to `anthropic-auth`, a running plugin watches the manifest and automatically creates its secret-free routing row; the same reconciliation runs during startup. Enrollment requires an exact live `credential.get` match for both the manifest credential ID and provider account UUID, persists only a custody tombstone plus identity metadata, and immediately refreshes the new route's quota so sticky-balanced routing does not wait for the next background interval. Existing disabled rows remain disabled. To stop routing without changing the manifest, disable the account; removing a manifest-bound row is refused until its binding is removed.
+
 If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state. API-key routes are unaffected.
 
 ## Quota-aware routing

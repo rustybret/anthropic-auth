@@ -227,8 +227,14 @@ import {
   isFallbackAccountVaultServed,
   mainCustodyDimension,
 } from './custody-dimensions.ts'
-import { runClaustrumTakeoverCommand } from './custody-live.ts'
 import {
+  materializeClaustrumEnrollment,
+  pendingClaustrumEnrollments,
+} from './custody-enrollment.ts'
+import { runClaustrumTakeoverCommand } from './custody-live.ts'
+import { adoptCustodyManifestWatcher } from './custody-manifest-watcher.ts'
+import {
+  CUSTODY_PREFLIGHT_MIN_TTL_MS,
   CustodyStateMismatchError,
   type MainCustodyRefusal,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
@@ -964,6 +970,7 @@ type PluginRuntimeOverrides = Partial<{
   clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
+  custodyManifestPollIntervalMs: number
   claustrumConnector: ClaustrumConnector
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
@@ -1977,6 +1984,76 @@ const anthropicAuthPlugin = async (
     return resolution
   }
 
+  async function enrollManifestBoundAccounts(
+    storage: AccountStorage,
+  ): Promise<{ storage: AccountStorage; enrolledAccountIds: string[] }> {
+    const bindings = pendingClaustrumEnrollments(storage, custodyHandleManifest)
+    if (bindings.length === 0) {
+      return { storage, enrolledAccountIds: [] }
+    }
+
+    const cache = await ensureClaustrumCredentialCache()
+    if (!cache) return { storage, enrolledAccountIds: [] }
+
+    const enrolledAccountIds: string[] = []
+    for (const binding of bindings) {
+      try {
+        const credential = await cache.get(
+          binding.handle,
+          CUSTODY_PREFLIGHT_MIN_TTL_MS,
+        )
+        if (
+          credential.credentialId !== binding.credentialId ||
+          !credential.accountId ||
+          !usableClaustrumAccessToken(credential, claustrumNow())
+        ) {
+          logger.warn(
+            'claustrum',
+            'manifest account enrollment verification failed',
+            {
+              label: binding.label,
+              reason:
+                credential.credentialId !== binding.credentialId
+                  ? 'credential-id-mismatch'
+                  : !credential.accountId
+                    ? 'missing-account-id'
+                    : 'credential-unusable',
+            },
+          )
+          continue
+        }
+
+        const account = materializeClaustrumEnrollment({
+          storage,
+          binding,
+          providerAccountUuid: credential.accountId,
+          now: claustrumNow(),
+        })
+        await addAccountPersistent(account, accountStoragePath)
+        enrolledAccountIds.push(account.id)
+        storage = (await loadAccounts(accountStoragePath)) ?? storage
+        await markClaustrumCredentialReady(account.id, binding.handle)
+        logger.info('claustrum', 'manifest account enrolled', {
+          id: account.id,
+          label: account.label,
+        })
+      } catch (error) {
+        handleClaustrumCredentialError(binding.label, error, binding.handle)
+        logger.warn('claustrum', 'manifest account enrollment failed', {
+          label: binding.label,
+          error:
+            error instanceof ClaustrumCredentialError
+              ? error.code
+              : error instanceof Error
+                ? error.name
+                : typeof error,
+        })
+      }
+    }
+
+    return { storage, enrolledAccountIds }
+  }
+
   function mainCustodyAccount(auth: {
     access?: string
     refresh?: string
@@ -2490,15 +2567,26 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  async function refreshManifestEnrollments(): Promise<{
+    storage: AccountStorage | null
+    enrolledAccountIds: string[]
+  }> {
+    await refreshCustodyHandleManifest()
+    const storage = await loadAccounts(accountStoragePath)
+    if (!storage) return { storage: null, enrolledAccountIds: [] }
+    return enrollManifestBoundAccounts(storage)
+  }
+
   async function refreshVaultBackedOAuthAccounts(
     initial = false,
   ): Promise<void> {
-    await refreshCustodyHandleManifest()
+    const enrollment = await refreshManifestEnrollments()
     let cache = claustrumCredentialCache
-    const storage = await loadAccounts(accountStoragePath)
+    const storage = enrollment.storage
     if (!storage) return
+    cache = claustrumCredentialCache
     const minTtlMs = getRefreshBeforeExpiryMs(storage) + 30 * 60_000
-    let sidebarChanged = false
+    let sidebarChanged = enrollment.enrolledAccountIds.length > 0
 
     const mainAuth =
       getClaustrumMode(storage) === 'claustrum' && latestGetAuth
@@ -3490,6 +3578,8 @@ const anthropicAuthPlugin = async (
     setLogLevel(getPersistedLogLevel(initialStorage) ?? 'info')
   }
 
+  let custodyManifestWatcherAdoption: { release: () => void } | null = null
+  let custodyManifestRefreshChain: Promise<void> = Promise.resolve()
   let rpcServerAdoption: RpcServerAdoption | null = null
   if (ctx.directory) {
     const rpcDir = getRpcDir(ctx.directory)
@@ -3508,6 +3598,14 @@ const anthropicAuthPlugin = async (
     }
   }
   const dispose: NonNullable<Hooks['dispose']> = async () => {
+    try {
+      custodyManifestWatcherAdoption?.release()
+      await custodyManifestRefreshChain.catch(() => {})
+    } catch (error) {
+      logger.warn('claustrum', 'failed to stop manifest watcher', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
     try {
       await quotaHeaderFeedRegistry?.dispose()
     } catch (error) {
@@ -5234,6 +5332,36 @@ const anthropicAuthPlugin = async (
       })
       ?.catch?.(() => {})
   }
+
+  custodyManifestWatcherAdoption = adoptCustodyManifestWatcher(
+    custodyHandleManifestPath,
+    () => {
+      custodyManifestRefreshChain = custodyManifestRefreshChain
+        .catch(() => {})
+        .then(async () => {
+          const enrollment = await refreshManifestEnrollments()
+          if (enrollment.enrolledAccountIds.length > 0) {
+            // Populate the new route's quota immediately so sticky-balanced
+            // routing does not observe an avoidable incomplete-pool window.
+            await fallbackManager.refreshQuotaForDueAccounts()
+            await refreshSidebarQuota()
+          }
+        })
+      return custodyManifestRefreshChain
+    },
+    {
+      setTimeoutImpl: runtimeTimers.setTimeout,
+      clearTimeoutImpl: runtimeTimers.clearTimeout,
+      pollSetTimeoutImpl: runtimeTimers.setTimeout,
+      pollClearTimeoutImpl: runtimeTimers.clearTimeout,
+      pollIntervalMs: runtimeOverrides.custodyManifestPollIntervalMs,
+      onError: (error) => {
+        logger.warn('claustrum', 'manifest watcher failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      },
+    },
+  )
 
   return {
     'experimental.chat.messages.transform': async (

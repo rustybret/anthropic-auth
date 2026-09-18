@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "setup": "bash scripts/setup.sh",
-    "build": "cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
+    "build": "rm -rf dist && cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
     "build:arcus": "bun run build && bash scripts/pack-arcus.sh",
     "pipeline:arcus": "sh scripts/arcus-pipeline.sh",
     "package:arcus": "bash scripts/pack-arcus.sh",
