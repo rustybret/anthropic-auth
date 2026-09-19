@@ -2,12 +2,12 @@
 
 Claude Pro/Max OAuth support for [OpenCode](https://opencode.ai), maintained as a private fleet fork distributed via [Arcus](https://github.com/rustybret/arcus).
 
-This package is part of the `rustybret/anthropic-auth` downstream fork of upstream `cortexkit/anthropic-auth`. It provides Anthropic OAuth interception, multi-account fallback, prompt caching, quota tracking, TUI sidebar integration, and request signing for OpenCode, packaged as an Arcus v2 plugin bundle.
+This package is part of the `rustybret/anthropic-auth` downstream fork of upstream `cortexkit/anthropic-auth`. It provides Anthropic OAuth interception, multi-account fallback, prompt caching, quota tracking, TUI sidebar integration, and request signing for OpenCode, packaged as an Arcus v3 plugin bundle.
 
 ## Fork Identity & Ecosystem Differentiation
 
-- **Distribution**: This fork is packaged exclusively as an **Arcus v2 release envelope** registered in `arcus-blessed-plugins.json`. It is never published to the public npm registry.
-- **Packaging Pipeline**: Uses Arcus Option B (`submodules/arcus` shallow submodule + symlinked pipeline scripts in `scripts/`), driven locally with `scripts/pack-arcus.sh` and canonicalized in CI via Cloudhome BuildKit (`arcus-release-upload`).
+- **Distribution**: This fork is packaged exclusively as an **Arcus v3 release envelope** registered in `arcus-blessed-plugins.json`. It is never published to the public npm registry.
+- **Packaging Pipeline**: Uses Arcus Consumer Template (`packages/arcus/bootstrap.sh` + symlinked pipeline scripts in `scripts/`), driven locally with `scripts/pack-arcus.sh` and canonicalized in CI via Cloudhome BuildKit (`arcus-release-upload`). Submodules of the Arcus repo are strictly prohibited.
 - **Fork Synchronization**: Synchronized with upstream `cortexkit/anthropic-auth` via `scripts/fork-sync.sh` with automated dependency hydration and lockfile merge handling.
 - **Local Loading**: Loaded directly by OpenCode through Arcus or via `file://` references to `packages/opencode/dist/index.js`.
 

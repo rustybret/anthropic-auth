@@ -1,0 +1,12 @@
+{
+  "$schema": "https://arcus.rustybret.com/schemas/arcus-project.schema.json",
+  "package_id": "opencode-anthropic-auth",
+  "software_type": "opencode-plugin",
+  "source_id": "arcus",
+  "channel": "stable",
+  "format": "tar.gz",
+  "plugin": {
+    "package_name": "@cortexkit/opencode-anthropic-auth",
+    "strip_components": 1
+  }
+}

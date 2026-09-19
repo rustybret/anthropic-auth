@@ -9,10 +9,10 @@ The `captures/` directory is for local system-prompt captures from Claude Code a
 
 ## Arcus packaging & distribution
 
-This repository is distributed via Arcus v2. Upstream pipeline scripts are integrated as symlinks to `submodules/arcus/skills/scripts/` (Option B: Git Submodule + Symlinks + setup.sh):
+This repository is distributed via Arcus v3 using the consumer template (`packages/arcus/bootstrap.sh`, `arcus install arcus-publisher`). Consuming projects must not submodule the Arcus repository:
 
-- **Fresh clone bootstrap**: `bun run setup` (or `git clone --recurse-submodules` / `bash scripts/setup.sh`) initializes `submodules/arcus`, repairs script symlinks, installs dependencies, and verifies the workspace build.
-- **Packaging pipeline**: `bun run pipeline:arcus` drives the Arcus v2 lifecycle (pack, sign, validate, publish, migrate, self-test).
+- **Fresh clone bootstrap**: `bun run setup` (or `bash scripts/setup.sh` / `sh packages/arcus/bootstrap.sh`) bootstraps the Arcus publisher toolchain (`packages/arcus/toolchain`), repairs script symlinks, installs dependencies, and verifies the workspace build.
+- **Packaging pipeline**: `bun run pipeline:arcus` drives the Arcus v3 lifecycle (pack, sign, validate, publish, migrate, self-test).
 - **Hermetic pipeline verification**: `bun run test:arcus` runs self-tests across all Arcus pipeline scripts plus integration tests.
 
 See [scripts/AGENTS.md](scripts/AGENTS.md) for full script inventory, conventions, and anti-patterns.

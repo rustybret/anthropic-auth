@@ -1,1 +1,1 @@
-../submodules/arcus/skills/scripts/arcus-pipeline.sh
+../packages/arcus/toolchain/scripts/arcus-pipeline.sh

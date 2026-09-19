@@ -1,1 +1,1 @@
-../submodules/arcus/skills/scripts/migrate-arcus.sh
+../packages/arcus/toolchain/scripts/migrate-arcus.sh

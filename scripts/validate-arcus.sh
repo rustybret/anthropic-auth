@@ -1,1 +1,1 @@
-../submodules/arcus/skills/scripts/validate-arcus.sh
+../packages/arcus/toolchain/scripts/validate-arcus.sh

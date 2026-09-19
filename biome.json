@@ -25,6 +25,8 @@
       "packages/*/*.json",
       "packages/*/scripts/**",
       "scripts/**",
+      "!scripts/arcus-toolchain.json",
+      "!packages/arcus",
       "*.json",
       "*.yml",
       ".github/**/*.yml"

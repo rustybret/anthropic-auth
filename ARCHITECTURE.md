@@ -7,7 +7,7 @@
 **Fork & Fleet Architecture:**
 - Downstream repository: `rustybret/anthropic-auth` (personal/fleet fork).
 - Upstream repository: `cortexkit/anthropic-auth` (source of truth for core OAuth and protocol shims).
-- Distribution: Distributed hermetically to the OpenCode fleet via **Arcus v2** (`submodules/arcus`, `scripts/pack-arcus.sh`, `arcus manifest validate --with-envelope`) and managed through `arcus-blessed-plugins.json`. Upstream npm publishing scripts are purged; this fork is never published to the public npm registry.
+- Distribution: Distributed hermetically to the OpenCode fleet via **Arcus v3** using the consumer template (`packages/arcus/bootstrap.sh`, `arcus install arcus-publisher`) and managed through `arcus-blessed-plugins.json`. Upstream npm publishing scripts are purged; this fork is never published to the public npm registry.
 - Upstream synchronization: Managed via `scripts/fork-sync.sh` (`bun run fork-sync`), which reconciles git merges, auto-resolves `bun.lock` conflicts, ensures workspace dependency hydration (`bun install`) before build verification, and prevents restoration of purged upstream release scripts.
 - CI/CD & Fleet Promotion: Canonical packaging and publishing are handled remotely by **Cloudhome BuildKit CI** (`arcus-release-upload`), landing signed manifests in `rustybret/arcus` and release assets on GitHub, with independent multi-target download, sha256, and hydration verification performed by **`uc-studio`** before blessed set promotion.
 
@@ -46,10 +46,10 @@
 - Location: `packages/e2e-tests/`
 - Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`, `src/mock-claustrum.ts`), OpenCode runner (`src/opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`, `tests/quota-header-relay.test.ts`, `tests/tmp-hygiene.test.ts`, `tests/custody-mode.test.ts`, `tests/mock-claustrum.test.ts`)
 
-**Arcus Distribution & Packaging (Fleet Option B):**
-- Purpose: Hermetic Arcus v2 release packaging, signing, validation, and publishing without upstream script drift
-- Location: `submodules/arcus/` (shallow git submodule), `scripts/` (symlinks to `submodules/arcus/skills/scripts/`), `scripts/pack-arcus.sh`, `scripts/setup.sh`
-- Pattern: Option B (Git Submodule + Symlinks + setup.sh) — generic pipeline scripts (`arcus-pipeline.sh`, `sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`) are symlinks to `submodules/arcus/skills/scripts/*`; `scripts/pack-arcus.sh` acts as the specialized project packaging driver for the OpenCode plugin strategy, staging runtime assets, auto-allocating sequence numbers against `submodules/arcus`, enforcing argv private key safety, supporting `--self-test` mode, and enforcing distinct digest triples across all 5 canonical targets; `scripts/setup.sh` hydrates submodules, repairs symlinks, and bootstraps dependencies on fresh clones.
+**Arcus Distribution & Packaging (Consumer Template / No-Submodule):**
+- Purpose: Hermetic Arcus v3 release packaging, signing, validation, and publishing without git submodule coupling
+- Location: `packages/arcus/` (`bootstrap.sh`, `arcus.json`), `scripts/` (symlinks to `packages/arcus/toolchain/scripts/`), `scripts/pack-arcus.sh`, `scripts/setup.sh`
+- Pattern: Arcus Consumer Template — generic pipeline scripts (`arcus-pipeline.sh`, `sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`, `arcus-toolchain.json`) are symlinks to `packages/arcus/toolchain/scripts/*` managed via `arcus install arcus-publisher` and `packages/arcus/bootstrap.sh`; direct submodules of the Arcus repository are strictly prohibited (Arcus R4); `scripts/pack-arcus.sh` acts as the specialized project packaging driver for the OpenCode plugin strategy, staging runtime assets, auto-allocating sequence numbers against the local Arcus catalog, enforcing argv private key safety, supporting `--self-test` mode, and enforcing distinct digest triples across all 5 canonical targets; `scripts/setup.sh` bootstraps the publisher toolchain, repairs symlinks, and bootstraps dependencies on fresh clones.
 
 **Upstream Fork Synchronization:**
 - Purpose: Bi-directional synchronization from upstream `cortexkit/anthropic-auth` to maintain feature and protocol parity while preserving fleet distribution assets

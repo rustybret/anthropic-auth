@@ -1,4 +1,7 @@
 #!/bin/sh
+# ARCUS_PUBLISHER_TOOLCHAIN_VERSION=0.4.0
+# ARCUS_LOOM_BUNDLE=arcus-prep
+# ARCUS_LOOM_BUNDLE_VERSION=0.1.0
 # =============================================================================
 # pack-arcus.sh - Arcus v2 packaging for opencode-anthropic-auth (OpenCode plugin)
 #
@@ -136,6 +139,7 @@ resolve_arcus_bin() {
     "${HOME}/.local/bin/arcus" \
     "${HOME}/.arcus/bin/arcus" \
     "/usr/local/bin/arcus" \
+    "${REPO_ROOT}/packages/arcus/toolchain/bin/arcus" \
     "${REPO_ROOT}/../arcus/bin/arcus" \
     "/Volumes/Topper2TB/Git/arcus/bin/arcus"; do
     if [ -x "$candidate" ]; then
@@ -156,7 +160,6 @@ resolve_arcus_dir() {
     return 1
   fi
   for candidate in \
-    "${REPO_ROOT}/submodules/arcus" \
     "${REPO_ROOT}/../arcus" \
     "/Volumes/Topper2TB/Git/arcus"; do
     if [ -d "${candidate}/manifests" ]; then
@@ -367,8 +370,10 @@ printf '  Sequence: %s\n' "$SEQUENCE"
 printf '  Version:  %s\n' "$VERSION"
 
 if [ "$SKIP_VALIDATE" -eq 0 ]; then
-  if [ -f "${SCRIPT_DIR}/validate-arcus.sh" ]; then
+  VALIDATE_SCRIPT="${REPO_ROOT}/packages/arcus/toolchain/scripts/validate-arcus.sh"
+  [ -f "$VALIDATE_SCRIPT" ] || VALIDATE_SCRIPT="${SCRIPT_DIR}/validate-arcus.sh"
+  if [ -f "$VALIDATE_SCRIPT" ]; then
     printf 'pack-arcus: running validation...\n'
-    sh "${SCRIPT_DIR}/validate-arcus.sh" "$ENVELOPE"
+    sh "$VALIDATE_SCRIPT" "$ENVELOPE" || die "strict envelope validation failed"
   fi
 fi

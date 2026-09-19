@@ -2,7 +2,7 @@
 # ==============================================================================
 # Anthropic Auth Repository Setup & Toolchain Bootstrap
 # ==============================================================================
-# Verifies toolchain readiness (Bun, Git), initializes the Arcus submodule,
+# Verifies toolchain readiness (Bun, Git), bootstraps the Arcus publisher toolchain,
 # repairs Arcus script symlinks, and installs workspace dependencies.
 # ==============================================================================
 
@@ -49,17 +49,14 @@ check_tool "arcus" "Install Arcus CLI (optional; can resolve from local build or
 echo ""
 
 # ------------------------------------------------------------------------------
-# 2. Git Submodules & Arcus Toolchain
+# 2. Arcus Publisher Toolchain
 # ------------------------------------------------------------------------------
-echo "==> 2/4 Initializing Git submodules (Arcus toolchain)..."
-if [[ -f "${REPO_ROOT}/.gitmodules" ]]; then
-  git submodule update --init --recursive submodules/arcus
-  if git -C "${REPO_ROOT}/submodules/arcus" config core.sparseCheckout >/dev/null 2>&1; then
-    git -C "${REPO_ROOT}/submodules/arcus" sparse-checkout set skills manifests
-  fi
-  echo "  ✓ Arcus submodule initialized and hydrated."
+echo "==> 2/4 Bootstrapping Arcus publisher toolchain..."
+if [[ -f "${REPO_ROOT}/packages/arcus/bootstrap.sh" ]]; then
+  sh "${REPO_ROOT}/packages/arcus/bootstrap.sh"
+  echo "  ✓ Arcus publisher toolchain bootstrapped."
 else
-  echo "  • No .gitmodules found; skipping."
+  echo "  • packages/arcus/bootstrap.sh not found; skipping."
 fi
 
 # Verify and repair Arcus script symlinks
@@ -69,13 +66,14 @@ ARCUS_SCRIPTS=(
   "validate-arcus.sh"
   "publish-arcus.sh"
   "migrate-arcus.sh"
+  "arcus-toolchain.json"
 )
 for script_name in "${ARCUS_SCRIPTS[@]}"; do
   script_path="${REPO_ROOT}/scripts/${script_name}"
-  target_path="${REPO_ROOT}/submodules/arcus/skills/scripts/${script_name}"
+  target_path="${REPO_ROOT}/packages/arcus/toolchain/scripts/${script_name}"
   if [[ ! -L "${script_path}" || ! -e "${script_path}" ]]; then
     if [[ -f "${target_path}" ]]; then
-      ln -sf "../submodules/arcus/skills/scripts/${script_name}" "${script_path}"
+      ln -sf "../packages/arcus/toolchain/scripts/${script_name}" "${script_path}"
       echo "  ✓ Repaired symlink: scripts/${script_name}"
     else
       echo "  ✗ Warning: Arcus upstream script ${target_path} not found." >&2

@@ -1,1 +1,1 @@
-../submodules/arcus/skills/scripts/sign-arcus.sh
+../packages/arcus/toolchain/scripts/sign-arcus.sh

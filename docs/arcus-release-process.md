@@ -1,51 +1,54 @@
-# Arcus v2 Release Process — opencode-anthropic-auth
+# Arcus v3 Release Process — opencode-anthropic-auth
 
 ## Overview
 
-This document describes the modern Arcus v2 release and distribution pipeline for `opencode-anthropic-auth` within the private package fleet. The package is distributed hermetically through Arcus v2 (`rustybret/arcus`) and managed via the blessed plugin composition (`arcus-blessed-plugins.json`).
+This document describes the modern Arcus v3 release and distribution pipeline for `opencode-anthropic-auth` within the private package fleet. The package is distributed hermetically through Arcus v3 (`rustybret/arcus`) and managed via the blessed plugin composition (`arcus-blessed-plugins.json`).
 
 ### Key Characteristics:
 - **Zero Binaries in Git**: All compiled archives (`.tar.zst`, `.zip`, `.pwr`) are published as GitHub Release assets or served via the Arcus artifact gateway (`arcus-auth.rustybret.com`).
 - **Cryptographic Signature Verification**: Every release manifest is cryptographically signed using Ed25519 and validated via `arcus manifest validate --with-envelope`.
 - **5 Canonical Targets**: Releases provide distinct, verified multi-arch artifacts across `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, and `windows-x64`.
-- **Zero Drift Option B Architecture**: Pipeline scripts are symlinked directly to `submodules/arcus/skills/scripts/*`, ensuring the toolchain stays aligned with upstream Arcus without duplicate code.
+- **Consumer Template Architecture**: Toolchain scripts are symlinked directly to `packages/arcus/toolchain/scripts/*` via `packages/arcus/bootstrap.sh` and `arcus install arcus-publisher`. Git submodules of Arcus are strictly prohibited (Arcus R4).
 - **Automated CI Build & Publish**: The canonical publishing path is driven automatically by Cloudhome BuildKit CI (`arcus-release-upload`), landing signed manifests in `rustybret/arcus` and triggering verification by `uc-studio`.
 
 ---
 
-## 1. Toolchain & Submodule Architecture (Option B)
+## 1. Toolchain & Consumer Template Architecture
 
-The repository integrates Arcus via **Option B: Git Submodule + Symlinks + setup.sh**:
+The repository integrates Arcus via the **Arcus Consumer Template (`packages/arcus`)**:
 
 ```
 anthropic-auth/
-├── submodules/
-│   └── arcus/                  # Shallow submodule tracking rustybret/arcus
+├── packages/
+│   └── arcus/                  # Arcus consumer template (bootstrap.sh, arcus.json)
+│       └── toolchain/          # -> Symlink to installed arcus-publisher
 ├── scripts/
 │   ├── setup.sh                # Fresh clone bootstrap script
 │   ├── pack-arcus.sh           # Specialized OpenCode plugin target packager
 │   ├── pack-arcus.test.ts      # Automated verification tests
-│   ├── arcus-pipeline.sh       # -> ../submodules/arcus/skills/scripts/arcus-pipeline.sh
-│   ├── sign-arcus.sh           # -> ../submodules/arcus/skills/scripts/sign-arcus.sh
-│   ├── validate-arcus.sh       # -> ../submodules/arcus/skills/scripts/validate-arcus.sh
-│   ├── publish-arcus.sh        # -> ../submodules/arcus/skills/scripts/publish-arcus.sh
-│   └── migrate-arcus.sh        # -> ../submodules/arcus/skills/scripts/migrate-arcus.sh
+│   ├── arcus-pipeline.sh       # -> ../packages/arcus/toolchain/scripts/arcus-pipeline.sh
+│   ├── sign-arcus.sh           # -> ../packages/arcus/toolchain/scripts/sign-arcus.sh
+│   ├── validate-arcus.sh       # -> ../packages/arcus/toolchain/scripts/validate-arcus.sh
+│   ├── publish-arcus.sh        # -> ../packages/arcus/toolchain/scripts/publish-arcus.sh
+│   ├── migrate-arcus.sh        # -> ../packages/arcus/toolchain/scripts/migrate-arcus.sh
+│   └── arcus-toolchain.json    # -> ../packages/arcus/toolchain/scripts/arcus-toolchain.json
 ```
 
 ### Fresh Clone Bootstrap
 On a fresh clone, run the repository bootstrap script:
 
 ```bash
-git clone --recurse-submodules https://github.com/rustybret/anthropic-auth.git
+git clone https://github.com/rustybret/anthropic-auth.git
 cd anthropic-auth
 bun run setup
 ```
 
-If cloned without `--recurse-submodules`, `bun run setup` (or `bash scripts/setup.sh`) will automatically:
-1. Initialize and hydrate `submodules/arcus`.
-2. Verify and repair all pipeline script symlinks.
-3. Install workspace dependencies (`bun install`).
-4. Verify the workspace build (`bun run build`).
+`bun run setup` (or `bash scripts/setup.sh` / `sh packages/arcus/bootstrap.sh`) will automatically:
+1. Ensure the `arcus-publisher` toolchain is installed via `arcus install arcus-publisher`.
+2. Symlink `packages/arcus/toolchain` and `.opencode/skills/arcus-publisher`.
+3. Verify and repair all pipeline script symlinks.
+4. Install workspace dependencies (`bun install`).
+5. Verify the workspace build (`bun run build`).
 
 ---
 
@@ -65,7 +68,7 @@ bun run pack:arcus
 
 ### Packaging Driver (`scripts/pack-arcus.sh`)
 `scripts/pack-arcus.sh` acts as the target-assembly driver for `@cortexkit/opencode-anthropic-auth`:
-- **Sequence Auto-Allocation**: When `--sequence` is omitted, it invokes `arcus manifest allocate-sequence --root submodules/arcus` to assign the next monotonic sequence number.
+- **Sequence Auto-Allocation**: When `--sequence` is omitted, it invokes `arcus manifest allocate-sequence` against the local Arcus catalog to assign the next monotonic sequence number.
 - **Dynamic Binary Discovery**: Resolves the `arcus` CLI binary from `$PATH`, candidate local build trees, or `ARCUS_BIN`.
 - **Argv Key Guard**: Prevents leaking private keys in command-line arguments (rejects raw key values passed via `--key`, `--signing-key`, or `--private-key`; accepts `--key-env`, `--key-file`, or stdin).
 - **Hermetic Self-Test**: Supports `--self-test` to validate argument parsing, exit codes, and sequence logic safely.

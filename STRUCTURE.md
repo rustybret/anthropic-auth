@@ -22,11 +22,11 @@ anthropic-auth/
 │   │   ├── src/
 │   │   │   └── tests/
 │   │   └── dist/
-│   └── e2e-tests/              # End-to-end integration tests
-│       ├── src/                # Test harness + mock servers
-│       └── tests/              # Test files
-├── submodules/
-│   └── arcus/                  # Shallow submodule tracking rustybret/arcus (Option B)
+│   ├── e2e-tests/              # End-to-end integration tests
+│   │   ├── src/                # Test harness + mock servers
+│   │   └── tests/              # Test files
+│   └── arcus/                  # Arcus consumer template (bootstrap, manifests)
+│       └── toolchain/          # Symlink to installed arcus-publisher (git-ignored)
 ├── scripts/                    # Dev, Arcus packaging symlinks, setup, and fork-sync scripts
 ├── captures/                   # System-prompt capture artifacts (git-ignored)
 ├── docs/                       # Feature docs, research, plans, specs, and perf notes
@@ -65,13 +65,13 @@ anthropic-auth/
 - Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene, custody mode, mock claustrum)
 - Key files: `src/harness.ts` (test harness), `src/mock-anthropic.ts` (mock Anthropic server), `src/mock-relay.ts` (mock HTTP/WebSocket relay), `src/mock-claustrum.ts` (mock Claustrum daemon), `src/opencode-runner.ts` (runner with temp hygiene)
 
-**`submodules/arcus/`:**
-- Purpose: Git submodule tracking `https://github.com/rustybret/arcus.git` (Option B architecture)
-- Contains: Upstream Arcus toolchain, manifests, and canonical pipeline scripts (`skills/scripts/*`). Generic scripts in `scripts/` symlink into this submodule to eliminate upstream drift.
+**`packages/arcus/`:**
+- Purpose: Arcus Consumer Template — canonical entry point for projects distributing software via the Arcus gateway
+- Contains: `arcus.json` (declarative package manifest), `arcus.json.example`, `bootstrap.sh` (toolchain bootstrap script), `README.md`, `.gitignore`, and `toolchain/` symlink pointing to the Arcus-managed `arcus-publisher` installation. Git submodules of Arcus are strictly prohibited (Arcus R4).
 
 **`scripts/`:**
 - Purpose: Development, Arcus packaging, sync, and analysis utilities
-- Contains: `setup.sh` (toolchain bootstrap, submodule hydration, and symlink verification), `arcus-pipeline.sh` (symlinked unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager with sequence auto-allocation and self-test verification), Arcus v2 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`), `fork-sync.sh` / `fork-sync-exclusions` / `fork-sync.test.ts` (upstream fork-synchronization automation with automated `bun install` dependency hydration), `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `check-claustrum-golden.ts` (validates Claustrum golden fixtures against upstream contracts), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
+- Contains: `setup.sh` (toolchain bootstrap and symlink verification), `arcus-pipeline.sh` (symlinked unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager with sequence auto-allocation and self-test verification), Arcus v3 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`, `arcus-toolchain.json`), `fork-sync.sh` / `fork-sync-exclusions` / `fork-sync.test.ts` (upstream fork-synchronization automation with automated `bun install` dependency hydration), `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `check-claustrum-golden.ts` (validates Claustrum golden fixtures against upstream contracts), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup)
 
 ## Key File Locations
 

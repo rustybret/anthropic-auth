@@ -2,18 +2,18 @@
 
 Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), maintained as a private fleet fork distributed via [Arcus](https://github.com/rustybret/arcus).
 
-This repository is a Bun workspace monorepo. It is maintained as a downstream fork (`rustybret/anthropic-auth`) of the upstream CortexKit repository (`cortexkit/anthropic-auth`), adapted for the OpenCode private package fleet and hermetically distributed via Arcus v2.
+This repository is a Bun workspace monorepo. It is maintained as a downstream fork (`rustybret/anthropic-auth`) of the upstream CortexKit repository (`cortexkit/anthropic-auth`), adapted for the OpenCode private package fleet and hermetically distributed via Arcus v3.
 
 ## Fork Identity & Ecosystem Differentiation
 
 | Dimension | Upstream (`cortexkit/anthropic-auth`) | Fleet Fork (`rustybret/anthropic-auth`) |
 | --- | --- | --- |
 | **Primary Repository** | `https://github.com/cortexkit/anthropic-auth` | `https://github.com/rustybret/anthropic-auth` |
-| **Distribution Channel** | Public npm registry (`@cortexkit/opencode-anthropic-auth`, `@cortexkit/pi-anthropic-auth`) | **Arcus v2 Release Envelopes** (`rustybret/arcus`) via `arcus manifest validate --with-envelope` |
+| **Distribution Channel** | Public npm registry (`@cortexkit/opencode-anthropic-auth`, `@cortexkit/pi-anthropic-auth`) | **Arcus v3 Release Envelopes** (`rustybret/arcus`) via `arcus manifest validate --with-envelope` |
 | **npm Publishing** | Published via GitHub Actions tag workflow (`scripts/release.sh`) | **Never published to npm**; upstream release scripts are purged |
-| **Release Pipeline** | Upstream npm publish scripts + tag triggers | **Option B Pipeline**: `submodules/arcus` shallow submodule, pipeline symlinks, `scripts/pack-arcus.sh`, and `cloudhome` BuildKit CI (`arcus-release-upload`) |
+| **Release Pipeline** | Upstream npm publish scripts + tag triggers | **Arcus Consumer Template**: `packages/arcus/bootstrap.sh`, toolchain symlinks, `scripts/pack-arcus.sh`, and `cloudhome` BuildKit CI (`arcus-release-upload`) |
 | **Upstream Sync** | N/A (origin of truth) | Automated via `scripts/fork-sync.sh` (`bun run fork-sync`) with automatic dependency hydration and exclusion guards |
-| **OpenCode Loading** | Installed via `npm:` or `@cortexkit/...` in `opencode.json` | Installed via **Arcus v2 blessed set** (`arcus-blessed-plugins.json`) or local file link (`file:///.../packages/opencode/dist/index.js`) |
+| **OpenCode Loading** | Installed via `npm:` or `@cortexkit/...` in `opencode.json` | Installed via **Arcus blessed set** (`arcus-blessed-plugins.json`) or local file link (`file:///.../packages/opencode/dist/index.js`) |
 | **Fleet Coordination** | Standalone OSS project | Integrated into fleet composition, cross-project messaging (`project_message`), and promotion gates (`uc-studio`, `cloudhome`, `lore`) |
 
 ## Packages

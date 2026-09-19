@@ -48,28 +48,45 @@ describe('anthropic-auth arcus packaging & sync', () => {
     expect(pkg.scripts['arcus:test']).toBeUndefined()
   })
 
-  it('configures submodules/arcus in .gitmodules and hydrates submodule tree', () => {
+  it('adheres to Arcus R4 submodule prohibition (no submodules/arcus, no .gitmodules)', () => {
     const gitmodulesPath = resolve(repoRoot, '.gitmodules')
-    expect(existsSync(gitmodulesPath)).toBe(true)
-    const gitmodules = readFileSync(gitmodulesPath, 'utf-8')
-    expect(gitmodules).toContain('submodule "submodules/arcus"')
-    expect(gitmodules).toContain('path = submodules/arcus')
-    expect(gitmodules).toContain('url = https://github.com/rustybret/arcus.git')
+    expect(existsSync(gitmodulesPath)).toBe(false)
 
-    const submoduleScriptsDir = resolve(
-      repoRoot,
-      'submodules/arcus/skills/scripts',
-    )
-    expect(existsSync(submoduleScriptsDir)).toBe(true)
+    const submodulePath = resolve(repoRoot, 'submodules/arcus')
+    expect(existsSync(submodulePath)).toBe(false)
   })
 
-  it('symlinks generic Arcus lifecycle scripts to upstream submodule', () => {
+  it('provides packages/arcus publisher template and canonical arcus.json manifests', () => {
+    const rootManifestPath = resolve(repoRoot, 'arcus.json')
+    expect(existsSync(rootManifestPath)).toBe(true)
+    const rootManifest = JSON.parse(readFileSync(rootManifestPath, 'utf-8'))
+    expect(rootManifest.package_id).toBe('opencode-anthropic-auth')
+    expect(rootManifest.software_type).toBe('opencode-plugin')
+    expect(rootManifest.channel).toBe('stable')
+
+    const pkgManifestPath = resolve(repoRoot, 'packages/arcus/arcus.json')
+    expect(existsSync(pkgManifestPath)).toBe(true)
+    const pkgManifest = JSON.parse(readFileSync(pkgManifestPath, 'utf-8'))
+    expect(pkgManifest.package_id).toBe('opencode-anthropic-auth')
+    expect(pkgManifest.software_type).toBe('opencode-plugin')
+
+    const bootstrapPath = resolve(repoRoot, 'packages/arcus/bootstrap.sh')
+    expect(existsSync(bootstrapPath)).toBe(true)
+    const bootstrapStat = statSync(bootstrapPath)
+    expect((bootstrapStat.mode & 0o111) !== 0).toBe(true)
+
+    const toolchainPath = resolve(repoRoot, 'packages/arcus/toolchain')
+    expect(existsSync(toolchainPath)).toBe(true)
+  })
+
+  it('symlinks generic Arcus lifecycle scripts to packages/arcus/toolchain', () => {
     const symlinkedScripts = [
       'arcus-pipeline.sh',
       'sign-arcus.sh',
       'validate-arcus.sh',
       'publish-arcus.sh',
       'migrate-arcus.sh',
+      'arcus-toolchain.json',
     ]
 
     for (const name of symlinkedScripts) {
@@ -78,7 +95,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
       expect(lstat.isSymbolicLink()).toBe(true)
 
       const target = readlinkSync(scriptPath)
-      expect(target).toBe(`../submodules/arcus/skills/scripts/${name}`)
+      expect(target).toBe(`../packages/arcus/toolchain/scripts/${name}`)
       expect(existsSync(scriptPath)).toBe(true)
 
       const stat = statSync(scriptPath)
@@ -97,6 +114,24 @@ describe('anthropic-auth arcus packaging & sync', () => {
     expect(existsSync(setupScriptPath)).toBe(true)
     const setupStat = statSync(setupScriptPath)
     expect((setupStat.mode & 0o111) !== 0).toBe(true)
+  })
+
+  it('passes arcus manifest verify-toolchain on scripts/', () => {
+    const proc = Bun.spawnSync(
+      [
+        'arcus',
+        'manifest',
+        'verify-toolchain',
+        '--root',
+        resolve(repoRoot, 'scripts'),
+      ],
+      {
+        cwd: repoRoot,
+      },
+    )
+    expect(proc.exitCode).toBe(0)
+    const combined = proc.stdout.toString() + proc.stderr.toString()
+    expect(combined).toContain('publisher toolchain accepted')
   })
 
   it('passes hermetic self-tests across all Arcus pipeline scripts', () => {
@@ -292,9 +327,9 @@ process.exit(0);
       expect(v1Manifest.plugin?.asset?.filename).toBe(expectedTarballName)
       expect(v1Manifest.plugin?.asset?.sha256).toMatch(/^[a-f0-9]{64}$/)
 
-      // Validate v2 release envelope structure
+      // Validate v2/v3 release envelope structure
       const v2Envelope = JSON.parse(readFileSync(v2EnvelopePath, 'utf-8'))
-      expect(v2Envelope.signed?.schema_version).toBe(2)
+      expect([2, 3]).toContain(v2Envelope.signed?.schema_version)
       expect(v2Envelope.signed?.kind).toBe('release')
       expect(v2Envelope.signed?.package_id).toBe('opencode-anthropic-auth')
       expect(v2Envelope.signed?.version).toBe(opencodePkg.version)

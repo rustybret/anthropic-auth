@@ -1,1 +1,1 @@
-../submodules/arcus/skills/scripts/publish-arcus.sh
+../packages/arcus/toolchain/scripts/publish-arcus.sh

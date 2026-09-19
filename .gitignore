@@ -6,6 +6,10 @@ packages/*/dist/
 packages/opencode/src/tui-compiled/
 *.tsbuildinfo
 
+# Arcus publisher toolchain
+packages/arcus/toolchain
+.opencode/skills/arcus-publisher
+
 # Local agent/dev state
 .opencode/
 .claude/
