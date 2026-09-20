@@ -247,6 +247,9 @@ stage_payload() {
   [ -f "${PAYLOAD_DIR}/src/tui/entry.mjs" ] || die "required entrypoint src/tui/entry.mjs missing from staged payload"
   [ -f "${PAYLOAD_DIR}/src/tui-compiled/tui.tsx" ] || die "required entrypoint src/tui-compiled/tui.tsx missing from staged payload"
 
+  chmod 0755 "${PAYLOAD_DIR}/dist/index.js"
+  [ -f "${PAYLOAD_DIR}/dist/cli.js" ] && chmod 0755 "${PAYLOAD_DIR}/dist/cli.js"
+
   # Generate legacy v1 npm pack tarball and stamp real sha256 into arcus-manifest.json
   cd "$PLUGIN_DIR"
   TARBALL=$(npm pack --pack-destination="$OUTPUT_DIR" 2>/dev/null | tail -n 1)
