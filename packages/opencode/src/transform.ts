@@ -1158,7 +1158,9 @@ function stripLatestAssistantToolUseTrailingWhitespace(
     if (!Array.isArray(message.content)) return 0
     if (
       !message.content.some(
-        (block) => isRecord(block) && block.type === 'tool_use',
+        (block) =>
+          isRecord(block) &&
+          (block.type === 'tool_use' || block.type === 'server_tool_use'),
       )
     ) {
       return 0
@@ -1248,6 +1250,125 @@ function countRewriteShape(parsed: Record<string, unknown>) {
     toolDefinitionCount: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
     toolUseCount,
     systemBlockCount: Array.isArray(parsed.system) ? parsed.system.length : 0,
+  }
+}
+
+const SERVER_TOOL_USE_ID_REGEX = /^srvtoolu_[a-zA-Z0-9_]+$/
+const CLIENT_TOOL_USE_ID_REGEX = /^[a-zA-Z0-9_-]+$/
+
+/**
+ * Normalize a server_tool_use ID to match Anthropic's required pattern:
+ * ^srvtoolu_[a-zA-Z0-9_]+$
+ * Cross-model sessions (e.g. OpenAI/Gemini web_search) produce IDs like
+ * `ws_...`, `call_...`, or UUIDs with hyphens that Anthropic strictly rejects.
+ */
+export function normalizeServerToolUseId(id: string): string {
+  if (SERVER_TOOL_USE_ID_REGEX.test(id)) {
+    return id.length > 256 ? id.slice(0, 256) : id
+  }
+  let suffix: string
+  if (id.startsWith('srvtoolu_')) {
+    suffix = id.slice('srvtoolu_'.length).replace(/[^a-zA-Z0-9_]/g, '_')
+  } else {
+    suffix = id.replace(/[^a-zA-Z0-9_]/g, '_')
+  }
+  const normalized = `srvtoolu_${suffix || 'id'}`
+  return normalized.length > 256 ? normalized.slice(0, 256) : normalized
+}
+
+/**
+ * Sanitize a client tool_use ID to match Anthropic's pattern:
+ * ^[a-zA-Z0-9_-]+$
+ */
+export function sanitizeToolUseId(id: string): string {
+  if (CLIENT_TOOL_USE_ID_REGEX.test(id)) {
+    return id.length > 256 ? id.slice(0, 256) : id
+  }
+  const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, '_') || 'toolu_id'
+  return cleaned.length > 256 ? cleaned.slice(0, 256) : cleaned
+}
+
+/**
+ * Normalize tool call IDs in messages (both server_tool_use and client tool_use),
+ * updating all corresponding tool_use_id references in result blocks.
+ */
+export function normalizeToolCallIds(parsed: Record<string, unknown>): void {
+  if (!Array.isArray(parsed.messages)) return
+
+  const idMap = new Map<string, string>()
+  const usedIds = new Set<string>()
+
+  // Collect already-valid IDs across all messages
+  for (const msg of parsed.messages) {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (!isRecord(block)) continue
+      if (typeof block.id === 'string' && block.id) {
+        if (
+          (block.type === 'server_tool_use' &&
+            SERVER_TOOL_USE_ID_REGEX.test(block.id)) ||
+          (block.type === 'tool_use' && CLIENT_TOOL_USE_ID_REGEX.test(block.id))
+        ) {
+          usedIds.add(block.id)
+        }
+      }
+    }
+  }
+
+  // Pass 1: Normalize tool calls
+  for (const msg of parsed.messages) {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (!isRecord(block) || typeof block.id !== 'string') continue
+
+      if (block.type === 'server_tool_use') {
+        const oldId = block.id
+        if (!SERVER_TOOL_USE_ID_REGEX.test(oldId)) {
+          let newId = idMap.get(oldId)
+          if (!newId) {
+            const candidate = normalizeServerToolUseId(oldId)
+            newId = candidate
+            let counter = 1
+            while (usedIds.has(newId)) {
+              newId = `${candidate}_${counter++}`
+            }
+            usedIds.add(newId)
+            idMap.set(oldId, newId)
+          }
+          block.id = newId
+        }
+      } else if (block.type === 'tool_use') {
+        const oldId = block.id
+        if (!CLIENT_TOOL_USE_ID_REGEX.test(oldId)) {
+          let newId = idMap.get(oldId)
+          if (!newId) {
+            const candidate = sanitizeToolUseId(oldId)
+            newId = candidate
+            let counter = 1
+            while (usedIds.has(newId)) {
+              newId = `${candidate}_${counter++}`
+            }
+            usedIds.add(newId)
+            idMap.set(oldId, newId)
+          }
+          block.id = newId
+        }
+      }
+    }
+  }
+
+  // Pass 2: Update tool_use_id references in any result blocks
+  if (idMap.size > 0) {
+    for (const msg of parsed.messages) {
+      if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+      for (const block of msg.content) {
+        if (!isRecord(block) || typeof block.tool_use_id !== 'string') continue
+        const mapped = idMap.get(block.tool_use_id)
+        if (mapped) {
+          block.tool_use_id = mapped
+        }
+      }
+    }
   }
 }
 
@@ -1422,6 +1543,7 @@ export async function rewriteRequestBody(
 
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
+    normalizeToolCallIds(parsed)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),

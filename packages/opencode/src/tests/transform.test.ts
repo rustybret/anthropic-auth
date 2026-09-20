@@ -32,6 +32,8 @@ import {
   mergeBetaHeaders,
   mergeHeaders,
   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+  normalizeServerToolUseId,
+  normalizeToolCallIds,
   prefixToolNames,
   prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
@@ -39,6 +41,7 @@ import {
   rewriteRequestBody,
   rewriteUrl,
   sanitizeSystemText,
+  sanitizeToolUseId,
   setOAuthHeaders,
   stripToolPrefix,
 } from '../transform'
@@ -4217,6 +4220,112 @@ describe('rewriteRequestBody', () => {
       })
       const result = JSON.parse(await rewriteRequestBody(body))
       expect(result.model).toBe('claude-sonnet-4-20250514')
+    })
+  })
+
+  describe('tool call ID normalization', () => {
+    test('normalizes server_tool_use IDs to match Anthropic pattern ^srvtoolu_[a-zA-Z0-9_]+$', () => {
+      expect(
+        normalizeServerToolUseId(
+          'ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+        ),
+      ).toBe('srvtoolu_ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59')
+      expect(normalizeServerToolUseId('call_123-abc')).toBe(
+        'srvtoolu_call_123_abc',
+      )
+      expect(normalizeServerToolUseId('srvtoolu_valid123')).toBe(
+        'srvtoolu_valid123',
+      )
+      expect(normalizeServerToolUseId('srvtoolu_has-hyphens')).toBe(
+        'srvtoolu_has_hyphens',
+      )
+      expect(normalizeServerToolUseId('')).toBe('srvtoolu_id')
+    })
+
+    test('sanitizes client tool_use IDs to match Anthropic pattern ^[a-zA-Z0-9_-]+$', () => {
+      expect(sanitizeToolUseId('toolu_123-abc')).toBe('toolu_123-abc')
+      expect(sanitizeToolUseId('call:123.456')).toBe('call_123_456')
+      expect(sanitizeToolUseId('')).toBe('toolu_id')
+    })
+
+    test('normalizes server_tool_use ID and updates corresponding tool_use_id in web_search_tool_result', () => {
+      const parsed = {
+        messages: [
+          { role: 'user', content: 'Search for quantum breakthroughs' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Let me check...' },
+              {
+                type: 'server_tool_use',
+                id: 'ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+                name: 'web_search',
+                input: { query: 'quantum breakthroughs' },
+              },
+              {
+                type: 'web_search_tool_result',
+                tool_use_id:
+                  'ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+                content: [{ url: 'https://example.com', title: 'News' }],
+              },
+            ],
+          },
+        ],
+      }
+
+      normalizeToolCallIds(parsed)
+
+      const serverTool = (parsed.messages[1] as any).content[1]
+      const toolResult = (parsed.messages[1] as any).content[2]
+
+      expect(serverTool.id).toBe(
+        'srvtoolu_ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+      )
+      expect(serverTool.id).toMatch(/^srvtoolu_[a-zA-Z0-9_]+$/)
+      expect(toolResult.tool_use_id).toBe(serverTool.id)
+    })
+
+    test('rewriteRequestBody fixes server_tool_use.id when switching models with OpenAI/Gemini search history', async () => {
+      // Reproduces error: messages.777.content.1.server_tool_use.id: String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'
+      const body = JSON.stringify({
+        model: 'claude-opus-4-7',
+        messages: [
+          { role: 'user', content: 'What is quantum computing?' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Searching the web...' },
+              {
+                type: 'server_tool_use',
+                id: 'ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+                name: 'web_search',
+                input: { query: 'quantum computing' },
+              },
+              {
+                type: 'web_search_tool_result',
+                tool_use_id:
+                  'ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+                content: 'Quantum computing is...',
+              },
+            ],
+          },
+          { role: 'user', content: 'Can you elaborate?' },
+        ],
+      })
+
+      const rewritten = await rewriteRequestBody(body)
+      const parsed = JSON.parse(rewritten)
+      const assistantMsg = parsed.messages[1]
+      const serverToolUse = assistantMsg.content[1]
+      const webSearchResult = assistantMsg.content[2]
+
+      expect(serverToolUse.type).toBe('server_tool_use')
+      expect(serverToolUse.id).toMatch(/^srvtoolu_[a-zA-Z0-9_]+$/)
+      expect(serverToolUse.id).toBe(
+        'srvtoolu_ws_01cff0bcd6d9bde1016a3dd6b557ec81998f81eb014207ad59',
+      )
+      expect(webSearchResult.type).toBe('web_search_tool_result')
+      expect(webSearchResult.tool_use_id).toBe(serverToolUse.id)
     })
   })
 })
