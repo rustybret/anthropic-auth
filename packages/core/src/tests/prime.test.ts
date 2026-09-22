@@ -11,10 +11,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import {
   __setLogTestSink,
-  type AccountStorage,
   type LogTestRecord,
-  type OAuthAccount,
-  type OAuthQuotaSnapshot,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 // Source-side logger import — installed as a second sink so PrimeManager logs
@@ -23,9 +20,13 @@ import {
 // instance is the package-alias target used by other tests; both must be
 // wired to keep sink assertions consistent across runs.
 import {
+  type AccountStorage,
   getOrCreateMainAccountId,
   getOrCreatePrimeAuthLineageId,
   loadAccounts,
+  type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  type PrimeUsageCounters,
   saveAccountState,
 } from '../accounts.ts'
 import {
@@ -47,7 +48,6 @@ import {
   type PrimeAccountStatus,
   PrimeManager,
   type PrimeSendResult,
-  type PrimeUsageCounters,
   parsePrimeCommandAction,
   primeAccountMarkerDir,
   primeIsEligible,
@@ -197,7 +197,7 @@ describe('buildPrimeStatusSummary', () => {
       {
         id: 'main',
         label: 'main',
-        nextDueAt: null,
+        nextDueAt: undefined,
         usage: {
           count: 12,
           inputTokens: 240,
@@ -231,7 +231,7 @@ describe('executePrimeCommand', () => {
     {
       id: 'main',
       label: 'main',
-      nextDueAt: null,
+      nextDueAt: undefined,
       usage: { count: 0, inputTokens: 0, outputTokens: 0, since: 1 },
       estimatedCostUsd: 0,
     },
@@ -394,7 +394,7 @@ async function makeHarness(opts: {
       return result
     },
     sendPrime: async (id) => {
-      const result = opts.send
+      const result: PrimeSendResult = opts.send
         ? await opts.send(id)
         : {
             ok: true,
@@ -1651,7 +1651,7 @@ describe('PrimeManager — recordSuccess', () => {
       scheduled = handler
       scheduledDelay = delay
       return 42
-    }) as typeof setTimeout
+    }) as unknown as typeof setTimeout
     const clearTimeoutImpl = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
@@ -1696,7 +1696,7 @@ describe('PrimeManager — recordSuccess', () => {
     const setTimeoutImpl = ((handler: () => void) => {
       scheduled = handler
       return 42
-    }) as typeof setTimeout
+    }) as unknown as typeof setTimeout
     const clearTimeoutImpl = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
@@ -1858,7 +1858,7 @@ describe('PrimeManager — lifecycle', () => {
     const setTimeoutImpl = ((handler: () => void) => {
       scheduled = handler
       return 42
-    }) as typeof setTimeout
+    }) as unknown as typeof setTimeout
     const clearTimeoutImpl = ((timer: unknown) => {
       cleared.push(timer)
     }) as typeof clearTimeout

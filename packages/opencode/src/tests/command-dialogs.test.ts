@@ -274,6 +274,22 @@ describe('openCommandDialog — global custody mode', () => {
     })
   })
 
+  test('exposes scoped enrollment guidance in the open account modal', () => {
+    const dialog = buildAccountDialogL1({
+      accounts: accountRows,
+      claustrumDetection: 'ready',
+      custodyMode: 'claustrum',
+      custodyModeKnown: true,
+      enrollmentStatus:
+        '- Enrollment: pending approval (request-1)\n- Approve: `ck auth enroll approve --request-id request-1`',
+    })
+
+    expect(dialog.enrollmentStatus).toContain('pending approval (request-1)')
+    expect(dialog.enrollmentStatus).toContain(
+      'ck auth enroll approve --request-id request-1',
+    )
+  })
+
   test('offers Claustrum custody while local', () => {
     const dialog = buildAccountDialogL1({
       accounts: accountRows,

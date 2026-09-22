@@ -1,3 +1,5 @@
+import type { ClaustrumEnrollmentStatus } from '@cortexkit/anthropic-auth-core'
+
 export const COMMAND_MODAL_NAMES = [
   'claude-account',
   'claude-cache',
@@ -40,6 +42,8 @@ export interface AccountDialogKnobs {
   claustrumDetection: string
   custodyMode?: 'local' | 'claustrum'
   custodyModeKnown?: boolean
+  enrollmentStatus?: string
+  claustrumEnrollment?: ClaustrumEnrollmentStatus
   [key: string]: unknown
 }
 

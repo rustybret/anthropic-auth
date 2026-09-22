@@ -334,11 +334,15 @@ export type CacheKeepTarget = {
   consecutiveFailures: number
   dayKey: string
   oauthAccountId?: string
+  oauthAccountIdentity?: string
+  accountStoragePath?: string
   isSubagent: boolean
 }
 
 export type CacheKeepPrewarmAttempt = {
   id: number
+  /** One deadline covers credential authorization and the HTTP attempt. */
+  signal?: AbortSignal
 }
 
 function cacheKeepRetryDelayMs(targetId: string, failureCount: number) {
@@ -522,6 +526,8 @@ export class CacheKeepManager {
     storage: AccountStorage | null
     cacheMode: string
     oauthAccountId?: string
+    oauthAccountIdentity?: string
+    accountStoragePath?: string
     isSubagent?: boolean
   }) {
     if (!input.sessionId)
@@ -560,6 +566,8 @@ export class CacheKeepManager {
       consecutiveFailures: 0,
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
+      oauthAccountIdentity: input.oauthAccountIdentity,
+      accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
     })
     this.pruneTargets(now, today)
@@ -574,6 +582,8 @@ export class CacheKeepManager {
     headers: Headers
     bodyText: string
     oauthAccountId?: string
+    oauthAccountIdentity?: string
+    accountStoragePath?: string
     isSubagent?: boolean
   }): Promise<CacheKeepPrewarmResult> {
     const headers: Record<string, string> = {}
@@ -590,6 +600,8 @@ export class CacheKeepManager {
       consecutiveFailures: 0,
       dayKey: '',
       oauthAccountId: input.oauthAccountId,
+      oauthAccountIdentity: input.oauthAccountIdentity,
+      accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
     }
     return this.sendPrewarm(target)
@@ -651,7 +663,12 @@ export class CacheKeepManager {
   private async sendPrewarm(
     target: CacheKeepTarget,
   ): Promise<CacheKeepPrewarmResult> {
-    const attempt = { id: ++this.nextPrewarmAttemptId }
+    const attempt = {
+      id: ++this.nextPrewarmAttemptId,
+      signal: AbortSignal.timeout(
+        this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
+      ),
+    }
     try {
       let bodyText = target.bodyText
       if (this.options.prepareBody) {
@@ -692,9 +709,7 @@ export class CacheKeepManager {
           method: 'POST',
           headers,
           body: prewarm.bodyText,
-          signal: AbortSignal.timeout(
-            this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
-          ),
+          signal: attempt.signal,
         })
       } catch (error) {
         return {

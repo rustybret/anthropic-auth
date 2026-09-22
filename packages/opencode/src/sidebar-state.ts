@@ -836,6 +836,8 @@ export function formatFallbackModelLabel(modelId: string | undefined): string {
     return 'Fable 5.1'
   if (modelId === 'claude-fable-5' || modelId?.startsWith('claude-fable-5-'))
     return 'Fable 5'
+  if (modelId === 'claude-opus-5-5' || modelId?.startsWith('claude-opus-5-5-'))
+    return 'Opus 5.5'
   if (modelId === 'claude-opus-5' || modelId?.startsWith('claude-opus-5-'))
     return 'Opus 5'
   if (modelId === 'claude-opus-4-8' || modelId?.startsWith('claude-opus-4-8-'))

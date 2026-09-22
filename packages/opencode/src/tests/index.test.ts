@@ -52,6 +52,7 @@ import {
   PROFILE_TTL_MS,
   type ProviderAccountUuid,
   primeStorageFingerprint,
+  readClaustrumEnrollmentStatus,
   removeCustodyHandleManifestEntry,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
@@ -63,6 +64,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { SubcCallError } from '@cortexkit/subc-client'
+import { getOpenCodeClaustrumEnrollmentPaths } from '../claustrum-enrollment-registry'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
@@ -544,6 +546,10 @@ async function useTempAccountFile(storage: AccountStorage) {
     tempConfigDir,
     'sidebar-state.json',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    tempConfigDir,
+    'opencode-enrollment.json',
+  )
   process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
     tempConfigDir,
     'cachekeep-registry',
@@ -570,6 +576,10 @@ function restoreProcessTestFiles() {
   process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
     testDir,
     'sidebar-state.json',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    testDir,
+    'opencode-enrollment.json',
   )
   process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
     testDir,
@@ -685,6 +695,8 @@ type PluginRuntimeOverrides = Partial<{
   clearInterval: typeof globalThis.clearInterval
   custodyManifestPollIntervalMs: number
   claustrumConnector: (options: unknown) => Promise<unknown>
+  claustrumEnrollmentConnect: () => Promise<unknown>
+  claustrumEnrollmentPollIntervalMs: number
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
   removeCustodyHandleManifestEntry: typeof removeCustodyHandleManifestEntry
@@ -700,6 +712,12 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
     ) as unknown as typeof setInterval,
     clearInterval: mock(() => {}) as unknown as typeof clearInterval,
     custodyManifestPollIntervalMs: 0,
+    claustrumEnrollmentPollIntervalMs: 0,
+    claustrumEnrollmentConnect: async () => ({
+      enrollPropose: async () => ({ requestId: 'test-enrollment-request' }),
+      enrollPoll: async () => ({ status: 'pending' as const }),
+      close() {},
+    }),
   }
 }
 
@@ -1528,6 +1546,82 @@ describe('fallback Claustrum credential resolution', () => {
       },
     )
   })
+
+  test.serial(
+    'starts a durable enrollment ceremony in Claustrum mode without enabling scoped serving',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      let approved = false
+      let proposalHash = ''
+      let connectionClosed = false
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumEnrollmentPollIntervalMs: 5,
+        claustrumEnrollmentConnect: async () => ({
+          enrollPropose: async ({
+            requestSecretHash,
+          }: {
+            requestSecretHash: string
+          }) => {
+            proposalHash = requestSecretHash
+            return { requestId: 'request-autostart' }
+          },
+          enrollPoll: async () =>
+            approved
+              ? {
+                  status: 'approved' as const,
+                  name: 'anthropic-auth-opencode',
+                  token: 'ae'.repeat(32),
+                  tokenGeneration: 1,
+                }
+              : { status: 'pending' as const },
+          close: () => {
+            connectionClosed = true
+          },
+        }),
+      })
+      const enrollmentPaths = getOpenCodeClaustrumEnrollmentPaths()
+      const deadline = Date.now() + 2_000
+      let pending: Record<string, unknown> | undefined
+      while (Date.now() < deadline) {
+        pending = await readFile(enrollmentPaths.statePath, 'utf8')
+          .then((source) => JSON.parse(source))
+          .catch(() => undefined)
+        if (pending?.requestId === 'request-autostart') break
+        await Bun.sleep(5)
+      }
+      expect(pending?.phase).toBe('pending')
+      expect(typeof pending?.requestSecret).toBe('string')
+      expect(proposalHash).toHaveLength(64)
+
+      approved = true
+      const approvalDeadline = Date.now() + 2_000
+      let approvedStatus: Awaited<
+        ReturnType<typeof readClaustrumEnrollmentStatus>
+      > = { state: 'idle' }
+      while (Date.now() < approvalDeadline) {
+        approvedStatus = await readClaustrumEnrollmentStatus(enrollmentPaths)
+        if (approvedStatus.state === 'approved') break
+        await Bun.sleep(5)
+      }
+      expect(approvedStatus).toEqual({
+        state: 'approved',
+        proposedName: 'anthropic-auth-opencode',
+        approvedName: 'anthropic-auth-opencode',
+        tokenGeneration: 1,
+      })
+      expect(await readFile(enrollmentPaths.statePath, 'utf8')).not.toContain(
+        String(pending?.requestSecret),
+      )
+      await plugin.dispose?.()
+      expect(connectionClosed).toBe(true)
+    },
+  )
 
   test.serial('warms a manifest-only handle at startup', async () => {
     await useTempAccountFile(manifestStorage({ label: 'manifest-start' }))
@@ -10678,6 +10772,10 @@ describe('provider.models', () => {
       { auth: { type: 'api' } } as never,
     )
 
+    expect(result?.['claude-opus-5-5']?.name).toBe('Claude Opus 5.5')
+    expect(result?.['claude-opus-5-5']?.variants).toEqual(
+      result?.['claude-opus-5']?.variants,
+    )
     expect(result?.['claude-opus-5']?.variants).toEqual({
       low: {
         thinking: { type: 'adaptive', display: 'summarized' },
@@ -17920,7 +18018,7 @@ describe('auth.loader', () => {
 
   test('fetch wrapper refreshes stale usable main quota in background', async () => {
     const originalDateNow = Date.now
-    let now = 0
+    let now = originalDateNow()
     Date.now = mock(() => now) as unknown as typeof Date.now
     await useTempAccountFile(
       createFallbackStorage({
@@ -17965,7 +18063,7 @@ describe('auth.loader', () => {
             type: 'oauth',
             access: 'main-access',
             refresh: 'main-refresh',
-            expires: 1_000_000,
+            expires: now + 1_000_000,
           }),
         { models: {} },
       )
@@ -17973,7 +18071,7 @@ describe('auth.loader', () => {
       expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
         'message-1',
       )
-      now = 120000
+      now += 120000
       // The second quota fetch never resolves. A correct background refresh
       // still lets the model response settle; a blocking implementation hits
       // this deadlock backstop regardless of machine speed.
@@ -18475,6 +18573,114 @@ describe('auth.loader', () => {
     expect(authorizations.slice(-2)).toEqual([
       'Bearer main-access',
       'Bearer scarce-access',
+    ])
+  })
+
+  test('sticky-balanced reselects after the user changes the session model', async () => {
+    const checkedAt = Date.now()
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(0),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'fable-rich',
+            type: 'oauth',
+            access: 'fable-rich-access',
+            refresh: 'fable-rich-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(100),
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+    const successSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(successSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 100_000,
+        }),
+      { models: {} },
+    )
+    const request = (model: string) => ({
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_user_model_change' },
+      body: JSON.stringify({
+        model,
+        max_tokens: 128_000,
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    await (await result.fetch(MESSAGES_URL, request('claude-fable-5-1'))).text()
+    await (await result.fetch(MESSAGES_URL, request('claude-opus-5'))).text()
+
+    expect(authorizations).toEqual([
+      'Bearer fable-rich-access',
+      'Bearer main-access',
     ])
   })
 

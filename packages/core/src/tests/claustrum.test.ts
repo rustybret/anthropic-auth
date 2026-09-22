@@ -72,6 +72,7 @@ describe('custodyCredentialIdFromResolution', () => {
       handle: 'ckh_c'.padEnd(47, '_'),
       credentialId: undefined,
     }
+    // @ts-expect-error Exercise an incomplete legacy manifest binding at runtime.
     expect(custodyCredentialIdFromResolution(resolution, 'main')).toBe(
       'oauth:anthropic:main',
     )
@@ -95,7 +96,11 @@ describe('readCustodyHandles provider scope', () => {
         {
           provider,
           serve,
-          accounts: [],
+          accounts: [] as Array<{
+            label: string
+            handle: string
+            credential_id: string
+          }>,
         },
       ],
     } as const

@@ -51,6 +51,7 @@ function defaultStorage(): AccountStorage {
 
 function usage() {
   console.log(`Usage:
+  opencode-anthropic-auth setup [--yes] [--dry-run]
   opencode-anthropic-auth login [label]
   opencode-anthropic-auth api add [label]
   opencode-anthropic-auth list
@@ -467,6 +468,10 @@ async function listAccounts() {
   }
 }
 
+import { runSetupCommand } from './setup/command.ts'
+
+export { runSetupCommand }
+
 async function main() {
   const [command, subcommandOrLabel, maybeLabel] = process.argv.slice(2)
   if (
@@ -476,6 +481,12 @@ async function main() {
     command === '-h'
   ) {
     usage()
+    return
+  }
+
+  if (command === 'setup') {
+    const code = await runSetupCommand(process.argv.slice(3))
+    if (code !== 0) process.exitCode = code
     return
   }
 

@@ -98,6 +98,36 @@ type RelaySendResult = {
   usedRelay: boolean
 }
 
+export type RelayAttemptAuthorization = {
+  headers: Headers
+  /** Called only for a genuine upstream response, never optimistic/transport status. */
+  onUpstreamStatus?: (status: number) => void
+}
+export type AuthorizeRelayAttempt = () => Promise<RelayAttemptAuthorization>
+
+class RelayAuthorizationError extends Error {
+  constructor(readonly failure: unknown) {
+    super('Relay request authorization failed')
+  }
+}
+
+async function authorizeRelayPayload(
+  payload: RelayPayload,
+  authorize?: AuthorizeRelayAttempt,
+): Promise<RelayAttemptAuthorization | undefined> {
+  if (!authorize) return undefined
+  try {
+    const attempt = await authorize()
+    payload.upstream = {
+      ...payload.upstream,
+      headers: jsonHeaders(attempt.headers),
+    }
+    return attempt
+  } catch (error) {
+    throw new RelayAuthorizationError(error)
+  }
+}
+
 class RelayStateMismatchError extends Error {}
 
 class RelayWebSocketConnectionResetError extends Error {
@@ -399,9 +429,14 @@ async function sendRelayHttp(options: {
   bodyText: string
   fallback: () => Promise<Response>
   signal?: AbortSignal | null
+  authorizeAttempt?: AuthorizeRelayAttempt
 }): Promise<RelaySendResult> {
-  const { config, payload, bodyText, fallback, signal } = options
+  const { config, payload, bodyText, fallback, signal, authorizeAttempt } =
+    options
   let actualPayload = payload
+  let authorization = authorizeAttempt
+    ? await authorizeRelayPayload(actualPayload, authorizeAttempt)
+    : undefined
   let response = await postRelay(config, actualPayload, signal)
   if (response.status === 409 && actualPayload.mode === 'patch') {
     relayLog(
@@ -409,7 +444,17 @@ async function sendRelayHttp(options: {
     )
     await response.body?.cancel().catch(() => {})
     actualPayload = createFullSyncPayload(actualPayload, bodyText)
+    authorization = authorizeAttempt
+      ? await authorizeRelayPayload(actualPayload, authorizeAttempt)
+      : undefined
     response = await postRelay(config, actualPayload, signal)
+  }
+  // Old workers already forward Anthropic request IDs. Without upstream
+  // provenance a relay's own 401 must never invalidate an OAuth credential.
+  if (/^req_[A-Za-z0-9_-]+$/.test(response.headers.get('request-id') ?? '')) {
+    try {
+      authorization?.onUpstreamStatus?.(response.status)
+    } catch {}
   }
   if (!response.ok && response.status >= 500 && config.fallbackToDirect) {
     relayLog(
@@ -504,6 +549,8 @@ type PendingWebSocketRequest = {
   retryingBeforeResponse: boolean
   onResponseHeaders?: (headers: Headers) => void
   stagedResponseHeaders?: Headers
+  authorizeAttempt?: AuthorizeRelayAttempt
+  authorization?: RelayAttemptAuthorization
   responseHeadersDelivered: boolean
 }
 
@@ -545,6 +592,7 @@ class PersistentRelaySession {
     bodyText: string,
     optimisticResponse = false,
     onResponseHeaders?: (headers: Headers) => void,
+    authorizeAttempt?: AuthorizeRelayAttempt,
   ): Promise<RelaySendResult> {
     this.touch()
     const enqueuedAt = perfNowMs()
@@ -557,6 +605,7 @@ class PersistentRelaySession {
           enqueuedAt,
           optimisticResponse,
           onResponseHeaders,
+          authorizeAttempt,
         ),
       )
     const result = start.then(async ({ response, getPayload }) => ({
@@ -579,6 +628,7 @@ class PersistentRelaySession {
     enqueuedAt: number,
     optimisticResponse: boolean,
     onResponseHeaders?: (headers: Headers) => void,
+    authorizeAttempt?: AuthorizeRelayAttempt,
   ) {
     const connectStart = perfNowMs()
     await this.ensureConnected()
@@ -609,16 +659,21 @@ class PersistentRelaySession {
       `perf websocket send_start session=${shortAffinity(this.affinity)} request=${requestPayload.id} mode=${requestPayload.mode} queueMs=${formatMs(connectedAt - enqueuedAt)} connectMs=${formatMs(connectedAt - connectStart)} bodyBytes=${bodyText.length} relayBytes=${JSON.stringify(requestPayload).length}`,
     )
 
+    const authorization = authorizeAttempt
+      ? await authorizeRelayPayload(requestPayload, authorizeAttempt)
+      : undefined
     let activePayload = requestPayload
     const first = this.sendPayload(
       requestPayload,
       bodyText,
       optimisticResponse,
       onResponseHeaders,
+      authorizeAttempt,
+      authorization,
     )
     void first.done.catch(() => {})
     let activeDone = first.done
-    const response = first.response.catch((error) => {
+    const response = first.response.catch(async (error) => {
       if (
         !(error instanceof RelayStateMismatchError) ||
         requestPayload.mode !== 'patch'
@@ -629,12 +684,17 @@ class PersistentRelaySession {
       fullSync.protocol = 2
       fullSync.id = createRequestId()
       fullSync.revision = (this.serverState?.revision ?? 0) + 1
+      const retryAuthorization = authorizeAttempt
+        ? await authorizeRelayPayload(fullSync, authorizeAttempt)
+        : undefined
       activePayload = fullSync
       const retry = this.sendPayload(
         fullSync,
         bodyText,
         optimisticResponse,
         onResponseHeaders,
+        authorizeAttempt,
+        retryAuthorization,
       )
       void retry.done.catch(() => {})
       activeDone = retry.done
@@ -739,6 +799,8 @@ class PersistentRelaySession {
     bodyText: string,
     optimisticResponse: boolean,
     onResponseHeaders?: (headers: Headers) => void,
+    authorizeAttempt?: AuthorizeRelayAttempt,
+    authorization?: RelayAttemptAuthorization,
   ) {
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -770,6 +832,8 @@ class PersistentRelaySession {
         retryAttempts: 0,
         retryingBeforeResponse: false,
         onResponseHeaders,
+        authorizeAttempt,
+        authorization,
         stagedResponseHeaders: undefined,
         responseHeadersDelivered: false,
       }
@@ -832,6 +896,11 @@ class PersistentRelaySession {
         retryPayload.id = createRequestId()
         retryPayload.revision = (this.serverState?.revision ?? 0) + 1
 
+        const authorization = pending.authorizeAttempt
+          ? await authorizeRelayPayload(retryPayload, pending.authorizeAttempt)
+          : undefined
+        if (this.pending !== pending || pending.streamDone) return
+        pending.authorization = authorization
         pending.payload = retryPayload
         pending.accepted = false
         pending.acceptedAt = undefined
@@ -852,7 +921,10 @@ class PersistentRelaySession {
         socket.send(JSON.stringify(retryPayload))
       } catch (error) {
         pending.retryingBeforeResponse = false
-        if (this.pending === pending) this.failPending(error)
+        if (this.pending === pending)
+          this.failPending(
+            error instanceof RelayAuthorizationError ? error.failure : error,
+          )
       }
     })()
 
@@ -943,10 +1015,13 @@ class PersistentRelaySession {
       if (pending.responseStartedAt != null) return
       const responseStartedAt = perfNowMs()
       pending.responseStartedAt = responseStartedAt
+      try {
+        pending.authorization?.onUpstreamStatus?.(message.status)
+      } catch {}
       relayLog(
         `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${message.status}`,
       )
-      clearTimeout(pending.timeout)
+      this.timers.clearTimeout(pending.timeout)
       if (message.headers)
         pending.stagedResponseHeaders = new Headers(message.headers)
       this.resolvePendingResponse(
@@ -1102,6 +1177,8 @@ export async function sendViaRelay(options: {
   fallback: () => Promise<Response>
   affinity?: string | null
   optimisticResponse?: boolean
+  /** Fresh authorization for every physical relay attempt, including internal retries. */
+  authorizeAttempt?: AuthorizeRelayAttempt
   /**
    * Observes genuine upstream headers once per delivered response. WebSocket
    * retries before downstream bytes replace staged headers, so the callback
@@ -1123,6 +1200,7 @@ export async function sendViaRelay(options: {
     fallback,
     affinity: explicitAffinity,
     optimisticResponse,
+    authorizeAttempt,
     onResponseHeaders,
     dumpTag,
     onDumpCreated,
@@ -1180,8 +1258,10 @@ export async function sendViaRelay(options: {
           bodyText,
           optimisticResponse === true,
           onResponseHeaders,
+          authorizeAttempt,
         )
       } catch (error) {
+        if (error instanceof RelayAuthorizationError) throw error
         relayLog(
           `websocket relay failed session=${shortAffinity(affinity)}; trying http relay: ${error instanceof Error ? error.message : String(error)}`,
         )
@@ -1191,6 +1271,7 @@ export async function sendViaRelay(options: {
           bodyText,
           fallback,
           signal: init?.signal,
+          authorizeAttempt,
         })
       }
     } else {
@@ -1200,6 +1281,7 @@ export async function sendViaRelay(options: {
         bodyText,
         fallback,
         signal: init?.signal,
+        authorizeAttempt,
       })
     }
 
@@ -1263,6 +1345,7 @@ export async function sendViaRelay(options: {
     })
     return result.response
   } catch (error) {
+    if (error instanceof RelayAuthorizationError) throw error.failure
     if (!config.fallbackToDirect) {
       relayLog(
         `relay failed session=${shortAffinity(affinity)} and fallbackToDirect=false: ${error instanceof Error ? error.message : String(error)}`,

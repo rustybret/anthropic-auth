@@ -632,6 +632,18 @@ describe('Pi API fallback routing helpers', () => {
       }
     }
 
+    const switchedOpus = streamCortexKitAnthropic(
+      { ...anthropicModel, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
+      anthropicContext,
+      {
+        apiKey: 'main-access',
+        sessionId: 'ses_pi_sticky',
+      },
+    )
+    for await (const _event of switchedOpus) {
+      // Drain the provider stream.
+    }
+
     const directOpus = streamCortexKitAnthropic(
       { ...anthropicModel, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
       anthropicContext,
@@ -646,6 +658,8 @@ describe('Pi API fallback routing helpers', () => {
 
     expect(authorizations).toEqual([
       'Bearer abundant-access',
+      'Bearer abundant-access',
+      'Bearer main-access',
       'Bearer abundant-access',
       'Bearer main-access',
       'Bearer abundant-access',

@@ -12,6 +12,7 @@ import type {
   ClaustrumDetection,
   CustodyHandleResolution,
 } from '../claustrum.ts'
+import type { ClaustrumEnrollmentStatus } from '../claustrum-enrollment.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
 export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
@@ -25,6 +26,7 @@ export type AccountCommandAction =
   | { type: 'move-up'; id: string }
   | { type: 'move-down'; id: string }
   | { type: 'reset-backoff' }
+  | { type: 'enrollment-reset' }
   | {
       type: 'add-apikey'
       apiKey: string
@@ -66,6 +68,8 @@ export function parseAccountCommandAction(
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
   if (action === 'reset-backoff' && !rest) return { type: 'reset-backoff' }
+  if (action === 'enrollment-reset' && !rest)
+    return { type: 'enrollment-reset' }
   if (action === 'claustrum' && !rest) {
     return { type: 'claustrum-mode', mode: 'claustrum' }
   }
@@ -186,8 +190,58 @@ export function custodyStatusLabel(state: CustodyStatusState): string {
   }
 }
 
+export function formatEnrollmentStatus(
+  status: ClaustrumEnrollmentStatus,
+  scopedServing = false,
+): string[] {
+  switch (status.state) {
+    case 'idle':
+      return ['- Enrollment: not enrolled']
+    case 'busy':
+      return ['- Enrollment: another plugin process is reconciling']
+    case 'unavailable':
+      return ['- Enrollment: temporarily unavailable']
+    case 'pending':
+      return status.requestId && /^[A-Za-z0-9_-]{1,128}$/.test(status.requestId)
+        ? [
+            `- Enrollment: pending approval (${status.requestId})`,
+            `- Approve: \`ck auth enroll approve --request-id ${status.requestId}\``,
+          ]
+        : status.requestId
+          ? [
+              '- Enrollment: pending approval; inspect it with `ck auth enroll list`',
+            ]
+          : ['- Enrollment: preparing request']
+    case 'approved': {
+      const name = status.approvedName ?? status.proposedName
+      return /^[A-Za-z0-9_-]{1,128}$/.test(name)
+        ? [
+            `- Enrollment: approved as enrolled:${name} (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
+            ...(scopedServing
+              ? []
+              : [
+                  `- Grant: \`ck auth grant --principal enrolled:${name} --selector-kind category --selector anthropic-native --operation read\``,
+                ]),
+          ]
+        : [
+            `- Enrollment: approved (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
+            ...(scopedServing
+              ? []
+              : [
+                  '- Inspect the approved name with `ck auth enroll list` before granting access.',
+                ]),
+          ]
+    }
+    case 'denied':
+      return ['- Enrollment: denied by operator']
+    case 'blocked':
+      return [`- Enrollment: blocked (${status.code})`]
+  }
+}
+
 export type AccountCommandStatusProjection = {
   claustrumDetection: string
+  claustrumEnrollment?: ClaustrumEnrollmentStatus
   custodyMode?: 'local' | 'claustrum'
   custodyModeKnown?: boolean
   accounts: Array<
@@ -245,6 +299,7 @@ const USAGE_TEXT = [
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
+  '  /claude-account enrollment-reset       Retry a denied/blocked enrollment',
   '  /claude-account add-apikey <key>      Add an API key fallback account',
   '  /claude-account add-oauth-start       Start OAuth device flow',
   '  /claude-account add-oauth-finish <code>  Complete OAuth flow',
@@ -258,6 +313,7 @@ export async function executeAccountCommand(input: {
   resolveCustodyBinding?: (account: FallbackAccount) => CustodyHandleResolution
   path?: string
   transition?: ClaustrumModeTransition
+  resetEnrollment?: () => Promise<AccountCommandResult>
 }): Promise<AccountCommandResult> {
   const action = parseAccountCommandAction(input.argumentsText)
   const accounts = input.storage.accounts
@@ -275,6 +331,9 @@ export async function executeAccountCommand(input: {
       '',
       `- Custody mode: ${getClaustrumMode(input.storage)}`,
       `- Claustrum: ${detection}`,
+      ...(input.statusProjection?.claustrumEnrollment
+        ? formatEnrollmentStatus(input.statusProjection.claustrumEnrollment)
+        : []),
       '',
     ]
     for (const a of list) {
@@ -315,6 +374,17 @@ export async function executeAccountCommand(input: {
       return { text: 'Claustrum mode transition is unavailable.' }
     }
     return input.transition(action.mode)
+  }
+  if (action.type === 'enrollment-reset') {
+    if (getClaustrumMode(input.storage) !== 'claustrum') {
+      return {
+        text: 'Claustrum enrollment is available only in Claustrum mode.',
+      }
+    }
+    if (!input.resetEnrollment) {
+      return { text: 'Claustrum enrollment reset is unavailable.' }
+    }
+    return input.resetEnrollment()
   }
 
   if (action.type === 'add-apikey') {
@@ -359,6 +429,15 @@ export async function executeAccountCommand(input: {
     const target = accounts.find((a) => a.id === id)
     if (!target) {
       return { text: `Account "${id}" not found.` }
+    }
+    if (
+      getClaustrumMode(input.storage) === 'claustrum' &&
+      isOAuthAccount(target) &&
+      target.claustrumScopedCredentialId
+    ) {
+      return {
+        text: `Account "${target.label ?? id}" is managed by Claustrum. Disable it to stop routing, or remove it from the vault.`,
+      }
     }
     const binding = input.resolveCustodyBinding?.(target)
     if (

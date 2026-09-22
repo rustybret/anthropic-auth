@@ -29,6 +29,7 @@ type TuiAccountDialogPayload = {
   accounts: TuiAccountDialogAccount[]
   claustrumDetection: string
   custodyMode?: TuiCustodyMode
+  enrollmentStatus?: string
 }
 
 type TuiCustodyMode = 'local' | 'claustrum' | `mismatch: ${string}`
@@ -144,6 +145,10 @@ export function normalizeAccountDialogPayload(
         ? payload.claustrumDetection
         : 'unknown',
     ...(custodyMode && { custodyMode }),
+    ...(typeof payload.enrollmentStatus === 'string' &&
+      payload.enrollmentStatus.length <= 2_000 && {
+        enrollmentStatus: payload.enrollmentStatus,
+      }),
   }
 }
 
@@ -200,6 +205,7 @@ export function buildManageAccountOptions(account: TuiAccountDialogAccount) {
 export function buildAccountDialogL1(value: unknown): {
   header: string
   options: AccountDialogOption[]
+  enrollmentStatus?: string
   modeAction?: { command: 'claude-account'; arguments: 'local' | 'claustrum' }
 } {
   const payload = normalizeAccountDialogPayload(value)
@@ -236,6 +242,9 @@ export function buildAccountDialogL1(value: unknown): {
       },
       ...payload.accounts.map(buildAccountDialogOption),
     ],
+    ...(payload.enrollmentStatus && {
+      enrollmentStatus: payload.enrollmentStatus,
+    }),
     ...(modeAction && { modeAction }),
   }
 }
@@ -583,6 +592,11 @@ export function openCommandDialog(
         <box flexDirection='column' padding={1} width='100%'>
           <text>{`Claustrum: ${normalizeAccountDialogPayload(accountKnobs).claustrumDetection}`}</text>
           <text>{l1.header}</text>
+          {l1.enrollmentStatus && (
+            <box marginTop={1}>
+              <text>{l1.enrollmentStatus}</text>
+            </box>
+          )}
           {statusMessage && (
             <box marginTop={1}>
               <text fg={statusMessage.error ? '#ef4444' : '#22c55e'}>

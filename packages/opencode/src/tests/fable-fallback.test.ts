@@ -401,3 +401,34 @@ describe('FableFallbackManager — Opus 5 recovery parity', () => {
     })
   })
 })
+
+test('tracks Opus 5.5 recovery independently from Opus 5 in the same session', () => {
+  const manager = new FableFallbackManager()
+  const opus5 = manager.plan('session-a', body('claude-opus-5'))!
+  manager.activate(opus5, 'opus-5-account')
+
+  const healthyOpus55 = manager.plan('session-a', body('claude-opus-5-5'))!
+  expect(healthyOpus55).toMatchObject({
+    requestedModel: 'claude-opus-5-5',
+    effectiveModel: 'claude-opus-5-5',
+    downgraded: false,
+  })
+
+  manager.activate(healthyOpus55, 'opus-5-5-account')
+  const downgradedOpus5 = manager.plan('session-a', body('claude-opus-5'))!
+  const downgradedOpus55 = manager.plan('session-a', body('claude-opus-5-5'))!
+
+  expect(downgradedOpus5).toMatchObject({
+    requestedModel: 'claude-opus-5',
+    effectiveModel: FABLE_FALLBACK_MODEL_ID,
+    cacheAccountId: 'opus-5-account',
+    downgraded: true,
+  })
+  expect(downgradedOpus55).toMatchObject({
+    requestedModel: 'claude-opus-5-5',
+    effectiveModel: FABLE_FALLBACK_MODEL_ID,
+    cacheAccountId: 'opus-5-5-account',
+    downgraded: true,
+  })
+  expect(downgradedOpus5.cycle).not.toBe(downgradedOpus55.cycle)
+})

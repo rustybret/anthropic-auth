@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/pi-anthropic-auth",
-  "version": "1.22.0",
+  "version": "1.23.0",
   "type": "module",
   "repository": {
     "type": "git",
@@ -35,11 +35,11 @@
     "test": "bun test src/tests"
   },
   "dependencies": {
-    "@cortexkit/anthropic-auth-core": "1.22.0"
+    "@cortexkit/anthropic-auth-core": "1.23.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-ai": ">=0.86.1",
+    "@earendil-works/pi-coding-agent": ">=0.86.1",
+    "@earendil-works/pi-tui": ">=0.86.1"
   }
 }

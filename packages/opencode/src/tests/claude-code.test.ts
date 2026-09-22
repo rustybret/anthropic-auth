@@ -5,6 +5,7 @@ import {
   applyClaudeCodeMetadata,
   applyCustomHeaders,
   CLAUDE_CODE_FULL_AGENT_BETAS,
+  CLAUDE_CODE_VERSION,
   type ClaudeCodeIdentity,
   getClaudeCodeIdentity,
   orderClaudeCodeBody,
@@ -14,6 +15,7 @@ import {
   resetClaudeCodeIdentityCachesForTest,
   resolveClaudeCodeIdentity,
   selectClaudeCodeBetas,
+  USER_AGENT,
 } from '@cortexkit/anthropic-auth-core'
 
 const providerUuid = (value: string) => value as ProviderAccountUuid
@@ -177,7 +179,7 @@ describe('Claude Code fingerprint helpers', () => {
       { body, identity },
     )
 
-    expect(headers.get('user-agent')).toBe('claude-cli/2.1.258 (external, cli)')
+    expect(headers.get('user-agent')).toBe(USER_AGENT)
     expect(headers.get('x-claude-code-session-id')).toBe(identity.sessionId)
     expect(headers.get('x-stainless-package-version')).toBe('0.112.1')
     expect(headers.get('x-stainless-runtime-version')).toBe('v26.3.0')
@@ -447,7 +449,9 @@ describe('Claude Code bootstrap identity lookup', () => {
         expect(url.searchParams.get('model')).toBe('claude-sonnet-4-6')
 
         const headers = new Headers(init?.headers)
-        expect(headers.get('user-agent')).toBe('claude-code/2.1.258')
+        expect(headers.get('user-agent')).toBe(
+          `claude-code/${CLAUDE_CODE_VERSION}`,
+        )
         expect(headers.get('anthropic-beta')).toBe('oauth-2025-04-20')
         expect(headers.get('content-type')).toBe('application/json')
 

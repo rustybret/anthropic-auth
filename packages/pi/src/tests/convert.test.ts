@@ -1,9 +1,15 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   type ProviderAccountUuid,
 } from '@cortexkit/anthropic-auth-core'
-import type { Context, Message } from '@earendil-works/pi-ai'
+import {
+  type Context,
+  type Message,
+  normalizeContext,
+  Type,
+} from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 
 function userMsg(text: string): Message {
@@ -473,7 +479,7 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
 
     const firstHeader = String(first.system?.[0]?.text)
     expect(String(compacted.system?.[0]?.text)).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
     )
     expect(String(compacted.system?.[0]?.text)).toBe(firstHeader)
     expect(String(other.system?.[0]?.text)).not.toBe(firstHeader)
@@ -486,10 +492,10 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     const changedHeader = String(changed.system?.[0]?.text)
 
     expect(firstHeader).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
     )
     expect(changedHeader).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messDage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messDage', CLAUDE_CODE_VERSION)};`,
     )
     expect(changedHeader).not.toBe(firstHeader)
   })
@@ -1241,4 +1247,119 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
       })
     },
   )
+})
+
+describe('Pi normalized transcripts', () => {
+  test('preserves the same prompt, tools and cache boundaries as raw host context', async () => {
+    const raw: Context = {
+      systemPrompt: 'PRESERVE_SYSTEM_INSTRUCTION_8642',
+      tools: [
+        {
+          name: 'preserve_tool',
+          description: 'Keep this tool',
+          parameters: Type.Object({}),
+        },
+      ],
+      messages: [userMsg('Hello')],
+    }
+    const cache = { enabled: false, mode: 'explicit' as const }
+    const direct = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      raw,
+      undefined,
+      cache,
+    )
+    const normalized = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      normalizeContext(raw),
+      undefined,
+      cache,
+    )
+    expect(normalized.bodyText).toContain('PRESERVE_SYSTEM_INSTRUCTION_8642')
+    expect(normalized.body.tools?.map((tool) => tool.name)).toEqual([
+      'preserve_tool',
+    ])
+    expect(normalized.body.messages).toEqual(direct.body.messages)
+    expect(normalized.body.tools).toEqual(direct.body.tools)
+    expect(normalized.body.system).toEqual(direct.body.system)
+  })
+
+  test('replays named prompt replacements and tool additions/removals without losing instructions', async () => {
+    const transcript = normalizeContext({
+      messages: [
+        {
+          role: 'system',
+          content: 'BASE_INSTRUCTION',
+          sections: { rules: 'RETIRED_SECTION_8642', stable: 'STABLE_SECTION' },
+          toolsAdded: [
+            {
+              name: 'old_tool',
+              description: 'Old',
+              parameters: Type.Object({}),
+            },
+          ],
+          timestamp: 0,
+        },
+        userMsg('Hello'),
+        {
+          role: 'system',
+          content: 'LATER_INSTRUCTION',
+          sections: { rules: 'REPLACED_SECTION_8642' },
+          toolsRemoved: [{ name: 'old_tool' }],
+          toolsAdded: [
+            {
+              name: 'new_tool',
+              description: 'New',
+              parameters: Type.Object({}),
+            },
+          ],
+          timestamp: 1,
+        },
+      ],
+    })
+    const result = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      transcript,
+      undefined,
+      { enabled: false, mode: 'explicit' },
+    )
+    for (const instruction of [
+      'BASE_INSTRUCTION',
+      'STABLE_SECTION',
+      'LATER_INSTRUCTION',
+      'REPLACED_SECTION_8642',
+    ])
+      expect(result.bodyText).toContain(instruction)
+    expect(result.bodyText).not.toContain('RETIRED_SECTION_8642')
+    expect(result.body.tools?.map((tool) => tool.name)).toEqual(['new_tool'])
+    expect(
+      result.body.messages.every((message) => message.role !== 'system'),
+    ).toBe(true)
+  })
+})
+
+describe('buildAnthropicRequest — Opus 5.5 thinking', () => {
+  test('requests summarized adaptive thinking for Opus 5.5 without reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toBeUndefined()
+  })
+
+  test('maps reasoning to output_config effort for Opus 5.5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'medium' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'medium' })
+  })
 })

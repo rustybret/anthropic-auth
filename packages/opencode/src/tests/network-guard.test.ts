@@ -12,16 +12,17 @@ import {
 } from './test-fetch'
 
 describe('test network guard', () => {
+  const guardedFetch = createGuardedFetch()
   test('rejects non-loopback fetches with an actionable error', async () => {
     await expect(
-      globalThis.fetch('https://example.invalid/provider'),
+      guardedFetch('https://example.invalid/provider'),
     ).rejects.toThrow(
       'Blocked non-loopback fetch to https://example.invalid/provider; stub globalThis.fetch in the test',
     )
   })
 
   test('rejects fetches whose URL cannot be parsed', async () => {
-    await expect(globalThis.fetch({} as Request)).rejects.toThrow(
+    await expect(guardedFetch({} as Request)).rejects.toThrow(
       'Blocked fetch with an unparseable URL; stub globalThis.fetch in the test',
     )
   })
@@ -33,7 +34,7 @@ describe('test network guard', () => {
     })
 
     try {
-      const response = await globalThis.fetch(
+      const response = await guardedFetch(
         `http://127.0.0.1:${server.port}/health`,
       )
       expect(response.status).toBe(200)
@@ -54,7 +55,7 @@ describe('test network guard', () => {
   test('rejects near-miss IPv4 addresses and loopback-looking hostnames', async () => {
     for (const host of ['128.0.0.1', '27.0.0.1', '127.0.0.1.evil.com']) {
       await expect(
-        globalThis.fetch(`http://${host}:8443/provider`),
+        guardedFetch(`http://${host}:8443/provider`),
       ).rejects.toThrow(
         `Blocked non-loopback fetch to http://${host}:8443/provider; stub globalThis.fetch in the test`,
       )
@@ -69,7 +70,7 @@ describe('test network guard', () => {
 
     try {
       await expect(
-        globalThis.fetch(`http://127.0.0.1:${server.port}/redirect`),
+        guardedFetch(`http://127.0.0.1:${server.port}/redirect`),
       ).rejects.toThrow(
         'Blocked non-loopback fetch to https://example.invalid/pwned; stub globalThis.fetch in the test',
       )
@@ -113,7 +114,7 @@ describe('test network guard', () => {
     })
 
     try {
-      const response = await globalThis.fetch(
+      const response = await guardedFetch(
         `http://127.0.0.1:${server.port}/redirect`,
       )
       expect(response.status).toBe(200)
@@ -160,10 +161,11 @@ describe('test network guard', () => {
 
     try {
       const controller = new AbortController()
-      const pending = globalThis.fetch(
-        `http://127.0.0.1:${server.port}/first`,
-        { method: 'POST', body: 'payload', signal: controller.signal },
-      )
+      const pending = guardedFetch(`http://127.0.0.1:${server.port}/first`, {
+        method: 'POST',
+        body: 'payload',
+        signal: controller.signal,
+      })
       await secondHopReady
       controller.abort()
       await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
@@ -190,7 +192,7 @@ describe('test network guard', () => {
 
     try {
       await expect(
-        globalThis.fetch(`http://127.0.0.1:${server.port}/hop/0`),
+        guardedFetch(`http://127.0.0.1:${server.port}/hop/0`),
       ).rejects.toThrow('Too many redirects while fetching')
     } finally {
       server.stop(true)
@@ -213,7 +215,7 @@ describe('test network guard', () => {
     })
 
     try {
-      const response = await globalThis.fetch(
+      const response = await guardedFetch(
         `http://127.0.0.1:${server.port}/hop/0`,
       )
       expect(response.status).toBe(200)
@@ -325,7 +327,7 @@ describe('test network guard', () => {
 
     try {
       await expect(
-        globalThis.fetch(`http://127.0.0.1:${server.port}/first`),
+        guardedFetch(`http://127.0.0.1:${server.port}/first`),
       ).rejects.toThrow(
         'Blocked non-loopback fetch to https://example.invalid/pwned; stub globalThis.fetch in the test',
       )
@@ -425,13 +427,13 @@ describe('test network guard', () => {
         'x-api-key': 'secret',
       }
       for (const path of ['/cross-switch', '/cross-preserve']) {
-        const response = await globalThis.fetch(
+        const response = await guardedFetch(
           `http://127.0.0.1:${serverA.port}${path}`,
           { method: 'POST', headers: credentials, body: 'payload' },
         )
         expect(await response.text()).toBe('cross-origin')
       }
-      const sameOriginFetch = await globalThis.fetch(
+      const sameOriginFetch = await guardedFetch(
         `http://127.0.0.1:${serverA.port}/same-origin`,
         { headers: credentials },
       )
@@ -543,7 +545,7 @@ describe('test network guard', () => {
 
   test('preconnect rejects non-loopback hosts', () => {
     expect(() =>
-      globalThis.fetch.preconnect('https://example.invalid:8443/provider'),
+      guardedFetch.preconnect('https://example.invalid:8443/provider'),
     ).toThrow(
       'Blocked non-loopback fetch to https://example.invalid:8443/provider; stub globalThis.fetch in the test',
     )
@@ -557,9 +559,9 @@ describe('test network guard', () => {
 
     try {
       expect(() =>
-        globalThis.fetch.preconnect(`http://127.0.0.1:${server.port}`),
+        guardedFetch.preconnect(`http://127.0.0.1:${server.port}`),
       ).not.toThrow()
-      const response = await globalThis.fetch(
+      const response = await guardedFetch(
         `http://127.0.0.1:${server.port}/health`,
       )
       expect(response.status).toBe(200)

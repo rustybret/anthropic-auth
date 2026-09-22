@@ -26,6 +26,11 @@ export type FakeClaustrumCredential = {
   cold?: boolean
 }
 
+export type FakeClaustrumEnrollmentProposal = {
+  proposed_name?: string
+  request_secret_hash?: string
+}
+
 export type FakeClaustrumAuthFailure = {
   handle?: string
   provider_status?: number
@@ -37,7 +42,9 @@ export type FakeClaustrumDaemon = {
   connectionFile: string
   credentialGets: string[]
   reportAuthFailures: FakeClaustrumAuthFailure[]
+  enrollmentProposals: FakeClaustrumEnrollmentProposal[]
   waitForCredentialGet: (handle: string) => Promise<void>
+  waitForEnrollmentProposal: () => Promise<void>
   stop: () => Promise<void>
 }
 
@@ -50,6 +57,8 @@ export async function startFakeClaustrumDaemon(input: {
   const credentialGets: string[] = []
   const credentialGetWaiters = new Map<string, Set<() => void>>()
   const reportAuthFailures: FakeClaustrumAuthFailure[] = []
+  const enrollmentProposals: FakeClaustrumEnrollmentProposal[] = []
+  const enrollmentProposalWaiters = new Set<() => void>()
   const server = createServer((socket) => {
     sockets.add(socket)
     socket.once('close', () => sockets.delete(socket))
@@ -124,6 +133,28 @@ export async function startFakeClaustrumDaemon(input: {
           )
           continue
         }
+        if (request.method === 'auth.enroll_propose') {
+          enrollmentProposals.push({
+            proposed_name:
+              typeof request.params?.proposed_name === 'string'
+                ? request.params.proposed_name
+                : undefined,
+            request_secret_hash:
+              typeof request.params?.request_secret_hash === 'string'
+                ? request.params.request_secret_hash
+                : undefined,
+          })
+          writeResponse(socket, header, {
+            result: { request_id: 'fake-enrollment-request' },
+          })
+          for (const resolve of enrollmentProposalWaiters) resolve()
+          enrollmentProposalWaiters.clear()
+          continue
+        }
+        if (request.method === 'auth.enroll_poll') {
+          writeResponse(socket, header, { result: { status: 'pending' } })
+          continue
+        }
         if (request.method === 'credential.get') {
           const handle = request.params?.handle
           const credential =
@@ -194,12 +225,19 @@ export async function startFakeClaustrumDaemon(input: {
     connectionFile,
     credentialGets,
     reportAuthFailures,
+    enrollmentProposals,
     async waitForCredentialGet(handle: string) {
       if (credentialGets.includes(handle)) return
       await new Promise<void>((resolve) => {
         const waiters = credentialGetWaiters.get(handle) ?? new Set()
         waiters.add(resolve)
         credentialGetWaiters.set(handle, waiters)
+      })
+    },
+    async waitForEnrollmentProposal() {
+      if (enrollmentProposals.length > 0) return
+      await new Promise<void>((resolve) => {
+        enrollmentProposalWaiters.add(resolve)
       })
     },
     async stop() {

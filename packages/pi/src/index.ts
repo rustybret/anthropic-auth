@@ -5,27 +5,53 @@ import {
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_FABLE_MYTHOS_5_PRICING,
+  type ClaustrumScopedClient,
   exchange,
+  getClaustrumMode,
   isClaudeFableOrMythos51Model,
+  loadAccounts,
   type MidConversationEffortTransition,
   refreshClaudeOAuthToken,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
+  Provider,
+  SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type {
+  ExtensionAPI,
+  ProviderConfig,
+} from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
+import { createPiCustodyCommands, requirePiEnrollment } from './custody.ts'
 import {
   collectPiEffortHistory,
   deriveContextEntries,
 } from './effort-history.ts'
-import { streamCortexKitAnthropic } from './stream.ts'
+import { getPiAccountStoragePath } from './paths.ts'
+import {
+  closePiScopedRuntime,
+  getPiScopedRuntime,
+  streamCortexKitAnthropic,
+} from './stream.ts'
+
+async function assertLocalAuthentication(): Promise<void> {
+  if (
+    getClaustrumMode(await loadAccounts(getPiAccountStoragePath())) ===
+    'claustrum'
+  ) {
+    throw new Error(
+      'Local Anthropic login and refresh are disabled while Claustrum custody is active',
+    )
+  }
+}
 
 async function loginAnthropic(
   callbacks: OAuthLoginCallbacks,
 ): Promise<OAuthCredentials> {
+  await assertLocalAuthentication()
   const auth = await authorize('max')
   callbacks.onAuth({ url: auth.url })
   const callback = await callbacks.onPrompt({
@@ -40,6 +66,7 @@ async function loginAnthropic(
   if (result.type !== 'success') {
     throw new Error('Anthropic OAuth exchange failed')
   }
+  await assertLocalAuthentication()
   return {
     refresh: result.refresh,
     access: result.access,
@@ -54,6 +81,7 @@ function textImageInput(): Array<'text' | 'image'> {
 async function refreshAnthropicToken(
   credentials: OAuthCredentials,
 ): Promise<OAuthCredentials> {
+  await assertLocalAuthentication()
   const refreshed = await refreshClaudeOAuthToken({
     refreshToken: credentials.refresh,
   })
@@ -65,8 +93,22 @@ async function refreshAnthropicToken(
   }
 }
 
-export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
-  registerCommands(pi)
+export default async function cortexKitPiAnthropicAuth(
+  pi: ExtensionAPI,
+  options: {
+    connectScoped?: () => Promise<ClaustrumScopedClient>
+    pollIntervalMs?: number
+  } = {},
+) {
+  const storagePath = getPiAccountStoragePath()
+  registerCommands(
+    pi,
+    createPiCustodyCommands({
+      storagePath,
+      reconfigure: configureProvider,
+      connect: options.connectScoped,
+    }),
+  )
   const effortHistoryBySession = new Map<
     string,
     MidConversationEffortTransition[]
@@ -102,9 +144,10 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
   pi.on('session_shutdown', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) effortHistoryBySession.delete(sessionId)
+    closePiScopedRuntime(storagePath)
   })
 
-  pi.registerProvider('anthropic', {
+  const configuration: ProviderConfig = {
     name: 'Anthropic (CortexKit OAuth)',
     baseUrl: 'https://api.anthropic.com',
     api: 'cortexkit-anthropic-messages',
@@ -128,6 +171,15 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
           maxTokens: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
         }
       }),
+      {
+        id: 'claude-opus-5-5',
+        name: 'Claude Opus 5.5',
+        reasoning: true,
+        input: textImageInput(),
+        cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 8 },
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+      },
       {
         id: 'claude-opus-5',
         name: 'Claude Opus 5',
@@ -189,5 +241,62 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
           ? effortHistoryBySession.get(options.sessionId)
           : undefined,
       ),
-  })
+  }
+
+  async function configureProvider() {
+    if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum') {
+      closePiScopedRuntime(storagePath)
+      pi.registerProvider('anthropic', configuration)
+      return
+    }
+    const streamSimple = configuration.streamSimple
+    if (!streamSimple)
+      throw new Error('Anthropic stream implementation is unavailable')
+    const configured = async () => {
+      if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum')
+        return false
+      await requirePiEnrollment()
+      return true
+    }
+    const provider: Provider = {
+      id: 'anthropic',
+      name: 'Anthropic (Claustrum)',
+      baseUrl: 'https://api.anthropic.com',
+      auth: {
+        // Native ambient auth avoids fake keys and local OAuth refresh. Pi refuses
+        // a leftover stored OAuth credential because this provider has no OAuth
+        // handler; setup must obtain consent before removing that local entry.
+        apiKey: {
+          name: 'Claustrum',
+          check: async () =>
+            (await configured())
+              ? { type: 'api_key', source: 'Claustrum' }
+              : undefined,
+          resolve: async () =>
+            (await configured())
+              ? { auth: {}, source: 'Claustrum' }
+              : undefined,
+        },
+      },
+      getModels: () =>
+        (configuration.models ?? []).map((model) => ({
+          ...model,
+          provider: 'anthropic',
+          api: model.api ?? 'cortexkit-anthropic-messages',
+          baseUrl: model.baseUrl ?? 'https://api.anthropic.com',
+        })),
+      // Preserve the legacy provider's simplified option surface for raw calls.
+      stream: (model, context, options) =>
+        streamSimple(model, context, options as SimpleStreamOptions),
+      streamSimple,
+    }
+    pi.registerProvider(provider)
+    getPiScopedRuntime(storagePath, {
+      ...(options.connectScoped && { connect: options.connectScoped }),
+      ...(options.pollIntervalMs !== undefined && {
+        pollIntervalMs: options.pollIntervalMs,
+      }),
+    }).start()
+  }
+  await configureProvider()
 }

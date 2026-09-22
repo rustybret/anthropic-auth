@@ -122,6 +122,28 @@ describe('custody mode', () => {
     expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
       'Bearer vault-main',
     )
+    await daemon.waitForEnrollmentProposal()
+    expect(daemon.enrollmentProposals).toHaveLength(1)
+    expect(daemon.enrollmentProposals[0]?.proposed_name).toBe(
+      'anthropic-auth-opencode',
+    )
+    expect(daemon.enrollmentProposals[0]?.request_secret_hash).toMatch(
+      /^[0-9a-f]{64}$/,
+    )
+    expect(
+      JSON.parse(
+        await readFile(
+          join(
+            harness.opencode.env.configDir,
+            'claustrum-enrollment-state.json',
+          ),
+          'utf8',
+        ),
+      ),
+    ).toMatchObject({
+      phase: 'pending',
+      requestId: 'fake-enrollment-request',
+    })
 
     const accountPath = join(
       harness.opencode.env.configDir,

@@ -73,6 +73,20 @@ export function fallbackCustodyDimensions(
     : ('R' as const)
   if (getClaustrumMode(storage) !== 'claustrum')
     return { fallbacks, evidence: constructionEvidence ?? ('V' as const) }
+  if (storage.claustrum?.scopedRoster === true) {
+    const custodyFallbacks = accounts.every(
+      (account) =>
+        Boolean(
+          account.claustrumScopedCredentialId && account.anthropicAccountUuid,
+        ) && hasNoLocalCredential(account),
+    )
+      ? ('T' as const)
+      : ('R' as const)
+    return {
+      fallbacks: custodyFallbacks,
+      evidence: constructionEvidence ?? ('V' as const),
+    }
+  }
   const bindings = accounts.map((account) =>
     deps.resolveAccountCustodyHandle(account, storage),
   )
@@ -128,12 +142,23 @@ export function isFallbackAccountVaultServed(
     | 'isBlocked'
   >,
 ): boolean {
-  if (!storage || deps.isBlocked(accountId)) return false
+  if (!storage || deps.isBlocked?.(accountId)) return false
   const account = storage.accounts.find(
     (candidate): candidate is OAuthAccount =>
       candidate.id === accountId && isOAuthAccount(candidate),
   )
   if (!account) return false
+  if (
+    getClaustrumMode(storage) === 'claustrum' &&
+    storage.claustrum?.scopedRoster === true
+  ) {
+    return Boolean(
+      account.claustrumScopedCredentialId &&
+        account.anthropicAccountUuid &&
+        account.claustrumScopedState === 'active' &&
+        hasNoLocalCredential(account),
+    )
+  }
   const resolved = deps.resolveAccountCustodyHandle(account, storage)
   if (!isOAuthAccountVaultOwned(storage, account, resolved)) return false
   if (resolved.status !== 'resolved') return false
@@ -150,6 +175,13 @@ export function custodyStateFor(
 ): CustodyStatusState {
   if (account.role === 'main') {
     if (!storage || getClaustrumMode(storage) !== 'claustrum') return 'na'
+    if (storage.claustrum?.scopedRoster === true) {
+      const primary = storage.claustrum.primaryAccount
+      if (!primary) return 'unknown-identity'
+      if (primary.state === 'needs_reauth') return 'on-vault-reauth'
+      if (primary.state === 'active') return 'on-vault-served'
+      return 'on-cold'
+    }
     const mainHandle = deps
       .getManifest()
       ?.accounts.find((entry) => entry.label === 'main')?.handle
@@ -184,6 +216,18 @@ export function custodyStateFor(
       candidate.id === account.id && isOAuthAccount(candidate),
   )
   if (!stored) return 'off'
+  if (
+    getClaustrumMode(storage) === 'claustrum' &&
+    storage.claustrum?.scopedRoster === true
+  ) {
+    if (stored.claustrumScopedCredentialId) {
+      if (stored.claustrumScopedState === 'needs_reauth')
+        return 'on-vault-reauth'
+      if (stored.claustrumScopedState === 'active') return 'on-vault-served'
+      return 'on-cold'
+    }
+    return 'off'
+  }
   const resolution = deps.resolveAccountCustodyHandle(stored, storage)
   if (
     resolution.status === 'unresolved' &&

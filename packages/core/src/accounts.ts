@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
 import type { ProviderAccountUuid } from './claude-code.ts'
@@ -10,6 +10,7 @@ import {
   type CustodyHandleResolution,
   CustodyTombstoneRefreshError,
   custodyTombstoneKey,
+  isCustodyTombstoneValue,
 } from './claustrum.ts'
 import {
   CACHE_1H_MODES,
@@ -63,6 +64,9 @@ export type OAuthAccount = AccountBase & {
   // request-scoped identity variables use the provider-neutral providerAccountUuid name.
   anthropicAccountUuid?: ProviderAccountUuid
   claustrumHandle?: string
+  /** Non-secret scoped identity; never a capability handle or bearer token. */
+  claustrumScopedCredentialId?: string
+  claustrumScopedState?: string
   access?: string
   refresh: string
   expires?: number
@@ -106,6 +110,16 @@ export type ClaustrumMode = 'local' | 'claustrum'
 export type ClaustrumConfig = {
   mode?: ClaustrumMode
   handlesFile?: string
+  /** Set by authoritative scoped discovery, not an authentication toggle. */
+  scopedRoster?: true
+  /** Authoritative, non-secret primary identity from scoped discovery. */
+  primaryAccount?: {
+    credentialId: string
+    accountId: ProviderAccountUuid
+    state: string
+  }
+  /** Preserve explicit exclusions when a vaulted account disappears and returns. */
+  disabledAccountIdentities?: string[]
   // Kept loadable so configurations remain safe to downgrade to older releases.
   accounts?: Record<string, ClaustrumAccountGate>
 }
@@ -372,6 +386,9 @@ export type AccountRuntimeEntry = Partial<
     OAuthAccount,
     | 'access'
     | 'authLineageId'
+    | 'anthropicAccountUuid'
+    | 'claustrumScopedCredentialId'
+    | 'claustrumScopedState'
     | 'claustrumHandle'
     | 'refresh'
     | 'expires'
@@ -389,6 +406,7 @@ export type AccountRuntimeEntry = Partial<
 export type AccountRuntimeState = {
   version: 1
   main?: {
+    scopedAccountIdentity?: string
     profile?: OAuthAccountProfile
     profileToken?: string
     quota?: OAuthQuotaSnapshot
@@ -581,7 +599,13 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     typeof value.label === 'string' &&
     Boolean(value.label.trim()) &&
     hasNoLocalCredential(value)
-  if (!refresh.trim() && !rosterOnly) return null
+  const scopedRosterOnly =
+    typeof value.claustrumScopedCredentialId === 'string' &&
+    Boolean(value.claustrumScopedCredentialId.trim()) &&
+    typeof value.anthropicAccountUuid === 'string' &&
+    Boolean(value.anthropicAccountUuid.trim()) &&
+    hasNoLocalCredential(value)
+  if (!refresh.trim() && !rosterOnly && !scopedRosterOnly) return null
 
   return {
     ...normalizeAccountBase(value),
@@ -598,6 +622,16 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     claustrumHandle:
       typeof value.claustrumHandle === 'string' && value.claustrumHandle.trim()
         ? value.claustrumHandle.trim()
+        : undefined,
+    claustrumScopedCredentialId:
+      typeof value.claustrumScopedCredentialId === 'string' &&
+      value.claustrumScopedCredentialId.trim()
+        ? value.claustrumScopedCredentialId.trim()
+        : undefined,
+    claustrumScopedState:
+      typeof value.claustrumScopedState === 'string' &&
+      value.claustrumScopedState.trim()
+        ? value.claustrumScopedState.trim()
         : undefined,
     access: typeof value.access === 'string' ? value.access : undefined,
     refresh,
@@ -951,6 +985,37 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
     typeof value.handlesFile === 'string' && value.handlesFile.trim()
       ? value.handlesFile.trim()
       : undefined
+  const primary = isRecord(value.primaryAccount)
+    ? value.primaryAccount
+    : undefined
+  const primaryAccount =
+    primary &&
+    typeof primary.credentialId === 'string' &&
+    primary.credentialId.trim() &&
+    typeof primary.accountId === 'string' &&
+    primary.accountId.trim() &&
+    typeof primary.state === 'string'
+      ? {
+          credentialId: primary.credentialId.trim(),
+          accountId: primary.accountId.trim() as ProviderAccountUuid,
+          state: primary.state,
+        }
+      : undefined
+  const scopedRoster = value.scopedRoster === true
+  const disabledAccountIdentities = Array.isArray(
+    value.disabledAccountIdentities,
+  )
+    ? [
+        ...new Set(
+          value.disabledAccountIdentities
+            .filter(
+              (id): id is string =>
+                typeof id === 'string' && id.trim().length > 0,
+            )
+            .map((id) => id.trim()),
+        ),
+      ]
+    : []
   const accounts = isRecord(value.accounts)
     ? Object.fromEntries(
         Object.entries(value.accounts).flatMap(([id, entry]) => {
@@ -971,12 +1036,17 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (
     !mode &&
     !handlesFile &&
+    !scopedRoster &&
+    disabledAccountIdentities.length === 0 &&
     (!accounts || Object.keys(accounts).length === 0)
   ) {
     return undefined
   }
   return {
     ...(mode && { mode }),
+    ...(scopedRoster && { scopedRoster: true as const }),
+    ...(primaryAccount && { primaryAccount }),
+    ...(disabledAccountIdentities.length > 0 && { disabledAccountIdentities }),
     ...(handlesFile && { handlesFile }),
     ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
   }
@@ -1066,6 +1136,26 @@ function mergeConfigAccountAndState(
   account: Record<string, unknown>,
   stateAccount: Record<string, unknown>,
 ): Record<string, unknown> {
+  if (
+    typeof account.claustrumScopedCredentialId === 'string' &&
+    typeof account.anthropicAccountUuid === 'string'
+  ) {
+    const sameBinding =
+      stateAccount.claustrumScopedCredentialId ===
+        account.claustrumScopedCredentialId &&
+      stateAccount.anthropicAccountUuid === account.anthropicAccountUuid
+    const scoped: Record<string, unknown> = {
+      ...(sameBinding ? stateAccount : {}),
+      ...account,
+      refresh: '',
+    }
+    delete scoped.access
+    delete scoped.expires
+    delete scoped.lastRefreshedAt
+    delete scoped.lastRefreshError
+    delete scoped.claustrumHandle
+    return scoped
+  }
   if (legacyConfigCredentialsAreNewer(account, stateAccount)) {
     const merged = { ...stateAccount, ...account }
     const configTimestamp = accountCredentialTimestamp(account)
@@ -1254,6 +1344,14 @@ function accountConfig(account: FallbackAccount) {
     addedAt: account.addedAt,
     baseURL: account.type === 'api' ? account.baseURL : undefined,
     authHeader: account.type === 'api' ? account.authHeader : undefined,
+    claustrumScopedCredentialId:
+      account.type === 'oauth'
+        ? account.claustrumScopedCredentialId
+        : undefined,
+    anthropicAccountUuid:
+      account.type === 'oauth' && account.claustrumScopedCredentialId
+        ? account.anthropicAccountUuid
+        : undefined,
   })
 }
 
@@ -1268,6 +1366,8 @@ function accountRuntimeState(account: FallbackAccount) {
     authLineageId: account.authLineageId,
     anthropicAccountUuid: account.anthropicAccountUuid,
     claustrumHandle: account.claustrumHandle,
+    claustrumScopedCredentialId: account.claustrumScopedCredentialId,
+    claustrumScopedState: account.claustrumScopedState,
     access: account.access,
     refresh: account.refresh,
     expires: account.expires,
@@ -1617,14 +1717,17 @@ export function getClaustrumMode(
 export function isOAuthAccountVaultOwned(
   storage: AccountStorage | null,
   account: FallbackAccount,
-  binding: CustodyHandleResolution | undefined,
+  binding?: CustodyHandleResolution | undefined,
 ): boolean {
   return (
     getClaustrumMode(storage) === 'claustrum' &&
     isOAuthAccount(account) &&
     account.enabled !== false &&
     // Source is provenance, not authorization; the resolver owns the binding decision.
-    binding?.status === 'resolved'
+    (binding?.status === 'resolved' ||
+      Boolean(
+        storage?.claustrum?.scopedRoster && account.claustrumScopedCredentialId,
+      ))
   )
 }
 
@@ -1740,6 +1843,7 @@ async function writeJsonAtomic(path: string, value: unknown) {
 }
 
 const WRITE_CLAUSTRUM_MODE = Symbol('writeClaustrumMode')
+const MUTATE_ACCOUNT_ROSTER = Symbol('mutateAccountRoster')
 
 export interface SaveAccountsOptions {
   /** Account ids intentionally removed by this mutation. */
@@ -1751,6 +1855,7 @@ export interface SaveAccountsOptions {
 
 type InternalSaveAccountsOptions = SaveAccountsOptions & {
   [WRITE_CLAUSTRUM_MODE]?: true
+  [MUTATE_ACCOUNT_ROSTER]?: true
 }
 
 function sameAccountIdentity(
@@ -1797,6 +1902,28 @@ function mergeAccountsForSave(
     if (!usedIncoming.has(index) && candidate) merged.push(candidate)
   }
   return merged
+}
+
+function preserveScopedAccountsOnSave(
+  current: readonly FallbackAccount[],
+  incoming: readonly FallbackAccount[],
+  options: SaveAccountsOptions,
+): FallbackAccount[] {
+  const apiRoutes = mergeAccountsForSave(
+    current.filter(isApiKeyAccount),
+    incoming.filter(isApiKeyAccount),
+    options,
+  )
+  const byId = new Map(apiRoutes.map((account) => [account.id, account]))
+  const result = current.flatMap<FallbackAccount>((account) => {
+    if (isOAuthAccount(account)) return [account]
+    const replacement = byId.get(account.id)
+    if (!replacement) return []
+    byId.delete(account.id)
+    return [replacement]
+  })
+  result.push(...byId.values())
+  return result
 }
 
 const ACCOUNT_CONFIG_LOCK_TTL_MS = 10_000
@@ -1858,6 +1985,41 @@ export function saveAccounts(
   return enqueueSave(() => saveAccountsLocked(storage, resolvedPath, options))
 }
 
+/** Read-modify-write account configuration under the existing config/state lock order.
+ * The callback is synchronous: network discovery must happen under its own outer
+ * lease, never while holding the config lock. Do not call another persistence API
+ * from the callback.
+ */
+export function mutateAccountsPersistent<T>(
+  path: string,
+  mutate: (storage: AccountStorage) => {
+    storage: AccountStorage
+    result: T
+    options?: SaveAccountsOptions
+    save?: boolean
+  },
+  options: { assertAuthority?: () => Promise<void> } = {},
+): Promise<T> {
+  const resolvedPath = resolve(path)
+  return enqueueSave(async () => {
+    const lock = await acquireAccountConfigWriteLock(resolvedPath)
+    try {
+      const current = (await loadAccounts(resolvedPath)) ?? createEmptyStorage()
+      const mutation = mutate(current)
+      if (mutation.save !== false) {
+        await options.assertAuthority?.()
+        await saveAccountsWithConfigLock(mutation.storage, resolvedPath, {
+          ...mutation.options,
+          [MUTATE_ACCOUNT_ROSTER]: true,
+        })
+      }
+      return mutation.result
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
 export async function getOrCreateMainAccountId(
   path = getAccountStoragePath(),
   createId: () => string = randomUUID,
@@ -1901,12 +2063,27 @@ async function saveAccountsWithConfigLock(
   options: InternalSaveAccountsOptions,
 ) {
   const current = await loadAccounts(path)
+  // A config-only writer may hold a pre-discovery snapshot. It must not
+  // resurrect departed OAuth members or overwrite scoped exclusions.
+  const preserveScopedRoster =
+    current?.claustrum?.scopedRoster === true && !options[MUTATE_ACCOUNT_ROSTER]
+  const mergeOptions = preserveScopedRoster
+    ? {
+        ...options,
+        removedAccountIds: options.removedAccountIds?.filter((id) =>
+          current?.accounts.some(
+            (account) => account.id === id && isApiKeyAccount(account),
+          ),
+        ),
+      }
+    : options
   const nextStorage: AccountStorage = {
     ...storage,
     ...(storage.claustrum && {
       claustrum: {
         ...current?.claustrum,
         ...storage.claustrum,
+        ...(preserveScopedRoster && current?.claustrum),
         ...(options[WRITE_CLAUSTRUM_MODE]
           ? { mode: storage.claustrum.mode }
           : current?.claustrum?.mode
@@ -1918,11 +2095,17 @@ async function saveAccountsWithConfigLock(
       current?.claustrum && {
         claustrum: current.claustrum,
       }),
-    accounts: mergeAccountsForSave(
-      current?.accounts ?? [],
-      storage.accounts,
-      options,
-    ),
+    accounts: preserveScopedRoster
+      ? preserveScopedAccountsOnSave(
+          current?.accounts ?? [],
+          storage.accounts,
+          mergeOptions,
+        )
+      : mergeAccountsForSave(
+          current?.accounts ?? [],
+          storage.accounts,
+          mergeOptions,
+        ),
   }
   const existing = await loadExistingTopLevelFields(path)
   const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
@@ -2205,6 +2388,29 @@ export function saveOAuthProfileState(
           ? ({ ...existing, version: 1 } as AccountRuntimeState)
           : { version: 1 }
         const { accountId, accountIdentity, profile } = input
+        if (
+          current?.claustrum?.scopedRoster &&
+          getClaustrumMode(current) === 'claustrum'
+        ) {
+          const account = current.accounts.find(
+            (entry) => entry.id === accountId,
+          )
+          const expected =
+            accountId === 'main'
+              ? current.claustrum.primaryAccount?.accountId
+              : account && isOAuthAccount(account)
+                ? account.anthropicAccountUuid
+                : undefined
+          if (
+            !expected ||
+            accountIdentity !== expected ||
+            (profile?.accountIdentity !== undefined &&
+              profile.accountIdentity !== expected) ||
+            (profile?.providerAccountUuid !== undefined &&
+              profile.providerAccountUuid !== expected)
+          )
+            return false
+        }
 
         if (accountId === 'main') {
           next.main = { ...(next.main ?? {}) }
@@ -2353,6 +2559,42 @@ export function clearClaustrumRefreshErrorPersistent(
   })
 }
 
+function fenceScopedPrimaryState(
+  state: AccountRuntimeState,
+  primaryId: string | undefined,
+) {
+  if (!isRecord(state.main)) state.main = {}
+  const main = state.main
+  if (!primaryId || main.scopedAccountIdentity !== primaryId) {
+    delete main.prime
+    delete main.primeAuthLineageId
+    delete main.primeAuthLineageRefreshTokenFingerprint
+    delete main.quotaErrorGeneration
+    delete main.quotaErrorClearedAt
+  }
+  main.scopedAccountIdentity = primaryId
+  if (!primaryId || main.quota?.accountIdentity !== primaryId) {
+    delete main.quota
+    delete main.quotaCheckedAt
+    delete main.quotaToken
+  }
+  if (!primaryId || main.lastQuotaApiError?.accountIdentity !== primaryId)
+    delete main.lastQuotaApiError
+  if (
+    !primaryId ||
+    (main.profile?.providerAccountUuid ?? main.profile?.accountIdentity) !==
+      primaryId
+  ) {
+    delete main.profile
+    delete main.profileToken
+  }
+  delete main.lastRefreshError
+  delete main.refreshErrorClearedAt
+  delete main.refreshLeaseId
+  delete main.refreshLeaseUntil
+  delete main.refreshLeaseTokenHash
+}
+
 async function saveAccountStateUnlocked(
   storage: AccountStorage,
   path: string,
@@ -2364,17 +2606,59 @@ async function saveAccountStateUnlocked(
     ? ({ ...existing, version: 1 } as AccountRuntimeState)
     : { version: 1 }
 
-  if (scope.mainProfile) applyMainProfileStatePatch(next, storage)
-  if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
-  if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
-  if (scope.mainPrime) applyMainPrimeStatePatch(next, storage)
+  const persistedConfig = (await readJsonIfPresent(path)).value
+  const authority = isRecord(persistedConfig)
+    ? normalizeClaustrumConfig(persistedConfig.claustrum)
+    : undefined
+  const scoped =
+    authority?.mode === 'claustrum' && authority.scopedRoster === true
+  const primaryId = authority?.primaryAccount?.accountId
+  const samePrimary = Boolean(
+    primaryId && storage.claustrum?.primaryAccount?.accountId === primaryId,
+  )
+  if (scoped) fenceScopedPrimaryState(next, primaryId)
+  const incomingProfileId =
+    storage.main?.profile?.providerAccountUuid ??
+    storage.main?.profile?.accountIdentity
+  if (
+    scope.mainProfile &&
+    (!scoped ||
+      (samePrimary &&
+        (!storage.main?.profile || incomingProfileId === primaryId)))
+  )
+    applyMainProfileStatePatch(next, storage)
+  const quotaMatches =
+    samePrimary &&
+    (!storage.quota?.mainQuota ||
+      storage.quota.mainQuota.accountIdentity === primaryId) &&
+    (!storage.quota?.mainLastQuotaApiError ||
+      storage.quota.mainLastQuotaApiError.accountIdentity === primaryId)
+  if (scope.mainQuota && (!scoped || quotaMatches)) {
+    applyMainQuotaStatePatch(
+      next,
+      scoped
+        ? { ...storage, quota: { ...storage.quota, mainQuotaToken: primaryId } }
+        : storage,
+    )
+  }
+  if (scope.mainRefresh && !scoped) applyMainRefreshStatePatch(next, storage)
+  if (scope.mainPrime && (!scoped || samePrimary))
+    applyMainPrimeStatePatch(next, storage)
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
     const setClaustrumHandleAccountIds = new Set(
       scope.setClaustrumHandleAccountIds ?? [],
     )
-    const config = (await readJsonIfPresent(path)).value
+    const config = persistedConfig
+    const configAccounts =
+      isRecord(config) && Array.isArray(config.accounts)
+        ? new Map(
+            config.accounts
+              .filter(isRecord)
+              .map((entry) => [String(entry.id ?? '').trim(), entry]),
+          )
+        : new Map<string, Record<string, unknown>>()
     const configuredIds = (() => {
       if (!isRecord(config) || !Array.isArray(config.accounts)) return null
       if (config.accounts.length === 0) return new Set<string>()
@@ -2428,12 +2712,50 @@ async function saveAccountStateUnlocked(
         next.accounts[accountId] ??
         (legacyKey ? next.accounts[legacyKey] : undefined)
       for (const key of legacyKeys) delete next.accounts[key]
-      next.accounts[accountId] = mergeAccountRuntimeState(
-        existingAccount,
-        accountRuntimeState(account),
-        setClaustrumHandleAccountIds.has(account.id) ||
-          setClaustrumHandleAccountIds.has(accountId),
-      )
+      const configured = configAccounts.get(accountId)
+      if (
+        configured &&
+        typeof configured.claustrumScopedCredentialId === 'string' &&
+        typeof configured.anthropicAccountUuid === 'string'
+      ) {
+        const matches = (value: unknown): value is AccountRuntimeEntry =>
+          isRecord(value) &&
+          value.claustrumScopedCredentialId ===
+            configured.claustrumScopedCredentialId &&
+          value.anthropicAccountUuid === configured.anthropicAccountUuid
+        const incoming = accountRuntimeState(account)
+        const merged = mergeAccountRuntimeState(
+          matches(existingAccount) ? existingAccount : undefined,
+          matches(incoming) ? incoming : {},
+        )
+        // The current config owns identity. Older local writers cannot restore
+        // credentials, handles or another account's observations after cutover.
+        next.accounts[accountId] = {
+          ...merged,
+          claustrumScopedCredentialId: configured.claustrumScopedCredentialId,
+          anthropicAccountUuid:
+            configured.anthropicAccountUuid as ProviderAccountUuid,
+          refresh: '',
+        }
+        const scoped = next.accounts[accountId]
+        delete scoped.access
+        delete scoped.expires
+        delete scoped.lastRefreshedAt
+        delete scoped.lastRefreshError
+        delete scoped.claustrumHandle
+      } else {
+        const merged = mergeAccountRuntimeState(
+          existingAccount,
+          accountRuntimeState(account),
+          setClaustrumHandleAccountIds.has(account.id) ||
+            setClaustrumHandleAccountIds.has(accountId),
+        )
+        if (configured) {
+          delete merged.claustrumScopedCredentialId
+          delete merged.claustrumScopedState
+        }
+        next.accounts[accountId] = merged
+      }
     }
     if (configuredIds) {
       // Config membership is authoritative for scoped writes too; otherwise a
@@ -2468,7 +2790,10 @@ export async function acquireRefreshFileLock(options: {
       | 'stale-lock-confirmed'
       | 'eviction-marker-acquired',
   ) => void | Promise<void>
-}): Promise<{ release: () => Promise<void> } | null> {
+}): Promise<{
+  release: () => Promise<void>
+  assertOwned: () => Promise<void>
+} | null> {
   const accountPath = options.path ?? getAccountStoragePath()
   const lockPath = `${accountPath}.${options.name}.lock`
   const legacyOwnerPath = join(lockPath, 'owner.json')
@@ -2670,6 +2995,12 @@ export async function acquireRefreshFileLock(options: {
   scheduleRenewal()
 
   return {
+    assertOwned: async () => {
+      const owner = await readOwner().catch(() => undefined)
+      if (released || owner?.ownerId !== ownerId) {
+        throw new Error('Account file lock ownership was lost')
+      }
+    },
     release: async () => {
       released = true
       if (renewTimer) {
@@ -3568,23 +3899,40 @@ export async function removeAccountPersistent(
   id: string,
   path = getAccountStoragePath(),
 ): Promise<boolean> {
-  const storage = await loadAccounts(path)
-  if (!storage) return false
-  const existed = removeAccount(storage, id)
-  if (existed) {
-    await saveAccounts(storage, path, { removedAccountIds: [id] })
-  }
-  return existed
+  return mutateAccountsPersistent(path, (storage) => {
+    const account = storage.accounts.find((entry) => entry.id === id)
+    if (
+      account &&
+      isOAuthAccount(account) &&
+      account.claustrumScopedCredentialId &&
+      getClaustrumMode(storage) === 'claustrum'
+    ) {
+      throw new Error(
+        'Disable this account or remove it from Claustrum; scoped membership is managed by the vault',
+      )
+    }
+    const existed = removeAccount(storage, id)
+    return {
+      storage,
+      result: existed,
+      save: existed,
+      options: { removedAccountIds: [id] },
+    }
+  })
 }
 
 export async function reorderAccountsPersistent(
   orderedIds: string[],
   path = getAccountStoragePath(),
 ) {
-  const storage = await loadAccounts(path)
-  if (!storage) return
-  reorderAccounts(storage, orderedIds)
-  await saveAccounts(storage, path, { preserveExistingAccountOrder: false })
+  await mutateAccountsPersistent(path, (storage) => {
+    reorderAccounts(storage, orderedIds)
+    return {
+      storage,
+      result: undefined,
+      options: { preserveExistingAccountOrder: false },
+    }
+  })
 }
 
 export async function setAccountEnabledPersistent(
@@ -3592,24 +3940,71 @@ export async function setAccountEnabledPersistent(
   enabled: boolean,
   path = getAccountStoragePath(),
 ): Promise<boolean> {
-  const storage = await loadAccounts(path)
-  if (!storage) return false
-  const found = setAccountEnabled(storage, id, enabled)
-  if (found) await saveAccounts(storage, path)
-  return found
+  return mutateAccountsPersistent(path, (storage) => {
+    const found = setAccountEnabled(storage, id, enabled)
+    const account = storage.accounts.find((candidate) => candidate.id === id)
+    if (
+      account &&
+      isOAuthAccount(account) &&
+      (account.claustrumScopedCredentialId ||
+        storage.claustrum?.scopedRoster) &&
+      account.anthropicAccountUuid
+    ) {
+      const disabled = new Set(
+        storage.claustrum?.disabledAccountIdentities ?? [],
+      )
+      if (enabled) disabled.delete(account.anthropicAccountUuid)
+      else disabled.add(account.anthropicAccountUuid)
+      storage.claustrum = {
+        ...storage.claustrum,
+        disabledAccountIdentities: [...disabled],
+      }
+    }
+    return { storage, result: found, save: found }
+  })
 }
 
 export async function addAccountPersistent(
   account: FallbackAccount,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
-  upsertAccount(storage, account)
-  await saveAccounts(storage, path, {
-    setClaustrumHandleAccountIds:
-      account.type === 'oauth' && account.claustrumHandle
-        ? [account.id]
-        : undefined,
+  await mutateAccountsPersistent(path, (storage) => {
+    if (
+      storage.claustrum?.scopedRoster &&
+      getClaustrumMode(storage) === 'claustrum' &&
+      isOAuthAccount(account)
+    ) {
+      throw new Error(
+        'Claustrum account membership is managed by the vault; add accounts with ck auth login',
+      )
+    }
+    upsertAccount(storage, account)
+    if (
+      isOAuthAccount(account) &&
+      getClaustrumMode(storage) === 'local' &&
+      account.refresh &&
+      !isCustodyTombstoneValue(account.refresh)
+    ) {
+      const updated = storage.accounts.find(
+        (entry) =>
+          entry.id === account.id ||
+          (account.label && entry.label === account.label),
+      )
+      if (updated && isOAuthAccount(updated)) {
+        delete updated.claustrumScopedCredentialId
+        delete updated.claustrumScopedState
+      }
+    }
+    return {
+      storage,
+      result: undefined,
+      options: {
+        setClaustrumHandleAccountIds:
+          account.type === 'oauth' && account.claustrumHandle
+            ? [account.id]
+            : undefined,
+      },
+    }
   })
 }
 
@@ -4766,7 +5161,10 @@ export class FallbackAccountManager {
       changed = true
       access = this.resolveFallbackAccessToken(target, storage)
     }
-    if (!access) {
+    const delegatedQuotaAuthorization =
+      storage?.claustrum?.scopedRoster === true &&
+      this.quotaManager?.canFetchWithoutAccessToken() === true
+    if (!access && !delegatedQuotaAuthorization) {
       log('[quota] fallback quota poll skipped: no usable credential', {
         accountId: target.id,
       })
@@ -4809,7 +5207,7 @@ export class FallbackAccountManager {
     const fetchStartedAt = this.now()
     let fetched = false
     try {
-      const result = await fetchSnapshot(access.token)
+      const result = await fetchSnapshot(access?.token ?? '')
       target.quota = result.quota
       fetched = result.fetched
     } catch (error) {
@@ -4817,7 +5215,7 @@ export class FallbackAccountManager {
       if (
         !message.includes('Claude quota check failed: 401') ||
         vaultEnabled ||
-        access.source !== 'sidecar'
+        access?.source !== 'sidecar'
       ) {
         throw error
       }

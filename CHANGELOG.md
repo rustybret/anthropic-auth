@@ -4,14 +4,28 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+## 1.23.0
+
 ### Minor Changes
+
+- Support Claude Opus 5.5 (`claude-opus-5-5`) across Core, OpenCode, and Pi:
+  - Expose Opus 5.5 model specifications (1,000,000 token context window, 128,000 max output tokens, $4/$20 MTok pricing).
+  - Enforce always-on adaptive thinking with summarized display (`thinking: { type: "adaptive", display: "summarized" }`) per Anthropic's Opus 5.5 specification, automatically rewriting disabled thinking or manual token budgets to adaptive summarized to prevent 400 invalid request errors.
+  - Expose native adaptive `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Opus 5.5 in OpenCode's provider catalog and Pi.
+  - Support Anthropic fast mode (`speed: "fast"` with `fast-mode-2026-02-01` beta header) on Opus 5.5.
+  - Provide refusal recovery and server-side safety fallback parity for Opus 5.5, isolating recovery state between Opus 5 and Opus 5.5.
+- Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
+- Add Claustrum vault custody support to Pi with native ambient authentication, per-dispatch scoped credential authorization, atomic roster reconciliation, and version-fenced 401 reporting.
+- Implement zero-bind scoped Claustrum custody across OpenCode and Pi, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
 
 - Add the global `/claude-account claustrum|local` custody mode for every OpenCode OAuth account, including main-account tombstone takeover, fail-closed serving, and explicit Pi refusal.
 - Add global Claustrum manifest onboarding, startup legacy-handle migration, and verified local re-login recovery.
+- Add a crash-resumable OpenCode Claustrum enrollment ceremony for the future scoped-discovery cutover, using producer-owned typed wire decoders, one host-global owner-only token, secret-before-propose persistence, process/file-lock sharing, and explicit pending/terminal status without enabling scoped credential spending yet.
 - Add API-key/proxy-only custom headers and model aliases for OpenCode and Pi, preserving versioned proxy base paths while protecting route authentication, protocol headers, and internal correlation state.
 
 ### Patch Changes
 
+- Bind sticky-balanced affinity to the user-selected model for OpenCode and Pi, discarding the old assignment and CacheKeep route preference on a real model change while preserving account affinity for transparent Fable/Opus recovery.
 - Enroll newly bound Claustrum OAuth accounts into the OpenCode routing pool at startup or live without a restart, after exact credential-ID and provider-account verification; immediately prime quota for sticky-balanced routing, persist only secret-free tombstone rows, preserve disabled accounts, and recover missed manifest watch events with one process-shared metadata poll.
 - Remove obsolete root-level build output before workspace builds so stale pre-custody CLI artifacts cannot bypass current account and Claustrum safeguards.
 - Give consecutive Desktop fallback notices distinct, pre-registered message IDs before the assistant; defer delivery when safe ordering is unavailable and bound notice tracking across sessions (#230).

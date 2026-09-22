@@ -99,6 +99,7 @@ test('drops a persisted blank Claustrum handlesFile', async () => {
 
 test('excludes an empty-material vault fallback after its quota policy fails', async () => {
   const now = 1_000_000
+  // @ts-expect-error A legacy vault row may omit all local OAuth material.
   const account: OAuthAccount = {
     id: 'vault-fallback',
     type: 'oauth',
@@ -128,7 +129,10 @@ test('excludes an empty-material vault fallback after its quota policy fails', a
       token: 'vault-fallback-access',
       source: 'vault',
     }),
-    fetchImpl: async (_input, init) => {
+    fetchImpl: (async (
+      _input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
       authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
       return new Response(
         JSON.stringify({
@@ -136,7 +140,7 @@ test('excludes an empty-material vault fallback after its quota policy fails', a
           seven_day: { utilization: 96 },
         }),
       )
-    },
+    }) as unknown as typeof fetch,
   })
 
   await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([])

@@ -7,12 +7,19 @@ import {
   CLAUDE_FABLE_MYTHOS_5_1_RELEASE_DATE,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_MYTHOS_5_1_MODEL_ID,
+  CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
+  CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
+  CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_PRICING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_MODEL_ID,
   getClaudeFableMythos5ReleaseDate,
   isClaudeFable51Model,
   isClaudeFableOrMythos5Model,
+  isClaudeOpus5FamilyModel,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isClaudeSonnet5Model,
   normalizeAnthropicModelId,
 } from '../models'
@@ -151,6 +158,11 @@ describe('isClaudeOpus5Model', () => {
     expect(isClaudeOpus5Model('claude-mythos-5')).toBe(false)
   })
 
+  test('does not match claude-opus-5-5 (isolated models)', () => {
+    expect(isClaudeOpus5Model('claude-opus-5-5')).toBe(false)
+    expect(isClaudeOpus5Model('claude-opus-5-5-20260918')).toBe(false)
+  })
+
   test('does not match Sonnet 5', () => {
     expect(isClaudeOpus5Model('claude-sonnet-5')).toBe(false)
   })
@@ -169,5 +181,47 @@ describe('CLAUDE_OPUS_5_ADAPTIVE_THINKING', () => {
       type: 'adaptive',
       display: 'summarized',
     })
+  })
+})
+
+describe('Claude Opus 5.5 model', () => {
+  test('exposes Opus 5.5 model specifications and pricing', () => {
+    expect(CLAUDE_OPUS_5_5_MODEL_ID).toBe('claude-opus-5-5')
+    expect(CLAUDE_OPUS_5_5_CONTEXT_WINDOW).toBe(1_000_000)
+    expect(CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS).toBe(128_000)
+    expect(CLAUDE_OPUS_5_5_PRICING).toEqual({
+      input: 4,
+      output: 20,
+      cacheRead: 0.2,
+      cacheWrite5m: 5,
+      cacheWrite1h: 8,
+    })
+    expect(CLAUDE_OPUS_5_5_ADAPTIVE_THINKING).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+    })
+  })
+
+  test('matches the bare claude-opus-5-5 id', () => {
+    expect(isClaudeOpus55Model('claude-opus-5-5')).toBe(true)
+    expect(isClaudeOpus55Model('claude-opus-5-5[1m]')).toBe(true)
+  })
+
+  test('matches a dated claude-opus-5-5 snapshot', () => {
+    expect(isClaudeOpus55Model('claude-opus-5-5-20260918')).toBe(true)
+  })
+
+  test('does not match claude-opus-5 or older models', () => {
+    expect(isClaudeOpus55Model('claude-opus-5')).toBe(false)
+    expect(isClaudeOpus55Model('claude-opus-5-20260701')).toBe(false)
+    expect(isClaudeOpus55Model('claude-opus-4-8')).toBe(false)
+    expect(isClaudeOpus55Model('claude-sonnet-5')).toBe(false)
+  })
+
+  test('isClaudeOpus5FamilyModel matches both Opus 5 and Opus 5.5', () => {
+    expect(isClaudeOpus5FamilyModel('claude-opus-5')).toBe(true)
+    expect(isClaudeOpus5FamilyModel('claude-opus-5-5')).toBe(true)
+    expect(isClaudeOpus5FamilyModel('claude-opus-5-5-20260918')).toBe(true)
+    expect(isClaudeOpus5FamilyModel('claude-opus-4-8')).toBe(false)
   })
 })

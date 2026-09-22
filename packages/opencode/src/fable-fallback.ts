@@ -2,6 +2,7 @@ import {
   CLAUDE_FABLE_5_1_MODEL_ID,
   CLAUDE_FABLE_5_MODEL_ID,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   normalizeAnthropicModelId,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -51,13 +52,18 @@ type FableFallbackState = {
  * the same classifier refusal shape and recovery period. Mythos has no
  * classifiers and Sonnet 5 is not flagged — both stay outside this gate.
  */
-export type RecoverableRefusalFamily = 'fable-5' | 'fable-5-1' | 'opus-5'
+export type RecoverableRefusalFamily =
+  | 'fable-5'
+  | 'fable-5-1'
+  | 'opus-5'
+  | 'opus-5-5'
 
 export function recoverableRefusalFamily(
   model: unknown,
 ): RecoverableRefusalFamily | null {
   if (typeof model !== 'string') return null
   const normalized = normalizeAnthropicModelId(model)
+  if (isClaudeOpus55Model(normalized)) return 'opus-5-5'
   if (isClaudeOpus5Model(normalized)) return 'opus-5'
   if (
     normalized === CLAUDE_FABLE_5_1_MODEL_ID ||

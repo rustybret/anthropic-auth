@@ -47,6 +47,7 @@ export type StickyRouteCandidate = {
 export type StickyRouteAssignment = {
   accountId: string
   family: StickyRouteFamily
+  affinityModelId?: string
   assignedAt: number
   lastSeenAt: number
   initialInputBytes: number
@@ -188,9 +189,19 @@ function normalizeAssignment(
   ) {
     return
   }
+  if (
+    Object.hasOwn(value, 'affinityModelId') &&
+    typeof value.affinityModelId !== 'string'
+  ) {
+    return
+  }
   return {
     accountId: value.accountId,
     family: value.family as StickyRouteFamily,
+    affinityModelId:
+      typeof value.affinityModelId === 'string'
+        ? value.affinityModelId
+        : undefined,
     assignedAt,
     lastSeenAt,
     initialInputBytes: Math.max(0, initialInputBytes),
@@ -627,6 +638,7 @@ export class StickySessionRouter {
     sessionId: string
     family: StickyRouteFamily
     modelId?: string
+    affinityModelId?: string
     candidates: readonly StickyRouteCandidate[]
     retainAccountIds: ReadonlySet<string>
     storage: AccountStorage | null
@@ -637,10 +649,16 @@ export class StickySessionRouter {
     if (!input.sessionId) return null
     await this.refreshStateIfChanged()
     const key = sessionKey(input.sessionId)
+    const affinityModelId = input.affinityModelId ?? input.modelId
+    const matchesAffinity = (assignment: StickyRouteAssignment) =>
+      affinityModelId !== undefined
+        ? assignment.affinityModelId === affinityModelId
+        : assignment.family === input.family
     const cached = this.state.assignments[key]
     if (
       cached &&
       this.assignmentIsActive(cached) &&
+      matchesAffinity(cached) &&
       input.retainAccountIds.has(cached.accountId) &&
       !input.excludeAccountIds?.has(cached.accountId)
     ) {
@@ -663,6 +681,7 @@ export class StickySessionRouter {
       const current = state.assignments[key]
       if (
         current &&
+        matchesAffinity(current) &&
         input.retainAccountIds.has(current.accountId) &&
         !input.excludeAccountIds?.has(current.accountId)
       ) {
@@ -675,22 +694,27 @@ export class StickySessionRouter {
           migrated: false,
         }
       }
+      const affinityChanged = Boolean(current && !matchesAffinity(current))
+      if (affinityChanged) {
+        delete state.assignments[key]
+      }
       const candidates = input.candidates.filter(
         (candidate) => !input.excludeAccountIds?.has(candidate.accountId),
       )
-      const preferred = input.preferredAccountId
-        ? candidates.find(
-            (candidate) =>
-              candidate.accountId === input.preferredAccountId &&
-              stickyRouteCandidateWeight({
-                candidate,
-                family: input.family,
-                modelId: input.modelId,
-                storage: input.storage,
-                now: this.now(),
-              }) > 0,
-          )
-        : undefined
+      const preferred =
+        !affinityChanged && input.preferredAccountId
+          ? candidates.find(
+              (candidate) =>
+                candidate.accountId === input.preferredAccountId &&
+                stickyRouteCandidateWeight({
+                  candidate,
+                  family: input.family,
+                  modelId: input.modelId,
+                  storage: input.storage,
+                  now: this.now(),
+                }) > 0,
+            )
+          : undefined
       const selected =
         preferred ?? this.selectCandidate({ ...input, candidates, state })
       if (!selected) {
@@ -705,6 +729,7 @@ export class StickySessionRouter {
       const assignment: StickyRouteAssignment = {
         accountId: selected.accountId,
         family: input.family,
+        affinityModelId,
         assignedAt: now,
         lastSeenAt: now,
         initialInputBytes: Math.max(1, input.inputBytes),

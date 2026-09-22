@@ -188,6 +188,10 @@ if (
   throw new Error('test manifest path escaped the isolated test directory')
 }
 process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(testDir, 'anthropic-auth.json')
+process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+  testDir,
+  'opencode-enrollment.json',
+)
 process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
   testDir,
   'sidebar-state.json',

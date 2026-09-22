@@ -168,9 +168,39 @@ export function isClaudeOpus5Model(model: unknown) {
   if (typeof model !== 'string') return false
   const normalized = normalizeAnthropicModelId(model)
   return (
-    normalized === CLAUDE_OPUS_5_MODEL_ID ||
-    normalized.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`)
+    !isClaudeOpus55Model(normalized) &&
+    (normalized === CLAUDE_OPUS_5_MODEL_ID ||
+      normalized.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`))
   )
+}
+
+export const CLAUDE_OPUS_5_5_MODEL_ID = 'claude-opus-5-5'
+export const CLAUDE_OPUS_5_5_RELEASE_DATE = '2026-09-18'
+export const CLAUDE_OPUS_5_5_CONTEXT_WINDOW = 1_000_000
+export const CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS = 128_000
+
+export const CLAUDE_OPUS_5_5_PRICING = {
+  input: 4,
+  output: 20,
+  cacheRead: 0.2,
+  cacheWrite5m: 5,
+  cacheWrite1h: 8,
+} as const
+
+export const CLAUDE_OPUS_5_5_ADAPTIVE_THINKING =
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
+
+export function isClaudeOpus55Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return (
+    normalized === CLAUDE_OPUS_5_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_OPUS_5_5_MODEL_ID}-`)
+  )
+}
+
+export function isClaudeOpus5FamilyModel(model: unknown) {
+  return isClaudeOpus5Model(model) || isClaudeOpus55Model(model)
 }
 
 export function isOpenAIReasoningSignature(value: unknown): boolean {

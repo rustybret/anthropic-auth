@@ -1,0 +1,76 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+export const OPENCODE_PACKAGE_NAME = '@cortexkit/opencode-anthropic-auth'
+export const PI_PACKAGE_NAME = '@cortexkit/pi-anthropic-auth'
+
+export function getOpenCodeConfigDir(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const configured = env.OPENCODE_CONFIG_DIR?.trim()
+  if (configured) return resolve(configured)
+  const xdg = env.XDG_CONFIG_HOME?.trim()
+  if (xdg) return join(resolve(xdg), 'opencode')
+  return join(homedir(), '.config', 'opencode')
+}
+
+export function getOpenCodeDataDir(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const xdg = env.XDG_DATA_HOME?.trim()
+  if (xdg) return join(resolve(xdg), 'opencode')
+  return join(homedir(), '.local', 'share', 'opencode')
+}
+
+export function getOpenCodeAuthPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(getOpenCodeDataDir(env), 'auth.json')
+}
+
+export function getPiAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim()
+  if (configured) return resolve(configured)
+  return join(homedir(), '.pi', 'agent')
+}
+
+export function getPiAuthPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(getPiAgentDir(env), 'auth.json')
+}
+
+export function opencodePluginEntry(version: string): string {
+  return `${OPENCODE_PACKAGE_NAME}@${version}`
+}
+
+export function opencodeTuiEntry(version: string): string {
+  return `${OPENCODE_PACKAGE_NAME}@${version}`
+}
+
+export function piPluginEntry(version: string): string {
+  return `npm:${PI_PACKAGE_NAME}@${version}`
+}
+
+/**
+ * Robustly resolve the package version from both source (src/setup/paths.ts)
+ * and bundled layouts (dist/cli.js, dist/index.js, etc.).
+ */
+export async function getSetupPackageVersion(): Promise<string> {
+  let dir = dirname(fileURLToPath(import.meta.url))
+  for (let i = 0; i < 5; i++) {
+    const candidate = join(dir, 'package.json')
+    if (existsSync(candidate)) {
+      try {
+        const pkg = JSON.parse(readFileSync(candidate, 'utf8'))
+        if (typeof pkg.version === 'string' && pkg.version.trim()) {
+          return pkg.version.trim()
+        }
+      } catch {}
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return '1.22.0'
+}

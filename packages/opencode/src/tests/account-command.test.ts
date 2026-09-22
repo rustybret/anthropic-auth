@@ -209,6 +209,15 @@ describe('parseAccountCommandAction', () => {
     expect(parseAccountCommandAction('enable')).toEqual({ type: 'usage' })
   })
 
+  test('parses enrollment-reset without arguments', async () => {
+    expect(parseAccountCommandAction('enrollment-reset')).toEqual({
+      type: 'enrollment-reset',
+    })
+    expect(parseAccountCommandAction('enrollment-reset extra')).toEqual({
+      type: 'usage',
+    })
+  })
+
   test('garbage returns usage', async () => {
     expect(parseAccountCommandAction('garbage')).toEqual({ type: 'usage' })
   })
@@ -394,6 +403,85 @@ describe('executeAccountCommand status', () => {
 
     expect(result.text).toContain('Claustrum: available')
     expect(result.text).toContain('**Work account** [fallback] · vault reauth')
+  })
+
+  test('renders the pending enrollment approval command in account status', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage: baseStorage(),
+      statusProjection: {
+        claustrumDetection: 'available',
+        claustrumEnrollment: {
+          state: 'pending',
+          proposedName: 'anthropic-auth-opencode',
+          requestId: 'request_123',
+        },
+        accounts: [],
+      },
+    })
+    expect(result.text).toContain('Enrollment: pending approval (request_123)')
+    expect(result.text).toContain(
+      'ck auth enroll approve --request-id request_123',
+    )
+  })
+
+  test('labels an approved enrollment as ceremony-only and prints the native grant', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage: baseStorage(),
+      statusProjection: {
+        claustrumDetection: 'available',
+        claustrumEnrollment: {
+          state: 'approved',
+          proposedName: 'anthropic-auth-opencode',
+          approvedName: 'anthropic-auth-opencode',
+          tokenGeneration: 1,
+        },
+        accounts: [],
+      },
+    })
+    expect(result.text).toContain('scoped serving not active yet')
+    expect(result.text).toContain(
+      '--selector anthropic-native --operation read',
+    )
+  })
+
+  test('does not interpolate unsafe enrollment identifiers into shell commands', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage: baseStorage(),
+      statusProjection: {
+        claustrumDetection: 'available',
+        claustrumEnrollment: {
+          state: 'pending',
+          proposedName: 'anthropic-auth-opencode',
+          requestId: 'request`touch /tmp/bad`',
+        },
+        accounts: [],
+      },
+    })
+    expect(result.text).toContain('inspect it with `ck auth enroll list`')
+    expect(result.text).not.toContain('--request-id request`')
+  })
+
+  test('routes enrollment-reset only in Claustrum mode', async () => {
+    const local = await executeAccountCommand({
+      argumentsText: 'enrollment-reset',
+      storage: baseStorage(),
+      resetEnrollment: async () => ({ text: 'unexpected' }),
+    })
+    expect(local.text).toContain('only in Claustrum mode')
+
+    const storage = baseStorage()
+    storage.claustrum = { mode: 'claustrum' }
+    const resetEnrollment = mock(async () => ({ text: 'reset' }))
+    const result = await executeAccountCommand({
+      argumentsText: 'enrollment-reset',
+      storage,
+      resetEnrollment,
+    })
+    expect(result.text).toBe('reset')
+    expect(resetEnrollment).toHaveBeenCalledTimes(1)
   })
 
   test('renders a resolved custody binding without a status projection', async () => {

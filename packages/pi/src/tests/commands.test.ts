@@ -84,7 +84,7 @@ afterAll(() => {
 })
 
 describe('claude-account persistence', () => {
-  test('refuses global custody modes without changing Pi config or state', async () => {
+  test('refuses custody changes without a host controller and preserves Pi config and state', async () => {
     const initial = {
       version: 1,
       claustrum: { accounts: { unrelated: { enabled: true } } },
@@ -113,8 +113,8 @@ describe('claude-account persistence', () => {
     await handler!('local', ctx)
 
     expect(notified).toEqual([
-      'Custody mode is managed from OpenCode; Pi does not participate.',
-      'Custody mode is managed from OpenCode; Pi does not participate.',
+      'Refused: Pi custody controller is unavailable.',
+      'Refused: Pi custody controller is unavailable.',
     ])
     expect(await readFile(accountPath, 'utf8')).toBe(beforeConfig)
     expect(await readFile(statePath, 'utf8')).toBe(beforeState)

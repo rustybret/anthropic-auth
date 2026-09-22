@@ -63,10 +63,10 @@ function mockPi() {
 }
 
 describe('cortexKitPiAnthropicAuth provider registration', () => {
-  test('exposes Claude Sonnet 5 in the Pi Anthropic catalog', () => {
+  test('exposes Claude Sonnet 5 in the Pi Anthropic catalog', async () => {
     const { pi, providers } = mockPi()
 
-    cortexKitPiAnthropicAuth(pi)
+    await cortexKitPiAnthropicAuth(pi)
 
     const anthropic = providers.get('anthropic')
     expect(anthropic).toBeDefined()
@@ -85,10 +85,10 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     })
   })
 
-  test('exposes Claude Fable and Mythos 5.1 in the Pi Anthropic catalog', () => {
+  test('exposes Claude Fable and Mythos 5.1 in the Pi Anthropic catalog', async () => {
     const { pi, providers } = mockPi()
 
-    cortexKitPiAnthropicAuth(pi)
+    await cortexKitPiAnthropicAuth(pi)
 
     const models = providers.get('anthropic')?.models ?? []
     expect(models).toEqual(
@@ -113,10 +113,29 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     )
   })
 
-  test('exposes Claude Opus 5 in the Pi Anthropic catalog', () => {
+  test('exposes Claude Opus 5.5 in the Pi Anthropic catalog', async () => {
     const { pi, providers } = mockPi()
 
-    cortexKitPiAnthropicAuth(pi)
+    await cortexKitPiAnthropicAuth(pi)
+
+    const opus55 = providers
+      .get('anthropic')
+      ?.models?.find((model) => model.id === 'claude-opus-5-5')
+    expect(opus55).toMatchObject({
+      id: 'claude-opus-5-5',
+      name: 'Claude Opus 5.5',
+      reasoning: true,
+      input: ['text', 'image'],
+      cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 8 },
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+    })
+  })
+
+  test('exposes Claude Opus 5 in the Pi Anthropic catalog', async () => {
+    const { pi, providers } = mockPi()
+
+    await cortexKitPiAnthropicAuth(pi)
 
     const opus5 = providers
       .get('anthropic')
@@ -151,7 +170,7 @@ describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
     )
 
     const { pi, providers, events } = mockPi()
-    cortexKitPiAnthropicAuth(pi)
+    await cortexKitPiAnthropicAuth(pi)
 
     // minimal -> low, then xhigh, with one assistant message between them.
     const branch = [
@@ -240,7 +259,7 @@ describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
 
   test('degrades to no transitions when the host session shape is unreadable', async () => {
     const { pi, events } = mockPi()
-    cortexKitPiAnthropicAuth(pi)
+    await cortexKitPiAnthropicAuth(pi)
 
     const handler = events.get('turn_start')
     expect(handler).toBeDefined()

@@ -11,6 +11,7 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
@@ -20,6 +21,7 @@ import {
   isClaudeFableOrMythos5Model,
   isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
@@ -1059,6 +1061,13 @@ function normalizeSonnet5Request(
 function normalizeOpus5Request(
   parsed: Record<string, unknown>,
 ): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+  if (isClaudeOpus55Model(parsed.model)) {
+    // Opus 5.5 has adaptive thinking ALWAYS ON: setting `type: "disabled"` or manual
+    // `budget_tokens` returns a 400 invalid_request_error. Rewrite to adaptive summarized.
+    const hadThinking = Object.hasOwn(parsed, 'thinking')
+    parsed.thinking = { ...CLAUDE_OPUS_5_5_ADAPTIVE_THINKING }
+    return { replacedExisting: hadThinking, display: 'summarized' }
+  }
   if (!isClaudeOpus5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   const thinking = parsed.thinking

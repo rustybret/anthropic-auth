@@ -36,7 +36,7 @@ test('a completed older main request does not clear a newer in-flight refresh', 
         await releaseSecond.promise
       }
       return Response.json(quotaResponse)
-    }) as typeof fetch,
+    }) as unknown as typeof fetch,
   })
 
   const first = manager.refreshMainWithMetadata('main', 'token-a')
@@ -115,4 +115,80 @@ test('an unbound future timestamp cannot replace a newer in-memory main snapshot
     checkedAt: 200,
     quota: { five_hour: { usedPercent: 20 } },
   })
+})
+
+test('custody quota transport authorizes only actual fetches and supports secret-free routes', async () => {
+  const calls: Array<{
+    kind: string
+    accountId: string | undefined
+    accessToken: string
+  }> = []
+  let directFetches = 0
+  let now = Date.now()
+  const manager = new QuotaManager({
+    storage: null,
+    now: () => now,
+    fetchImpl: (async () => {
+      directFetches += 1
+      throw new Error('local transport must not run')
+    }) as unknown as typeof fetch,
+    fetchQuotaSnapshot: async (request) => {
+      calls.push(request)
+      return {
+        checkedAt: now,
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+      }
+    },
+  })
+  const main = await manager.refreshMainWithMetadata('scoped-main', '')
+  expect(main.fetched).toBe(true)
+  now += 2_000
+  const fallback = await manager.refreshFallbackWithMetadata(
+    'scoped-fallback',
+    '',
+    undefined,
+  )
+  expect(fallback.fetched).toBe(true)
+  expect(calls).toEqual([
+    { kind: 'main', accountId: 'scoped-main', accessToken: '' },
+    { kind: 'fallback', accountId: 'scoped-fallback', accessToken: '' },
+  ])
+  expect(directFetches).toBe(0)
+})
+
+test('custody quota authorization refusal never falls back to the supplied local token', async () => {
+  let directFetches = 0
+  const manager = new QuotaManager({
+    storage: null,
+    fetchImpl: (async () => {
+      directFetches += 1
+      return Response.json(quotaResponse)
+    }) as unknown as typeof fetch,
+    fetchQuotaSnapshot: async () => {
+      throw new Error('custody authorization revoked')
+    },
+  })
+  await expect(
+    manager.refreshMainWithMetadata('scoped-main', 'must-not-use-local-token'),
+  ).rejects.toThrow('custody authorization revoked')
+  expect(directFetches).toBe(0)
+  expect(manager.getMain('scoped-main')).toBeNull()
+})
+
+test('an absent local fallback token is rejected before HTTP dispatch', async () => {
+  let fetches = 0
+  const manager = new QuotaManager({
+    storage: null,
+    fetchImpl: Object.assign(
+      async () => {
+        fetches++
+        return Response.json(quotaResponse)
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  await expect(
+    manager.refreshFallback('missing-token-account', '', undefined),
+  ).rejects.toThrow('access token is unavailable')
+  expect(fetches).toBe(0)
 })

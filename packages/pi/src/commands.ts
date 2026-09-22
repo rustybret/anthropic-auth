@@ -16,8 +16,10 @@ import {
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
+  formatEnrollmentStatus,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getClaustrumMode,
   getPersistedLogLevel,
   getRoutingMode,
   isCache1hPersistentlyEnabled,
@@ -57,7 +59,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
-
+import type { PiCustodyCommands } from './custody.ts'
 import { getPiAccountStoragePath } from './paths.ts'
 import {
   clearPiStickyRoutingSession,
@@ -74,7 +76,10 @@ function notify(
   ctx.ui.notify(message, kind)
 }
 
-export function registerCommands(pi: ExtensionAPI) {
+export function registerCommands(
+  pi: ExtensionAPI,
+  custody?: PiCustodyCommands,
+) {
   pi.registerCommand('claude-cache', {
     description: 'Show or configure Claude 1-hour prompt cache mode',
     handler: async (args, ctx) => {
@@ -274,17 +279,31 @@ export function registerCommands(pi: ExtensionAPI) {
         argumentsText: args ?? '',
         storage: storage ?? createEmptyStorage(),
         path,
-        transition: async () => ({
-          text: 'Custody mode is managed from OpenCode; Pi does not participate.',
-        }),
+        transition:
+          custody?.transition ??
+          (async () => ({
+            text: 'Refused: Pi custody controller is unavailable.',
+          })),
+        resetEnrollment: custody?.reset,
         claustrum:
           action.type === 'status'
             ? await detectClaustrumConnection()
             : undefined,
       })
 
+      if (action.type === 'status' && custody) {
+        try {
+          result.text += `\n${formatEnrollmentStatus(await custody.status(), getClaustrumMode(storage) === 'claustrum').join('\n')}`
+        } catch {
+          result.text += '\n- Enrollment: unavailable'
+        }
+      }
       if (!result.updated) {
-        notify(ctx, result.text)
+        notify(
+          ctx,
+          result.text,
+          result.text.startsWith('Refused:') ? 'error' : 'info',
+        )
         return
       }
 

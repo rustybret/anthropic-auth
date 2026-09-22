@@ -45,9 +45,9 @@ This repository is a Bun workspace monorepo. It is maintained as a downstream fo
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
 - **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
-- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
-- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5/5.1, Mythos 5/5.1, and Opus 5. OpenCode exposes native `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Fable 5.1 and Opus 5. OAuth Fable 5.1 sessions can change effort between turns without rewriting the cached prefix.
-- **Fable/Opus 5 safety fallback (OpenCode)**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
+- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models (`claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`).
+- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5/5.1, Mythos 5/5.1, Opus 5, and Opus 5.5. OpenCode exposes native `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Fable 5.1, Opus 5, and Opus 5.5. On Opus 5.5, thinking is always on (adaptive summarized) per the model specification. OAuth Fable 5.1 sessions can change effort between turns without rewriting the cached prefix.
+- **Fable/Opus 5 and 5.5 safety fallback (OpenCode)**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **Host-local quota feed (OpenCode)**: optionally publish sanitized response-header quota observations so another local CortexKit process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
 - **Quota sidebar widget**: register the OpenCode TUI plugin in `tui.json` to render a live sidebar with per-account quota, routing, cache, and health state.
@@ -67,17 +67,34 @@ This repository is a Bun workspace monorepo. It is maintained as a downstream fo
 - Add `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands to OpenCode.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
-## Quick Start & Fresh Clone Setup
+## Quick setup (recommended)
 
-On a fresh clone, run the repository setup script to initialize submodules, verify toolchain dependencies, hydrate the Arcus distribution pipeline, and install dependencies:
+Set up OpenCode, Pi, and optional Claustrum custody in one command:
 
 ```bash
-git clone --recurse-submodules https://github.com/rustybret/anthropic-auth.git
+bunx @cortexkit/opencode-anthropic-auth setup
+```
+
+The interactive setup wizard:
+- Detects OpenCode, Pi, `ck`, and the running Claustrum daemon
+- Configures `@cortexkit/opencode-anthropic-auth` in `opencode.jsonc` and `tui.jsonc`
+- Installs `@cortexkit/pi-anthropic-auth` into Pi via `pi install`
+- Optionally activates Claustrum vault custody for both OpenCode and Pi (approving consumer enrollment, granting `category:anthropic-native`, discovering accounts, and installing OpenCode's activation tombstone)
+- All accounts logged in via `ck auth login --provider anthropic` are discovered automatically without manual binds, manifest files, or restarts
+
+---
+
+## Fresh Clone & Arcus Packaging Setup
+
+On a fresh clone, run the repository setup script to bootstrap the Arcus publisher toolchain, repair script symlinks, install dependencies, and verify the workspace build:
+
+```bash
+git clone https://github.com/rustybret/anthropic-auth.git
 cd anthropic-auth
 bun run setup
 ```
 
-If cloned without `--recurse-submodules`, `bun run setup` (or `bash scripts/setup.sh`) will automatically initialize and hydrate `submodules/arcus`, repair Arcus pipeline script symlinks, install workspace dependencies, and verify the workspace build.
+`bun run setup` (or `bash scripts/setup.sh`) bootstraps the Arcus publisher toolchain (`packages/arcus/bootstrap.sh`), repairs Arcus pipeline script symlinks, installs workspace dependencies, and verifies the workspace build.
 
 ## Install
 
@@ -282,7 +299,7 @@ Fallback accounts are separate Claude OAuth accounts or Anthropic-compatible API
 
 Use `/claude-routing fallback-first` to prefer usable fallback accounts before the main account, `/claude-routing main-first` to restore the default, or `/claude-routing sticky-balanced` to allocate each new session to an OAuth account according to spendable 5-hour, 7-day, and matching model-scoped quota headroom. The command persists `routing.mode` and takes effect on the next request without restarting. `/claude-routing reset` clears only the current session's assignment so its next request is allocated again.
 
-`sticky-balanced` uses a weighted deficit allocator: current quota headroom is normalized by time until reset, and the initial prompt size is counted until the next quota refresh. The selected account is then persisted by hashed session ID across plugin instances and restarts. Existing hybrid CacheKeep sessions seed their current OAuth route when the mode is enabled, avoiding an unnecessary account switch for an already-warm session.
+`sticky-balanced` uses a weighted deficit allocator: current quota headroom is normalized by time until reset, and the initial prompt size is counted until the next quota refresh. The selected account is then persisted by hashed session ID across plugin instances and restarts. Existing hybrid CacheKeep sessions seed their current OAuth route when the mode is enabled, avoiding an unnecessary account switch for an already-warm session. Changing the user-selected model discards the old assignment and its model-specific CacheKeep preference before quota-based reselection; transparent safety-recovery model changes retain the original account.
 
 Affinity survives network failures, relay failures, 5xx responses, unconfirmed 429s, quota-probe failures, and changes in relative account weights. Confirmed 7-day or matching model-scoped exhaustion migrates the session. Confirmed 5-hour exhaustion migrates it only when more than 15 minutes remain before reset; at 15 minutes or less, the route is retained and returns `Retry-After` rather than moving a large prompt cache. Disabled/removed accounts, permanent re-login failures, and killswitch blocks are also eligible for migration.
 
@@ -332,6 +349,8 @@ Entering custody preflights every enabled OAuth account. A refusal changes nothi
 In custody, every enabled OAuth route is served from the vault, including the main account. A cold main vault record returns a typed startup refusal and holds every OAuth route until the next viable boot; after a warm boot, it returns a typed provider-unavailable error. The plugin does not fall back to sidecar credentials or send a tombstone as a bearer token. A cold fallback is excluded only for that request, so other warm routes can still serve.
 
 Leaving custody puts the main account back into interactive OpenCode sign-in. A fallback binding clears only after a login completed through the plugin's own login flow observes new credential material. To enter custody again for that fallback, the operator must import the new material into the vault with `--replace`; until then, `/claude-account claustrum` refuses with `binding_missing`. API-key routes are unaffected.
+
+Claustrum mode also starts the future scoped-discovery enrollment ceremony under the host identity `anthropic-auth-opencode`. The plugin durably stores the request secret before proposing, shares one locked ceremony across OpenCode project processes, and shows the request ID and approval command in `/claude-account`. The approved owner-only token defaults to `~/.local/state/cortexkit/anthropic-auth/opencode-enrollment.json`. Grant only `category:anthropic-native`; do not grant the broader `llm-provider` category. This release persists the enrollment but continues serving through the existing capability-handle manifest until scoped discovery lands. `/claude-account enrollment-reset` retries only denied or locally blocked ceremonies.
 ## Quota-aware routing
 
 When `quota.enabled` is true, the plugin checks Anthropic's OAuth usage endpoint and applies the configured remaining-quota thresholds to both main and fallback accounts.
@@ -738,6 +757,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` | Override the owner-only OpenCode Claustrum enrollment-token path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
 | `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE` | Override the persistent sticky-balanced session assignment file. |
 | `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Override the temporary OpenCode CacheKeep session lease directory. |

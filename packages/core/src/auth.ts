@@ -74,6 +74,9 @@ export async function refreshClaudeOAuthToken(input: {
   setTimeoutImpl?: typeof globalThis.setTimeout
 }): Promise<ClaudeOAuthRefreshResult> {
   assertNotCustodyTombstone(input.refreshToken, 'anthropic')
+  if (typeof input.refreshToken !== 'string' || !input.refreshToken.trim()) {
+    throw new Error('Local OAuth refresh credential is unavailable')
+  }
   const fetchImpl = input.fetchImpl ?? fetch
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500

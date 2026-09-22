@@ -170,6 +170,23 @@ async function fetchClaudeCodeAccountUuid(
   }
 }
 
+/** Use the identity already verified by the credential custodian, without an
+ * additional bootstrap request carrying a previously authorized token. */
+export function getClaudeCodeIdentityForVerifiedAccount(
+  accountIdentity: string,
+  accountUuid: ProviderAccountUuid,
+): ClaudeCodeIdentity {
+  if (!accountIdentity.trim() || !accountUuid.trim()) {
+    throw new Error('A verified provider account identity is required')
+  }
+  const base =
+    identityCache.get(accountCacheKey(accountUuid, accountIdentity)) ??
+    getClaudeCodeIdentity(explicitCacheKey(accountIdentity))
+  const identity = { ...base, accountIdentity, accountUuid }
+  cacheAccountIdentity(identity, accountIdentity, accountUuid)
+  return identity
+}
+
 export async function resolveClaudeCodeIdentity(
   accessToken: string,
   model: string | undefined,
