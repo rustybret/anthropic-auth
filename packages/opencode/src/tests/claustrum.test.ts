@@ -206,6 +206,7 @@ describe('Claustrum connection detection', () => {
       expect(
         getDefaultClaustrumConnectionPath({
           HOME: join(tempDir, 'empty-home'),
+          TMPDIR: join(tempDir, 'empty-tmp'),
           XDG_RUNTIME_DIR: undefined,
         }),
       ).toBe('/run/user/4242/subc-connection.json')

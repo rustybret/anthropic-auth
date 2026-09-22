@@ -110,7 +110,8 @@ export function findExistingClaustrumConnectionPath(
   const linuxRun = `/run/user/${uid}/${PRODUCTION_CLAUSTRUM_CONNECTION_FILE_NAME}`
   if (safeIsFile(linuxRun)) return linuxRun
 
-  const tempMatches = listSubcTempConnectionFiles(tmpdir())
+  const tempDir = env.TMPDIR?.trim() || tmpdir()
+  const tempMatches = listSubcTempConnectionFiles(tempDir)
   if (tempMatches.length === 1) return tempMatches[0]
 
   return undefined

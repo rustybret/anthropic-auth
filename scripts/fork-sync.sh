@@ -256,6 +256,7 @@ if [[ "$SKIP_BUILD" == "1" ]]; then
   echo "FORK_SYNC_SKIP_BUILD=1; skipping workspace build."
 else
   echo "== installing workspace dependencies =="
+  rm -rf packages/*/node_modules
   bun install
   bun run build
 fi
