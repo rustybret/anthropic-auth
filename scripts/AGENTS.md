@@ -18,14 +18,17 @@ Repository lifecycle, Arcus v2 packaging, fork synchronization, and local develo
 | System Prompt Interception | `scripts/capture-with-mitmproxy.sh`, `scripts/extract-system-prompt.ts` | mitmproxy HTTPS flow capture and system prompt extraction |
 
 ## CONVENTIONS
+- **Tidy Dist Standard (`dist/<version>/<sequence>/<package>/`)**: All Arcus packaging artifacts are strictly output to `dist/<version>/<sequence>/<package_id>/` (mirroring `magic-context`), keeping releases organized and distinct. Flat dumps into repository roots or `dist-arcus/` are prohibited.
 - **Arcus Publisher Toolchain & Symlinks**: Generic Arcus release scripts (`arcus-pipeline.sh`, `sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`, `arcus-toolchain.json`) are symlinks to `../packages/arcus/toolchain/scripts/*` backed by the Arcus publisher toolchain (`packages/arcus/bootstrap.sh`). Submodules of the Arcus repository are strictly prohibited. `scripts/setup.sh` bootstraps the toolchain on initial clone and repairs symlinks if needed.
-- **Project Packaging Driver**: `scripts/pack-arcus.sh` is anthropic-auth's specialized opencode-plugin pack driver that builds workspace packages, stages runtime assets (`dist`, `src/tui.tsx`, `src/tui-compiled`, `src/rpc`), generates v2/v3 envelopes, and auto-allocates sequences against the local Arcus catalog.
+- **Project Packaging Driver**: `scripts/pack-arcus.sh` is anthropic-auth's specialized opencode-plugin pack driver that builds workspace packages, stages runtime assets (`dist`, `src/tui.tsx`, `src/tui-compiled`, `src/rpc`), generates v3 envelopes into `dist/<version>/<sequence>/<package>/releases/`, and auto-allocates sequences against the local Arcus catalog or live gateway.
+- **Authenticated Gateway Publishing**: Submissions are emitted as self-contained bundles under `dist/arcus/<package_id>-<release_id>/` and submitted to the Arcus gateway via `arcus publish submit --bundle <dir> --gateway https://arcus-auth.rustybret.com` with verification tracked via `arcus publish status <submission_id>`.
 - **Fresh Clone Hydration**: Fresh clones require `bun run setup` (or `bash scripts/setup.sh` / `sh packages/arcus/bootstrap.sh`), which bootstraps the publisher toolchain, verifies symlinks, and runs `bun install`.
 - **Canonical Arcus Target IDs**: Target matrix is exactly `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, `windows-x64`. Legacy `win32-x64` is never emitted.
 - **Argv Key Protection**: Key material is never accepted as command-line arguments. Pass keys via `--key-file PATH`, `--key-file -` (stdin), or `--key-env NAME`.
 
 ## ANTI-PATTERNS
+- **NO Flat Dist Dumps**: Never dump release artifacts directly into repo root or flat `dist-arcus/`; use `dist/<version>/<sequence>/<package>/`.
 - **NO Arcus Git Submodules**: Submodule prohibition (R4) is enforced: never add `submodules/arcus` or commit `.gitmodules`. Toolchain updates run through `arcus install arcus-publisher` and `sh packages/arcus/bootstrap.sh`.
 - **NO Duplicate Script Code**: Never copy or import upstream Arcus pipeline scripts directly into `scripts/`; keep them symlinked to `packages/arcus/toolchain/scripts/`.
-- **NO Publishing to NPM**: This repository is a personal fork distributed via Arcus (`bun run package:arcus`, `bun run pipeline:arcus`); never run npm publish or restore upstream release scripts.
+- **NO Publishing to NPM**: This repository is a personal fork distributed via Arcus (`bun run pack:arcus`, `bun run pipeline:arcus`); never run npm publish or restore upstream release scripts.
 - **NO Key Material in Command Arguments**: Never pass raw key bytes in `--key` or `--signing-key`.

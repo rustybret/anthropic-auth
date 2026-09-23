@@ -29,13 +29,26 @@ This will:
 To package, validate, and emit a submission bundle:
 
 ```sh
-sh packages/arcus/toolchain/scripts/arcus-pipeline.sh all
+bun run pack:arcus
+# or run the full pipeline
+bun run pipeline:arcus all
 ```
 
-The resulting release submission bundle is written to:
-`dist-arcus/<package_id>-<release_id>/`
+Packaging artifacts are stored following the Arcus suite standard under:
+`dist/<version>/<sequence>/<package_id>/`
 
-Send this submission bundle to the Arcus catalog owner for gateway staging and index signing.
+The self-contained submission bundle is emitted to:
+`dist/arcus/<package_id>-<release_id>/`
+
+Submit the release bundle to the Arcus gateway over authenticated HTTPS:
+```sh
+arcus publish submit --bundle dist/arcus/<package_id>-<release_id>/ --gateway https://arcus-auth.rustybret.com --wait
+```
+
+Track submission status and hydration diagnostics:
+```sh
+arcus publish status <submission_id> --gateway https://arcus-auth.rustybret.com
+```
 
 ## Submodule Prohibition
 

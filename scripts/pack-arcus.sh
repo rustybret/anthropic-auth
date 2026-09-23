@@ -36,7 +36,7 @@ GITHUB_REPO='rustybret/anthropic-auth'
 ARCHIVE_FORMAT='tar.zst'
 PLUGIN_PACKAGE_NAME='@cortexkit/opencode-anthropic-auth'
 
-OUTPUT_DIR="${REPO_ROOT}/dist-arcus"
+OUTPUT_DIR=''
 PAYLOAD_DIR=''
 VERSION=''
 RELEASE_ID=''
@@ -68,7 +68,7 @@ Usage: sh scripts/pack-arcus.sh [options]
   --release-id ID     Release identifier (default: <version> or <package_id>-<version>).
   --channel NAME      Distribution channel (default: stable).
   --payload DIR       Use a pre-staged payload directory (skips staging).
-  --output DIR        Output directory (default: dist-arcus).
+  --output DIR        Output directory (default: dist/<version>/<sequence>/<package_id>).
   --format FMT        Archive format: tar.zst, tar.gz, or zip (default: tar.zst).
   --key-file PATH     Ed25519 private key file. Use '-' to read stdin.
   --key-env NAME      Name of an environment variable holding the key.
@@ -206,6 +206,10 @@ if [ -z "$RELEASE_ID" ]; then
   RELEASE_ID="$VERSION"
 fi
 [ -n "$RELEASE_ID" ] || die "could not derive a release_id from ${PACKAGE_ID} ${VERSION}"
+
+if [ -z "$OUTPUT_DIR" ]; then
+  OUTPUT_DIR="${REPO_ROOT}/dist/${VERSION}/${SEQUENCE}/${PACKAGE_ID}"
+fi
 
 stage_payload() {
   if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -351,6 +355,14 @@ fi
 
 ENVELOPE="${OUTPUT_DIR}/releases/${RELEASE_ID}.json"
 [ -f "$ENVELOPE" ] || die "expected release envelope not found at ${ENVELOPE}"
+
+# Ensure standard release ID aliases are available for publisher/toolchain lookups
+if [ "$RELEASE_ID" != "${PACKAGE_ID}-${VERSION}" ]; then
+  cp "$ENVELOPE" "${OUTPUT_DIR}/releases/${PACKAGE_ID}-${VERSION}.json" 2>/dev/null || true
+fi
+if [ "$RELEASE_ID" != "${PACKAGE_ID}-${VERSION}-${SEQUENCE}" ]; then
+  cp "$ENVELOPE" "${OUTPUT_DIR}/releases/${PACKAGE_ID}-${VERSION}-${SEQUENCE}.json" 2>/dev/null || true
+fi
 
 # Verification of digest distinctness
 ARCHIVE_HASH=$(sed -n 's/.*"archive_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ENVELOPE" | head -n 1)

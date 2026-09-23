@@ -366,4 +366,94 @@ process.exit(0);
       rmSync(mockBinDir, { recursive: true, force: true })
     }
   }, 25000)
+
+  it('enacts magic-context dist repo organization standard (dist/<version>/<sequence>/<package>)', () => {
+    const defaultDistDir = resolve(
+      repoRoot,
+      `dist/${opencodePkg.version}/9998/opencode-anthropic-auth`,
+    )
+    const mockBinDir = mkdtempSync(join(tmpdir(), 'arcus-mock-bin-'))
+    const mockArcus = join(mockBinDir, 'arcus')
+
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: `${mockBinDir}:${process.env.PATH}`,
+    }
+    const mockScript = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+
+const args = process.argv.slice(2);
+if (args[0] === 'pack') {
+  let output = '';
+  let releaseId = '${opencodePkg.version}';
+  let sequence = 9998;
+  let pkgId = 'opencode-anthropic-auth';
+  let version = '${opencodePkg.version}';
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--output' && args[i + 1]) output = args[i + 1];
+    if (args[i] === '--release-id' && args[i + 1]) releaseId = args[i + 1];
+    if (args[i] === '--sequence' && args[i + 1]) sequence = Number(args[i + 1]);
+    if (args[i] === '--package-id' && args[i + 1]) pkgId = args[i + 1];
+    if (args[i] === '--version' && args[i + 1]) version = args[i + 1];
+  }
+  const relDir = path.join(output, 'releases');
+  fs.mkdirSync(relDir, { recursive: true });
+  const targets = {};
+  for (const t of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'windows-x64']) {
+    targets[t] = {
+      artifact: { archive_sha256: '1'.repeat(64) },
+      target_content_source: { sha256: '2'.repeat(64) },
+      tree_signature: { sha256: '3'.repeat(64) }
+    };
+  }
+  const envelope = {
+    signed: {
+      schema_version: 3,
+      kind: 'release',
+      package_id: pkgId,
+      version: version,
+      sequence: sequence,
+      targets: targets
+    },
+    signatures: ['mock-signature']
+  };
+  fs.writeFileSync(path.join(relDir, releaseId + '.json'), JSON.stringify(envelope, null, 2));
+  console.log(JSON.stringify({ status: 'ok' }));
+  process.exit(0);
+} else if (args[0] === 'manifest' && args[1] === 'validate') {
+  process.exit(0);
+}
+process.exit(0);
+`
+    writeFileSync(mockArcus, mockScript, { mode: 0o755 })
+    env.ARCUS_BIN = mockArcus
+
+    try {
+      execFileSync(
+        'sh',
+        [
+          resolve(repoRoot, 'scripts/pack-arcus.sh'),
+          '--sequence',
+          '9998',
+          '--skip-build',
+        ],
+        { cwd: repoRoot, stdio: 'pipe', env },
+      )
+
+      expect(existsSync(defaultDistDir)).toBe(true)
+      expect(
+        existsSync(
+          join(defaultDistDir, 'releases', `${opencodePkg.version}.json`),
+        ),
+      ).toBe(true)
+      expect(existsSync(join(defaultDistDir, 'arcus-manifest.json'))).toBe(true)
+    } finally {
+      rmSync(resolve(repoRoot, `dist/${opencodePkg.version}/9998`), {
+        recursive: true,
+        force: true,
+      })
+      rmSync(mockBinDir, { recursive: true, force: true })
+    }
+  }, 25000)
 })
