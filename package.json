@@ -15,7 +15,6 @@
     "sign:arcus": "bash scripts/sign-arcus.sh",
     "validate:arcus": "bash scripts/validate-arcus.sh",
     "publish:arcus": "bash scripts/publish-arcus.sh",
-    "migrate:arcus": "bash scripts/migrate-arcus.sh",
     "test:arcus": "sh scripts/arcus-pipeline.sh self-test && bun test scripts/pack-arcus.test.ts",
     "fork-sync": "bash scripts/fork-sync.sh",
     "sync:fork": "bash scripts/fork-sync.sh",

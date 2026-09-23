@@ -38,7 +38,7 @@ describe('anthropic-auth arcus packaging & sync', () => {
     expect(pkg.scripts['publish:arcus']).toBe('bash scripts/publish-arcus.sh')
     expect(pkg.scripts['validate:arcus']).toBe('bash scripts/validate-arcus.sh')
     expect(pkg.scripts['sign:arcus']).toBe('bash scripts/sign-arcus.sh')
-    expect(pkg.scripts['migrate:arcus']).toBe('bash scripts/migrate-arcus.sh')
+    expect(pkg.scripts['migrate:arcus']).toBeUndefined()
     expect(pkg.scripts['test:arcus']).toBe(
       'sh scripts/arcus-pipeline.sh self-test && bun test scripts/pack-arcus.test.ts',
     )
@@ -437,6 +437,7 @@ process.exit(0);
           '--sequence',
           '9998',
           '--skip-build',
+          '--skip-validate',
         ],
         { cwd: repoRoot, stdio: 'pipe', env },
       )

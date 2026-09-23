@@ -41,6 +41,8 @@ PAYLOAD_DIR=''
 VERSION=''
 RELEASE_ID=''
 SEQUENCE=${ARCUS_SEQUENCE:-}
+GATEWAY_URL=${ARCUS_GATEWAY_URL:-https://arcus-auth.rustybret.com}
+OFFLINE=0
 KEY_FILE_OPT=''
 KEY_ENV_OPT=''
 SKIP_BUILD=0
@@ -118,6 +120,9 @@ while [ $# -gt 0 ]; do
     --key-file=*) KEY_FILE_OPT=${1#*=}; shift ;;
     --key-env) need_value "$#" "$1"; KEY_ENV_OPT=$2; shift 2 ;;
     --key-env=*) KEY_ENV_OPT=${1#*=}; shift ;;
+    --offline) OFFLINE=1; shift ;;
+    --gateway) need_value "$#" "$1"; GATEWAY_URL=$2; shift 2 ;;
+    --gateway=*) GATEWAY_URL=${1#*=}; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-validate) SKIP_VALIDATE=1; shift ;;
     --self-test) run_self_test ;;
@@ -171,7 +176,22 @@ resolve_arcus_dir() {
 }
 
 if [ -z "$SEQUENCE" ]; then
-  if resolve_arcus_dir; then
+  # 1. Attempt allocation from live gateway unless --offline
+  if [ "$OFFLINE" -eq 0 ] && command -v "$ARCUS_BIN" >/dev/null 2>&1; then
+    if SEQ_CANDIDATE=$("$ARCUS_BIN" manifest allocate-sequence --gateway "$GATEWAY_URL" --package-id "$PACKAGE_ID" 2>/dev/null) && [ -n "$SEQ_CANDIDATE" ]; then
+      case "$SEQ_CANDIDATE" in
+        ''|*[!0-9]*) : ;;
+        *)
+          SEQUENCE="$SEQ_CANDIDATE"
+          printf 'pack-arcus: allocated sequence %s for %s from live gateway (%s)\n' \
+            "$SEQUENCE" "$PACKAGE_ID" "$GATEWAY_URL"
+          ;;
+      esac
+    fi
+  fi
+
+  # 2. Fall back to local Arcus checkout if gateway allocation was not available
+  if [ -z "$SEQUENCE" ] && resolve_arcus_dir; then
     if command -v git >/dev/null 2>&1 && ([ -d "${ARCUS_DIR}/.git" ] || [ -f "${ARCUS_DIR}/.git" ]); then
       if ! (CDPATH='' cd -- "$ARCUS_DIR" && git fetch origin) 2>/dev/null; then
         warn "could not fetch origin in ${ARCUS_DIR}; auto-allocated sequence may be stale"
@@ -181,8 +201,10 @@ if [ -z "$SEQUENCE" ]; then
       die "auto-allocating sequence for ${PACKAGE_ID} failed (arcus manifest allocate-sequence --root ${ARCUS_DIR})"
     printf 'pack-arcus: auto-allocated sequence %s for %s (source: %s/manifests/v2/%s/releases)\n' \
       "$SEQUENCE" "$PACKAGE_ID" "$ARCUS_DIR" "$PACKAGE_ID"
-  else
-    die "--sequence (or ARCUS_SEQUENCE) is required: no local Arcus checkout found to auto-allocate one (set ARCUS_REPO_PATH, or pass --sequence explicitly)"
+  fi
+
+  if [ -z "$SEQUENCE" ]; then
+    die "--sequence (or ARCUS_SEQUENCE) is required: could not allocate from gateway (${GATEWAY_URL}) or local Arcus checkout"
   fi
 fi
 case "$SEQUENCE" in
@@ -362,6 +384,62 @@ if [ "$RELEASE_ID" != "${PACKAGE_ID}-${VERSION}" ]; then
 fi
 if [ "$RELEASE_ID" != "${PACKAGE_ID}-${VERSION}-${SEQUENCE}" ]; then
   cp "$ENVELOPE" "${OUTPUT_DIR}/releases/${PACKAGE_ID}-${VERSION}-${SEQUENCE}.json" 2>/dev/null || true
+fi
+
+# Emit self-contained Arcus submission bundle metadata at the dist root
+cp "$ENVELOPE" "${OUTPUT_DIR}/release.json" 2>/dev/null || true
+printf '{\n  "channel": "%s"\n}\n' "$CHANNEL" > "${OUTPUT_DIR}/release.index-policy.json"
+
+TOOLCHAIN_FILE="${SCRIPT_DIR}/arcus-toolchain.json"
+TOOLCHAIN_VER="0.4.0"
+if [ -f "$TOOLCHAIN_FILE" ]; then
+  cp "$TOOLCHAIN_FILE" "${OUTPUT_DIR}/toolchain.json" 2>/dev/null || true
+  if command -v jq >/dev/null 2>&1; then
+    TOOLCHAIN_VER=$(jq -r '.toolchain_version // "0.4.0"' "$TOOLCHAIN_FILE")
+  fi
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  jq -r '
+    [
+      ((.signed // .).targets[] | .artifact
+        | select(.url and .archive_sha256)
+        | [.archive_sha256, (.url | split("/")[-1])]),
+      ((.signed // .).targets[] | .target_content_source
+        | select(.url and .sha256)
+        | [.sha256, (.url | split("/")[-1])]),
+      ((.signed // .).targets[] | .tree_signature
+        | select(.url and .sha256)
+        | [.sha256, (.url | split("/")[-1])])
+    ]
+    | group_by(.[1])
+    | map(
+        if (map(.[0]) | unique | length) == 1 then .[0]
+        else error("one artifact filename has conflicting signed digests")
+        end
+      )
+    | sort_by(.[1])[]
+    | "\(.[0])  \(.[1])"
+  ' "$ENVELOPE" > "${OUTPUT_DIR}/assets.sha256" 2>/dev/null || true
+
+  CREATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  PUB_KEY_ID=$(sed -n 's/.*"key_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ENVELOPE" | head -n 1)
+  OBSERVED_SEQ=$((SEQUENCE - 1))
+  cat <<SUBMISSION_EOF > "${OUTPUT_DIR}/submission.json"
+{
+  "schema_version": 1,
+  "package_id": "${PACKAGE_ID}",
+  "release_id": "${RELEASE_ID}",
+  "version": "${VERSION}",
+  "sequence": ${SEQUENCE},
+  "channel": "${CHANNEL}",
+  "created_at": "${CREATED_AT}",
+  "toolchain_version": "${TOOLCHAIN_VER}",
+  "publisher_key_id": "${PUB_KEY_ID}",
+  "sequence_source": "gateway",
+  "observed_max_sequence": ${OBSERVED_SEQ}
+}
+SUBMISSION_EOF
 fi
 
 # Verification of digest distinctness
