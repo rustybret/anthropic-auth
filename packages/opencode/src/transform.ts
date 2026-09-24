@@ -1381,6 +1381,113 @@ export function normalizeToolCallIds(parsed: Record<string, unknown>): void {
   }
 }
 
+/**
+ * Prune or convert orphaned server_tool_use blocks in assistant messages.
+ * Anthropic strictly requires that any `server_tool_use` block (e.g. web_search)
+ * must have a corresponding server tool result block (`web_search_tool_result`)
+ * in the same assistant turn.
+ *
+ * When switching models from Gemini or OpenAI, provider-executed tools (such as web_search)
+ * are often lowered into `server_tool_use` blocks without a corresponding `web_search_tool_result`,
+ * or with their result placed in a subsequent `tool_result` block.
+ *
+ * This function:
+ * 1. If a matching client `tool_result` exists in subsequent messages: converts `server_tool_use`
+ *    to a standard client `tool_use` block.
+ * 2. If no result exists anywhere: removes the orphaned `server_tool_use` block so Anthropic
+ *    does not fail validation with:
+ *    `messages.N: '<name>' tool use with id '...' was found without a corresponding '<name>_tool_result' block`.
+ */
+export function repairServerToolUseBlocks(
+  parsed: Record<string, unknown>,
+): void {
+  if (!Array.isArray(parsed.messages)) return
+
+  // Collect all tool_use_id references present in client tool_result blocks across all messages
+  const clientResultIds = new Set<string>()
+  for (const msg of parsed.messages) {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (
+        isRecord(block) &&
+        typeof block.tool_use_id === 'string' &&
+        block.tool_use_id &&
+        block.type === 'tool_result'
+      ) {
+        clientResultIds.add(block.tool_use_id)
+      }
+    }
+  }
+
+  for (const msg of parsed.messages) {
+    if (
+      !isRecord(msg) ||
+      msg.role !== 'assistant' ||
+      !Array.isArray(msg.content)
+    )
+      continue
+
+    // Find all server tool result IDs in this assistant message
+    const serverResultIds = new Set<string>()
+    for (const block of msg.content) {
+      if (
+        isRecord(block) &&
+        typeof block.type === 'string' &&
+        block.type.endsWith('_tool_result') &&
+        typeof block.tool_use_id === 'string'
+      ) {
+        serverResultIds.add(block.tool_use_id)
+      }
+    }
+
+    const newContent: Array<Record<string, unknown>> = []
+    let modified = false
+
+    for (const block of msg.content) {
+      if (!isRecord(block)) {
+        newContent.push(block as Record<string, unknown>)
+        continue
+      }
+
+      if (block.type === 'server_tool_use' && typeof block.id === 'string') {
+        const toolId = block.id
+
+        // Case 1: Already paired with a server tool result in this assistant message -> keep
+        if (serverResultIds.has(toolId)) {
+          newContent.push(block)
+          continue
+        }
+
+        // Case 2: Paired with a client tool_result in another message -> convert to client tool_use
+        if (clientResultIds.has(toolId)) {
+          modified = true
+          newContent.push({
+            ...block,
+            type: 'tool_use',
+          })
+          continue
+        }
+
+        // Case 3: Completely orphaned with no result block anywhere -> prune it
+        modified = true
+        continue
+      }
+
+      newContent.push(block)
+    }
+
+    if (modified) {
+      if (newContent.length === 0) {
+        newContent.push({
+          type: 'text',
+          text: ' ',
+        })
+      }
+      msg.content = newContent
+    }
+  }
+}
+
 export async function rewriteRequestBody(
   body: string,
   options: {
@@ -1553,6 +1660,7 @@ export async function rewriteRequestBody(
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     normalizeToolCallIds(parsed)
+    repairServerToolUseBlocks(parsed)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),

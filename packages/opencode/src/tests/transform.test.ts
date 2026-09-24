@@ -38,6 +38,7 @@ import {
   prefixToolNames,
   prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
+  repairServerToolUseBlocks,
   resetPinnedFirstUserTextsForTest,
   rewriteRequestBody,
   rewriteUrl,
@@ -4329,6 +4330,159 @@ describe('rewriteRequestBody', () => {
       )
       expect(webSearchResult.type).toBe('web_search_tool_result')
       expect(webSearchResult.tool_use_id).toBe(serverToolUse.id)
+    })
+
+    test('prunes orphaned server_tool_use with no result block in rewriteRequestBody', async () => {
+      // Repro of exact user error: messages.7 web_search without corresponding web_search_tool_result
+      const body = JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        messages: [
+          { role: 'user', content: 'What is Arcus?' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Let me search.' },
+              {
+                type: 'server_tool_use',
+                id: 'srvtoolu_ws_0bca461cbc1f264b016ab4adf0fca887d0be5a5f5c05dc71af',
+                name: 'web_search',
+                input: {},
+              },
+              {
+                type: 'tool_use',
+                id: 'call_UI9Iatn1FnmIAijkcxfXp0Do',
+                name: 'aft_search',
+                input: { query: 'arcus' },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_UI9Iatn1FnmIAijkcxfXp0Do',
+                content: 'arcus packaging docs',
+              },
+            ],
+          },
+        ],
+      })
+
+      const rewritten = await rewriteRequestBody(body)
+      const parsed = JSON.parse(rewritten)
+      const assistantMsg = parsed.messages[1]
+
+      // Orphaned server_tool_use must be pruned
+      const serverTools = assistantMsg.content.filter(
+        (b: { type: string }) => b.type === 'server_tool_use',
+      )
+      expect(serverTools).toHaveLength(0)
+
+      // Remaining valid blocks must be preserved
+      expect(assistantMsg.content[0].type).toBe('text')
+      expect(assistantMsg.content[1].type).toBe('tool_use')
+      expect(assistantMsg.content[1].name).toBe('mcp_Aft_search')
+    })
+  })
+
+  describe('repairServerToolUseBlocks', () => {
+    type TestBlock = {
+      type: string
+      id?: string
+      name?: string
+      input?: Record<string, unknown>
+      text?: string
+      tool_use_id?: string
+      content?: unknown
+    }
+    type TestMessage = {
+      role: string
+      content: TestBlock[]
+    }
+
+    test('prunes orphaned server_tool_use with no result block', () => {
+      const parsed: { messages: TestMessage[] } = {
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'server_tool_use',
+                id: 'srvtoolu_ws_123',
+                name: 'web_search',
+                input: {},
+              },
+            ],
+          },
+        ],
+      }
+      repairServerToolUseBlocks(parsed)
+      // When the only block is pruned, non-empty placeholder text is added
+      expect(parsed.messages[0]?.content).toEqual([{ type: 'text', text: ' ' }])
+    })
+
+    test('converts server_tool_use to tool_use if paired with client tool_result in another message', () => {
+      const parsed: { messages: TestMessage[] } = {
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'server_tool_use',
+                id: 'srvtoolu_ws_123',
+                name: 'web_search',
+                input: { query: 'test' },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'srvtoolu_ws_123',
+                content: 'results',
+              },
+            ],
+          },
+        ],
+      }
+      repairServerToolUseBlocks(parsed)
+      expect(parsed.messages[0]?.content[0]?.type).toBe('tool_use')
+      expect(parsed.messages[0]?.content[0]?.id).toBe('srvtoolu_ws_123')
+      expect(parsed.messages[1]?.content[0]?.tool_use_id).toBe(
+        'srvtoolu_ws_123',
+      )
+    })
+
+    test('preserves server_tool_use if paired with server tool result in same assistant turn', () => {
+      const parsed: { messages: TestMessage[] } = {
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'server_tool_use',
+                id: 'srvtoolu_ws_123',
+                name: 'web_search',
+                input: {},
+              },
+              {
+                type: 'web_search_tool_result',
+                tool_use_id: 'srvtoolu_ws_123',
+                content: [],
+              },
+            ],
+          },
+        ],
+      }
+      repairServerToolUseBlocks(parsed)
+      expect(parsed.messages[0]?.content).toHaveLength(2)
+      expect(parsed.messages[0]?.content[0]?.type).toBe('server_tool_use')
+      expect(parsed.messages[0]?.content[1]?.type).toBe(
+        'web_search_tool_result',
+      )
     })
   })
 })
