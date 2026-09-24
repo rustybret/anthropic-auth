@@ -699,6 +699,76 @@ async function getPlugin(
 }
 
 describe('scoped enrollment is explicit', () => {
+  test('account dialog reports approved enrollment without false setup guidance for a vault-served main', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claustrum: {
+          mode: 'claustrum',
+          scopedRoster: true,
+          primaryAccount: {
+            credentialId: 'oauth:anthropic',
+            accountId:
+              '11111111-1111-4111-8111-111111111111' as ProviderAccountUuid,
+            state: 'active',
+          },
+        },
+      }),
+    )
+    const enrollmentFile =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+    if (!enrollmentFile) throw new Error('Missing isolated enrollment path')
+    await writeFile(
+      enrollmentFile,
+      JSON.stringify({
+        token: 'ab'.repeat(32),
+        token_generation: 1,
+      }),
+      { mode: 0o600 },
+    )
+    const previousConnection =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+      tempConfigDir ?? '',
+      'missing-connection.json',
+    )
+    const sessionId = `ses_approved_vault_account_dialog_${randomUUID()}`
+    drainNotifications(0, sessionId)
+    const plugin = await getPlugin()
+    let notificationId = 0
+    try {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: sessionId,
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      const notices = drainNotifications(0, sessionId)
+      notificationId = notices.at(-1)?.id ?? 0
+      const accountDialog = notices.at(-1)?.payload
+      expect(accountDialog?.command).toBe('claude-account')
+      expect(accountDialog?.knobs?.accounts).toContainEqual(
+        expect.objectContaining({
+          id: 'main',
+          vaultServed: true,
+        }),
+      )
+      const status = String(accountDialog?.knobs?.enrollmentStatus)
+      expect(status).toContain('approved as enrolled:anthropic-auth-opencode')
+      expect(status).not.toContain('scoped serving not active yet')
+      expect(status).not.toContain('Quit the host and run')
+    } finally {
+      await plugin.dispose?.()
+      if (notificationId > 0) drainNotifications(notificationId, sessionId)
+      if (previousConnection === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+      else
+        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+          previousConnection
+    }
+  })
+
   test('boot and account status are read-only for an unscoped Claustrum configuration', async () => {
     await useTempAccountFile(
       createFallbackStorage({ accounts: [], claustrum: { mode: 'claustrum' } }),

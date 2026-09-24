@@ -4260,6 +4260,9 @@ const anthropicAuthPlugin = async (
         ...(accountProjection.claustrumEnrollment && {
           enrollmentStatus: formatEnrollmentStatus(
             accountProjection.claustrumEnrollment,
+            accountProjection.accounts.some(
+              (account) => account.role === 'main' && account.vaultServed,
+            ),
           ).join('\n'),
         }),
       }

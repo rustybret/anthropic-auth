@@ -10,6 +10,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Correct approved enrollment status in `/claude-account` and the TUI account dialog when the main account is vault-served; do not prompt configured users to rerun setup, and describe `enrollment-reset` as a state clear rather than an automatic retry.
 - Fix the packed CLI failing before `setup` under Node by externalizing `jsonc-parser` from the split bundle and checking a fresh packed CLI install in the smoke gate (#257).
 - Make Claustrum enrollment explicit: OpenCode boot and `/claude-account` no longer start proposals or per-process polling; status reads local state, and reset only clears terminal state. The setup wizard resumes interrupted enrollment and replaces a daemon-proven dead request at most once. Permanently refused requests now stop even if the client labels them retryable (#255).
 - Preserve authenticated Fable 5.1 effort transitions through tool-result continuations and merged user boundaries, logging refusal metadata without markers; keep bounded, revocable request-plan history after in-flight compaction without accepting missing-anchor marker loss.

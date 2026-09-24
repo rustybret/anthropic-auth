@@ -284,7 +284,7 @@ const USAGE_TEXT = [
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
-  '  /claude-account enrollment-reset       Retry a denied/blocked enrollment',
+  '  /claude-account enrollment-reset       Clear denied/blocked state; rerun setup',
   '  /claude-account add-apikey <key>      Add an API key fallback account',
   '  /claude-account add-oauth-start       Start OAuth device flow',
   '  /claude-account add-oauth-finish <code>  Complete OAuth flow',
@@ -316,7 +316,12 @@ export async function executeAccountCommand(input: {
       `- Custody mode: ${getClaustrumMode(input.storage)}`,
       `- Claustrum: ${detection}`,
       ...(input.statusProjection?.claustrumEnrollment
-        ? formatEnrollmentStatus(input.statusProjection.claustrumEnrollment)
+        ? formatEnrollmentStatus(
+            input.statusProjection.claustrumEnrollment,
+            input.statusProjection.accounts.some(
+              (account) => account.role === 'main' && account.vaultServed,
+            ),
+          )
         : []),
       '',
     ]

@@ -448,6 +448,43 @@ describe('executeAccountCommand status', () => {
     expect(result.text).not.toContain('ck auth grant')
   })
 
+  test('does not tell an approved vault-served account to run setup again', async () => {
+    const storage = baseStorage()
+    storage.claustrum = { mode: 'claustrum', scopedRoster: true }
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage,
+      statusProjection: {
+        claustrumDetection: 'available',
+        claustrumEnrollment: {
+          state: 'approved',
+          proposedName: 'anthropic-auth-opencode',
+          approvedName: 'anthropic-auth-opencode',
+          tokenGeneration: 1,
+        },
+        accounts: [
+          {
+            id: 'main',
+            label: 'OpenCode anthropic',
+            role: 'main',
+            enabled: true,
+            quotaPercent: 42,
+            claustrumGate: 'na',
+            vaultServed: true,
+            vaultReauth: false,
+            custodyState: 'on-vault-served',
+          },
+        ],
+      },
+    })
+    expect(result.text).toContain(
+      'Enrollment: approved as enrolled:anthropic-auth-opencode',
+    )
+    expect(result.text).toContain('**OpenCode anthropic** [main] 42% · vault')
+    expect(result.text).not.toContain('scoped serving not active yet')
+    expect(result.text).not.toContain('Quit the host and run')
+  })
+
   test('does not interpolate unsafe enrollment identifiers into shell commands', async () => {
     const result = await executeAccountCommand({
       argumentsText: '',
