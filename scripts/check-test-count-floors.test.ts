@@ -281,7 +281,7 @@ test('replays a stale branch after main raises the floor and rejects the replay'
   const result = runGate(cwd, { core: 10, opencode: 20, pi: 30 })
 
   expect(new TextDecoder().decode(branch.stdout).trim()).toBe('stale')
-  expect(result.exitCode).toBe(1)
+  expect(result.exitCode, result.output).toBe(1)
   expect(result.output).toContain(
     'core branch floor 10 < merge target floor 11',
   )
@@ -348,6 +348,13 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
     'description: "Release tag to publish from, such as v1.24.0"\n        required: true',
   )
   expect(release).not.toContain('--base-ref HEAD^')
+  const releaseScript = await readFile(join(root, 'scripts/release.sh'), 'utf8')
+  const packedSmoke =
+    'TUI_SMOKE_SKIP_BUILD=1 bun run --cwd packages/opencode smoke:tui'
+  expect(releaseScript).toContain(packedSmoke)
+  expect(releaseScript.indexOf(packedSmoke)).toBeLessThan(
+    releaseScript.indexOf('git tag -a'),
+  )
   expect(ci).toContain('fetch-depth: 0')
   expect(release).toContain('fetch-depth: 0')
 })
@@ -415,7 +422,7 @@ test('release compares with the last tag, not HEAD^, when floor lowered earlier'
   // The old release gate was green because HEAD^ already carried the lower floor.
   expect(runGate(cwd, current, 'HEAD^').exitCode).toBe(0)
   const result = runReleaseGate(cwd, current)
-  expect(result.exitCode).toBe(1)
+  expect(result.exitCode, result.output).toBe(1)
   expect(result.output).toContain(
     'core branch floor 10 < release baseline floor 11',
   )
@@ -445,7 +452,7 @@ test('first floor-bearing release refuses a reduction below the verified cutover
   const current = { ...baseline, opencode: 1600 }
   const cwd = await makeReleaseHistory(null, current)
   const result = runReleaseGate(cwd, current)
-  expect(result.exitCode).toBe(1)
+  expect(result.exitCode, result.output).toBe(1)
   expect(result.output).toContain(
     'opencode branch floor 1600 < release baseline floor 1672',
   )

@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Fix packed OpenCode CLI startup under Node: keep `jsonc-parser` external so its CommonJS `./impl/*` modules resolve from the installed dependency, and run the packed CLI's `--help` path alongside the TUI smoke gate (#257).
 - Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
 - Update OpenCode plugin and SDK test dependencies together to 1.18.31, plus Biome 2.5.14, Lefthook 2.1.14 and the dev-only Anthropic SDK 4.0.58; preserve packed TUI and custom-fetch compatibility checks.
 - Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).

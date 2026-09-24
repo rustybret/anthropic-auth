@@ -36,7 +36,12 @@ function fail(name: string, detail: string): never {
   throw new Error(`${name}: ${detail}`)
 }
 
-function run(command: string, args: string[], cwd: string): string {
+function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  quietStdout = false,
+): string {
   const result = spawnSync(command, args, {
     cwd,
     encoding: 'utf8',
@@ -45,7 +50,7 @@ function run(command: string, args: string[], cwd: string): string {
     maxBuffer: 20 * 1024 * 1024,
   })
 
-  if (result.stdout) process.stdout.write(result.stdout)
+  if (result.stdout && !quietStdout) process.stdout.write(result.stdout)
   if (result.stderr) process.stderr.write(result.stderr)
   if (result.status !== 0) {
     fail(
@@ -86,6 +91,7 @@ try {
     'npm',
     ['pack', '--json', '--pack-destination', tempRoot],
     pluginRoot,
+    true,
   )
   const tarball = join(tempRoot, parsePackedFilename(packStdout))
   check('npm pack produced a tarball', existsSync(tarball), tarball)
@@ -97,6 +103,7 @@ try {
     'npm',
     ['pack', '--json', '--pack-destination', tempRoot],
     coreRoot,
+    true,
   )
   const coreTarball = join(tempRoot, parsePackedFilename(corePackStdout))
   check(
@@ -132,6 +139,18 @@ try {
     '@cortexkit',
     'opencode-anthropic-auth',
   )
+  // Exercise the published CLI under Node, not just source imports under Bun.
+  // A split bundle can strand a CommonJS relative require in dist even when
+  // the TUI loads correctly (e.g. jsonc-parser's ./impl/format wrapper).
+  const installedCli = join(installedPackageRoot, 'dist/cli.js')
+  check('CLI ships in the packed package', existsSync(installedCli))
+  const cliHelp = run(
+    process.env.CLI_SMOKE_NODE_BIN || 'node',
+    [installedCli, '--help'],
+    installRoot,
+  )
+  check('packed CLI exposes setup', cliHelp.includes('setup'))
+
   const compiledTui = join(installedPackageRoot, 'src/tui-compiled/tui.tsx')
   check('compiled TUI ships in the packed package', existsSync(compiledTui))
 

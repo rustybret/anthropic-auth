@@ -57,7 +57,7 @@ anthropic-auth/
 **`packages/opencode/scripts/`:**
 - Purpose: Build, smoke-testing, and bundle validation scripts for the OpenCode plugin and precompiled TUI
 - Contains: SolidJS build transformation, package installation validation, and bundle artifact registry verification
-- Key files: `build-tui.ts` (compiles the SolidJS/OpenTUI files to `src/tui-compiled/` with virtual modules), `smoke-tui-pack-install.ts` (validates TUI installation and dependency resolution), `check-bundle-globals.ts` (validates bundle artifact size and RPC server registry globals)
+- Key files: `build-tui.ts` (compiles the SolidJS/OpenTUI files to `src/tui-compiled/` with virtual modules), `smoke-tui-pack-install.ts` (verifies packed Node CLI startup and compiled TUI dependency resolution from a fresh install), `check-bundle-globals.ts` (validates bundle artifact size and RPC server registry globals)
 
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
