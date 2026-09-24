@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import {
   assertNotCustodyTombstone,
   buildRefreshOperationError,
@@ -16,15 +16,13 @@ import {
   getFallbackReauthLabels,
   isCustodyTombstoneOAuth,
   isPermanentRefreshError,
-  isValidCustodyHandle,
   loadAccounts,
-  readCustodyHandles,
   refreshClaudeOAuthToken,
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
+
 import { AnthropicAuthPlugin } from '../index'
 import { setOAuthHeaders } from '../transform'
-import { withCustodyManifestPath } from './custody-ruled-row.fixture'
 import { extractUrl, TOKEN_URL } from './test-fetch'
 
 const fixtureDir = join(import.meta.dir, 'fixtures', 'claustrum-golden')
@@ -36,27 +34,10 @@ const tombstoneFixture = JSON.parse(
     oauth: { provider: string; entry: Record<string, unknown> }
   }
 }
-type GoldenHandleFixture = {
-  providers: Array<{
-    provider: string
-    shape: string
-    serve: string
-    accounts: Array<{
-      label: string
-      handle: string
-      credential_id: string
-      superseded?: string[]
-    }>
-  }>
-}
-const handlesFixture = JSON.parse(
-  readFileSync(join(fixtureDir, 'handles.json'), 'utf8'),
-) as GoldenHandleFixture
 
 const oauthFixture = tombstoneFixture.fixtures.oauth
 const apiFixture = tombstoneFixture.fixtures.api
 const originalFetch = globalThis.fetch
-const originalManifestPath = process.env.CLAUSTRUM_OPENCODE_HANDLES
 
 function createMockClient() {
   return {
@@ -84,10 +65,7 @@ async function createTempStorage<T>(
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = path
   try {
     await saveAccounts(storage as never, path)
-    return await withCustodyManifestPath(
-      process.env.CLAUSTRUM_OPENCODE_HANDLES!,
-      () => callback(path),
-    )
+    return await callback(path)
   } finally {
     if (previous === undefined) delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = previous
@@ -103,12 +81,8 @@ describe('Claustrum custody tombstones', () => {
   test('recognizes only provider-bound OAuth tombstones', () => {
     const provider = oauthFixture.provider
     const key = custodyTombstoneKey(provider)
-    const productionTombstone = {
-      type: 'oauth',
-      access: '',
-      refresh: key,
-      expires: 0,
-    }
+    const productionTombstone = custodyTombstoneOAuth(provider)
+    expect(oauthFixture.entry).toEqual(productionTombstone)
     const cases: Array<{ name: string; auth: unknown; recognized: boolean }> = [
       {
         name: 'production empty-access tombstone',
@@ -116,8 +90,13 @@ describe('Claustrum custody tombstones', () => {
         recognized: true,
       },
       {
-        name: 'vendored golden sentinel-access tombstone',
+        name: 'vendored canonical empty-access tombstone',
         auth: oauthFixture.entry,
+        recognized: true,
+      },
+      {
+        name: 'noncanonical sentinel-access value is still refused at bearer boundaries',
+        auth: { ...productionTombstone, access: key },
         recognized: true,
       },
       { name: 'API entry', auth: apiFixture.entry, recognized: false },
@@ -176,9 +155,7 @@ describe('Claustrum custody tombstones', () => {
     expect(thrown).not.toHaveProperty('isRefreshError')
     expect(thrown).not.toHaveProperty('permanent')
     expect(thrown).not.toHaveProperty('status')
-    expect(String(thrown)).toContain(
-      'vault-served main path is not yet implemented',
-    )
+    expect(String(thrown)).toContain('local token refresh is forbidden')
   })
 
   test('keeps loader recognition contained by both irreversible boundaries', async () => {
@@ -268,7 +245,7 @@ describe('Claustrum custody tombstones', () => {
         const loaded = await plugin.auth.loader(() => Promise.resolve(auth), {
           models: {},
         } as never)
-        auth.access = String(oauthFixture.entry.access)
+        auth.access = custodyTombstoneKey(oauthFixture.provider)
 
         await expect(
           loaded.fetch('https://api.anthropic.com/v1/messages', {
@@ -330,225 +307,6 @@ describe('Claustrum custody tombstones', () => {
     ).toThrow(CustodyTombstoneRefreshError)
   })
 
-  test('preserves validated superseded handles in the parsed manifest', () => {
-    const anthropicSource = handlesFixture.providers.find(
-      (provider: { provider: string }) =>
-        provider.provider === oauthFixture.provider,
-    )
-    if (!anthropicSource) throw new Error('missing anthropic fixture')
-    const anthropic = readCustodyHandles(
-      handlesFixture,
-      oauthFixture.provider,
-      anthropicSource.serve,
-    )
-    expect(anthropic.version).toBe(1)
-    expect(anthropic.provider).toBe(anthropicSource.provider)
-    expect(anthropic.serve).toBe(anthropicSource.serve)
-    expect(anthropic.accounts).toEqual(
-      anthropicSource.accounts.map(
-        (account: {
-          label: string
-          handle: string
-          credential_id: string
-        }) => ({
-          label: account.label,
-          handle: account.handle,
-          credentialId: account.credential_id,
-        }),
-      ),
-    )
-    const deepseekSource = handlesFixture.providers.find(
-      (provider) => provider.provider === apiFixture.provider,
-    )
-    if (!deepseekSource) throw new Error('missing deepseek fixture')
-    const deepseek = readCustodyHandles(
-      handlesFixture,
-      apiFixture.provider,
-      deepseekSource.serve,
-    )
-    const deepseekBackup = deepseek.accounts[1]
-    if (!deepseekBackup) throw new Error('missing deepseek backup fixture')
-    if (!deepseekSource?.accounts[1]) {
-      throw new Error('missing deepseek backup fixture')
-    }
-    expect(deepseekBackup).toMatchObject({
-      handle: deepseekSource.accounts[1].handle,
-    })
-    expect(deepseek.superseded).toEqual(
-      new Set(deepseekSource.accounts[1].superseded),
-    )
-  })
-
-  test('marks malformed account entries as corrupt while retaining valid entries', () => {
-    const fixture = structuredClone(handlesFixture) as {
-      providers: Array<{
-        provider: string
-        accounts: Array<Record<string, unknown>>
-      }>
-    }
-    const anthropic = fixture.providers.find(
-      (provider) => provider.provider === oauthFixture.provider,
-    )
-    if (!anthropic) throw new Error('missing anthropic fixture')
-    const account = anthropic.accounts[0]
-    if (!account) throw new Error('missing anthropic account fixture')
-    const missingHandle: Record<string, unknown> = { ...account }
-    missingHandle.label = 'missing-handle'
-    delete missingHandle.handle
-    const missingCredentialId: Record<string, unknown> = { ...account }
-    missingCredentialId.label = 'missing-credential-id'
-    delete missingCredentialId.credential_id
-    anthropic.accounts = [
-      missingHandle,
-      missingCredentialId,
-      { ...account, extra: 'ignored' },
-    ]
-
-    const parsed = readCustodyHandles(
-      fixture,
-      oauthFixture.provider,
-      'anthropic-auth',
-    )
-    expect(parsed.corruptLabels).toEqual(
-      new Set(['missing-handle', 'missing-credential-id']),
-    )
-    expect(parsed.accounts).toHaveLength(1)
-  })
-
-  test('accepts a non-canonical credential ID and carries it verbatim', () => {
-    const fixture = structuredClone(handlesFixture) as {
-      providers: Array<{
-        provider: string
-        accounts: Array<Record<string, unknown>>
-      }>
-    }
-    const anthropic = fixture.providers.find(
-      (provider) => provider.provider === oauthFixture.provider,
-    )
-    if (!anthropic) throw new Error('missing anthropic fixture')
-    const account = anthropic.accounts[0]
-    if (!account) throw new Error('missing anthropic account fixture')
-    anthropic.accounts = [{ ...account, credential_id: 'oauth:anthropic' }]
-
-    const parsed = readCustodyHandles(
-      fixture,
-      oauthFixture.provider,
-      'anthropic-auth',
-    )
-    expect(parsed.corruptLabels).toEqual(new Set())
-    expect(parsed.accounts).toHaveLength(1)
-    expect(parsed.accounts[0]?.credentialId).toBe('oauth:anthropic')
-  })
-
-  test('marks every duplicate-label entry as corrupt', () => {
-    const fixture = structuredClone(handlesFixture) as {
-      providers: Array<{
-        provider: string
-        accounts: Array<Record<string, unknown>>
-      }>
-    }
-    const anthropic = fixture.providers.find(
-      (provider) => provider.provider === oauthFixture.provider,
-    )
-    if (!anthropic) throw new Error('missing anthropic fixture')
-    const account = anthropic.accounts[0]
-    if (!account) throw new Error('missing anthropic account fixture')
-    anthropic.accounts = [
-      { ...account, credential_id: 'oauth:anthropic:a' },
-      { ...account, credential_id: 'oauth:anthropic:b' },
-    ]
-
-    const parsed = readCustodyHandles(
-      fixture,
-      oauthFixture.provider,
-      'anthropic-auth',
-    )
-    expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
-    expect(parsed.accounts).toEqual([])
-  })
-
-  test('throws when the requested provider is absent', () => {
-    const fixture = structuredClone(handlesFixture)
-    fixture.providers = fixture.providers.filter(
-      (provider) => provider.provider !== oauthFixture.provider,
-    )
-    expect(() =>
-      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
-    ).toThrow('missing-provider')
-  })
-
-  test('rejects prototype provider ids without polluting Object.prototype', () => {
-    const malicious = JSON.parse(
-      '{"providers":[{"provider":"__proto__","accounts":[]}]}',
-    )
-    expect(() =>
-      readCustodyHandles(malicious, '__proto__', 'anthropic-auth'),
-    ).toThrow()
-    expect(({} as { polluted?: unknown }).polluted).toBeUndefined()
-  })
-
-  test('filters invalid labels and short handles while accepting golden handles', () => {
-    const fixture = structuredClone(handlesFixture) as {
-      providers: Array<{
-        provider: string
-        accounts: Array<Record<string, unknown>>
-      }>
-    }
-    const anthropic = fixture.providers.find(
-      (provider) => provider.provider === oauthFixture.provider,
-    )
-    if (!anthropic) throw new Error('missing anthropic fixture')
-    const account = anthropic.accounts[0]
-    if (!account) throw new Error('missing anthropic account fixture')
-    const invalidLabels = [
-      'constructor',
-      'Uppercase',
-      'with space',
-      'a'.repeat(65),
-    ]
-    anthropic.accounts = invalidLabels.map((label) => ({ ...account, label }))
-    anthropic.accounts.push({
-      ...account,
-      handle: `ckh_${apiFixture.provider}_main`,
-    })
-    expect(() =>
-      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
-    ).toThrow('invalid account label')
-
-    for (const provider of handlesFixture.providers) {
-      const parsed = readCustodyHandles(
-        handlesFixture,
-        provider.provider,
-        provider.serve,
-      )
-      expect(parsed.accounts).toHaveLength(provider.accounts.length)
-      for (const sourceAccount of provider.accounts) {
-        expect(isValidCustodyHandle(sourceAccount.handle)).toBe(true)
-        expect(sourceAccount.handle).toHaveLength(47)
-        for (const superseded of sourceAccount.superseded ?? []) {
-          expect(isValidCustodyHandle(superseded)).toBe(true)
-          expect(superseded).toHaveLength(47)
-        }
-      }
-    }
-
-    const allHandles = handlesFixture.providers.flatMap((provider) =>
-      provider.accounts.flatMap((account) => [
-        account.handle,
-        ...(account.superseded ?? []),
-      ]),
-    )
-    expect(allHandles.some((handle) => /[A-Z]/.test(handle))).toBe(true)
-    expect(allHandles.some((handle) => /[-_]/.test(handle))).toBe(true)
-    const validHandle = allHandles[0]
-    if (!validHandle) throw new Error('missing custody handle fixture')
-    expect(isValidCustodyHandle(validHandle.slice(0, -1))).toBe(false)
-    expect(isValidCustodyHandle(`${validHandle}A`)).toBe(false)
-    expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}+`)).toBe(false)
-    expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}/`)).toBe(false)
-    expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}=`)).toBe(false)
-  })
-
   test('holds a local main tombstone dark without network or refresh state', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {
@@ -582,7 +340,7 @@ describe('Claustrum custody tombstones', () => {
           }),
         ).rejects.toMatchObject({
           code: 'custody_state_mismatch',
-          verdict: 'REMAIN_DARK_PENDING_LOGIN',
+          verdict: 'FAIL_CLOSED',
         })
         expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
 
@@ -660,128 +418,6 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('returns typed startup mismatches for an unusable manifest-resolved main', async () => {
-    const fetchCalls: string[] = []
-    globalThis.fetch = mock((input: unknown) => {
-      fetchCalls.push(extractUrl(input as string | URL | Request))
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const makeStorage = (mode: 'claustrum' | 'local') => ({
-      version: 1,
-      main: { type: 'opencode', provider: oauthFixture.provider },
-      claustrum: { mode },
-      refresh: { enabled: true },
-      quota: { enabled: true },
-      accounts: [],
-    })
-
-    await createTempStorage(makeStorage('claustrum'), async (path) => {
-      const handlesPath = join(dirname(path), 'handles.json')
-      await writeFile(
-        handlesPath,
-        JSON.stringify({
-          version: 1,
-          providers: [
-            {
-              provider: 'anthropic',
-              serve: 'anthropic-auth',
-              accounts: [
-                {
-                  label: 'main',
-                  handle: `ckh_${'M'.repeat(43)}`,
-                  credential_id: 'oauth:anthropic:main',
-                },
-              ],
-            },
-          ],
-        }),
-      )
-      await chmod(handlesPath, 0o600)
-      process.env.CLAUSTRUM_OPENCODE_HANDLES = handlesPath
-      const timers = disabledTimerOverrides()
-      const plugin = (await AnthropicAuthPlugin(
-        // @ts-expect-error: minimal mock for testing
-        { client: createMockClient() },
-        timers,
-      )) as any
-      const intervalsBeforeLoader = (
-        timers.setInterval as typeof timers.setInterval & {
-          mock: { calls: unknown[] }
-        }
-      ).mock.calls.length
-      const loaded = await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            ...custodyTombstoneOAuth(oauthFixture.provider),
-            access: 'contaminated-local-access',
-          }),
-        { models: {} } as never,
-      )
-      await expect(
-        loaded.fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        }),
-      ).rejects.toMatchObject({
-        code: 'custody_state_mismatch',
-        verdict: 'FAIL_CLOSED',
-      })
-      expect(timers.setInterval).toHaveBeenCalledTimes(intervalsBeforeLoader)
-      expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
-      expect(fetchCalls).toHaveLength(0)
-
-      const realLoaded = await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth' as const,
-            access: 'real-local-access',
-            refresh: 'real-local-refresh',
-            expires: Date.now() + 60_000,
-          }),
-        { models: {} } as never,
-      )
-      await expect(
-        realLoaded.fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        }),
-      ).rejects.toMatchObject({
-        code: 'custody_state_mismatch',
-        verdict: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
-      })
-      expect(fetchCalls).toHaveLength(0)
-      await plugin.dispose?.()
-    })
-
-    await createTempStorage(makeStorage('local'), async () => {
-      const plugin = (await AnthropicAuthPlugin(
-        // @ts-expect-error: minimal mock for testing
-        { client: createMockClient() },
-        disabledTimerOverrides(),
-      )) as any
-      const localLoaded = await plugin.auth.loader(
-        () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
-        { models: {} } as never,
-      )
-      await expect(
-        localLoaded.fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          body: '{}',
-        }),
-      ).rejects.toMatchObject({
-        code: 'custody_state_mismatch',
-        verdict: 'REMAIN_DARK_PENDING_LOGIN',
-      })
-      await plugin.dispose?.()
-    })
-    expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
-  })
-
-  test('restores the shared custody manifest after temporary cleanup', () => {
-    expect(process.env.CLAUSTRUM_OPENCODE_HANDLES).toBe(originalManifestPath)
-  })
-
   test('reconciles a real main without a resolved binding before serving OAuth', async () => {
     const fetchCalls: Array<{ url: string; authorization: string | null }> = []
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
@@ -803,7 +439,8 @@ describe('Claustrum custody tombstones', () => {
         quota: { enabled: true },
         accounts: [],
       },
-      async () => {
+      async (path) => {
+        expect((await loadAccounts(path))?.claustrum?.mode).toBe('claustrum')
         const plugin = (await AnthropicAuthPlugin(
           // @ts-expect-error: minimal mock for testing
           { client: createMockClient() },
@@ -820,15 +457,15 @@ describe('Claustrum custody tombstones', () => {
           { models: {} } as never,
         )
 
-        await expect(
-          loaded.fetch('https://api.anthropic.com/v1/messages', {
+        const refused = await loaded.fetch(
+          'https://api.anthropic.com/v1/messages',
+          {
             method: 'POST',
             body: '{}',
-          }),
-        ).rejects.toMatchObject({
-          code: 'custody_state_mismatch',
-          verdict: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
-        })
+          },
+        )
+        expect(refused.status).toBe(503)
+        expect(await refused.text()).toContain('Claustrum')
         expect(fetchCalls).toEqual([])
         await plugin.dispose?.()
       },

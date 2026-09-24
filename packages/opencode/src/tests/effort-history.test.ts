@@ -323,6 +323,255 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     ])
   })
 
+  test('accepts authenticated effort history on a tool continuation', () => {
+    const messages = [
+      user('msg_low', 'ses_tool_continuation', 'claude-fable-5-1', 'low'),
+      assistant('msg_prior', 'ses_tool_continuation'),
+      user('msg_current', 'ses_tool_continuation', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    expect(plan?.markerCount).toBe(1)
+
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: 'msg_low' },
+        { role: 'assistant', content: [{ type: 'text', text: 'prior' }] },
+        {
+          role: 'user',
+          content: messages[2]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text,
+          })),
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Read', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'result' },
+          ],
+        },
+      ],
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toEqual({ found: 1, inserted: 1 })
+    expect(body.output_config).toEqual({ effort: 'low' })
+    expect(JSON.stringify(body)).not.toContain('cortexkit-internal-effort')
+  })
+
+  test('rejects a plain user boundary appended after the effort anchor', () => {
+    const messages = [
+      user('msg_low', 'ses_user_suffix', 'claude-fable-5-1', 'low'),
+      user('msg_current', 'ses_user_suffix', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: 'msg_low' },
+        {
+          role: 'user',
+          content: messages[1]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text,
+          })),
+        },
+        { role: 'user', content: 'unexpected boundary' },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+  })
+
+  test('rejects a plain user turn after an assistant reply', () => {
+    const messages = [
+      user('msg_low', 'ses_plain_turn', 'claude-fable-5-1', 'low'),
+      user('msg_current', 'ses_plain_turn', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: 'msg_low' },
+        {
+          role: 'user',
+          content: messages[1]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text,
+          })),
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
+        { role: 'user', content: [{ type: 'text', text: 'next turn' }] },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+  })
+
+  test('rejects a tool result that does not match the preceding tool use', () => {
+    const messages = [
+      user('msg_low', 'ses_tool_mismatch', 'claude-fable-5-1', 'low'),
+      user('msg_current', 'ses_tool_mismatch', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: 'msg_low' },
+        {
+          role: 'user',
+          content: messages[1]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text,
+          })),
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_expected', name: 'Read', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tool_other',
+              content: 'result',
+            },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+  })
+
+  test('rejects a tool-result user message mixed with text', () => {
+    const messages = [
+      user('msg_low', 'ses_mixed_tool_result', 'claude-fable-5-1', 'low'),
+      user('msg_current', 'ses_mixed_tool_result', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: 'msg_low' },
+        {
+          role: 'user',
+          content: messages[1]?.parts.map((part) => ({
+            type: 'text',
+            text: part.text,
+          })),
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Read', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'result' },
+            { type: 'text', text: 'extra user text' },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+  })
+
+  test('distinguishes a mismatched anchor token from invalid placement', () => {
+    const marked = [
+      user('msg_low', 'ses_anchor_token', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_anchor_token', 'claude-fable-5-1', 'high'),
+      user('msg_current_a', 'ses_anchor_token', 'claude-fable-5-1', 'high'),
+    ]
+    const expected = [
+      user('msg_low', 'ses_anchor_token', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_anchor_token', 'claude-fable-5-1', 'high'),
+      user('msg_current_b', 'ses_anchor_token', 'claude-fable-5-1', 'high'),
+    ]
+    const markedPlan = markOpenCodeEffortTransitions(marked)
+    const expectedPlan = markOpenCodeEffortTransitions(expected)
+    expect(markedPlan).not.toBeNull()
+    expect(expectedPlan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: marked.map((message) => ({
+        role: 'user',
+        content: message.parts.map((part) => ({
+          type: 'text',
+          text: part.text,
+        })),
+      })),
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(
+          expectedPlan as NonNullable<typeof expectedPlan>,
+        ),
+        expectedPlan as NonNullable<typeof expectedPlan>,
+      ),
+    ).toThrow('Mismatched internal Fable 5.1 effort anchor token')
+  })
+
   test('rejects non-prefix transition loss even with the resolved plan', () => {
     const messages = [
       user('msg_low', 'ses_non_prefix', 'claude-fable-5-1', 'low'),
@@ -579,4 +828,399 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
     expect(markerTexts(otherModel)).toEqual([])
   })
+
+  test('accepts a merged boundary whose transitions are a correctly-ordered run and emits the last effort', () => {
+    const messages = [
+      user('msg_low', 'ses_merged', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    expect(plan?.markerCount).toBe(2)
+
+    const highMarker = markerTexts([messages[1]!])[0]
+    const maxMarker = markerTexts([messages[2]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+    expect(highMarker).toBeDefined()
+    expect(maxMarker).toBeDefined()
+    expect(anchor).toBeDefined()
+
+    const body: {
+      model: string
+      output_config: { effort: string }
+      messages: unknown[]
+    } = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: highMarker },
+            { type: 'text', text: maxMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toEqual({ found: 2, inserted: 1 })
+    expect(body.messages).toContainEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'max' },
+    })
+    expect(body.messages).not.toContainEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
+    expect(JSON.stringify(body)).not.toContain('cortexkit-internal-effort')
+  })
+
+  test('rejects a merged boundary whose transitions are out of order', () => {
+    const messages = [
+      user('msg_low', 'ses_merged_order', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged_order', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged_order', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    const highMarker = markerTexts([messages[1]!])[0]
+    const maxMarker = markerTexts([messages[2]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: maxMarker },
+            { type: 'text', text: highMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker non-prefix loss')
+  })
+
+  test('rejects a merged boundary whose transitions are duplicated', () => {
+    const messages = [
+      user('msg_low', 'ses_merged_dup', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged_dup', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged_dup', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    const highMarker = markerTexts([messages[1]!])[0]
+    const maxMarker = markerTexts([messages[2]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: highMarker },
+            { type: 'text', text: highMarker },
+            { type: 'text', text: maxMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 3')
+  })
+
+  test('rejects a foreign-scope marker at index 1 of a merged boundary', () => {
+    const messages = [
+      user('msg_low', 'ses_merged_scope', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged_scope', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged_scope', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    const highMarker = markerTexts([messages[1]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+
+    // A valid marker minted for a different session carries a foreign scope.
+    const foreignMessages = [
+      user('msg_foreign_low', 'ses_foreign_scope', 'claude-fable-5-1', 'low'),
+      user('msg_foreign_high', 'ses_foreign_scope', 'claude-fable-5-1', 'high'),
+    ]
+    markOpenCodeEffortTransitions(foreignMessages)
+    const foreignMarker = markerTexts([foreignMessages[1]!])[0]
+    expect(foreignMarker).toBeDefined()
+
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: highMarker },
+            { type: 'text', text: foreignMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker scope mismatch')
+  })
+})
+
+test('preserves a header in flight when the same message plan is re-recorded after a prefix trim', () => {
+  const full = [
+    user('msg_low', 'ses_overwrite', 'claude-fable-5-1', 'low'),
+    user('msg_medium', 'ses_overwrite', 'claude-fable-5-1', 'medium'),
+    user('msg_high', 'ses_overwrite', 'claude-fable-5-1', 'high'),
+    user('msg_current', 'ses_overwrite', 'claude-fable-5-1', 'high'),
+  ]
+  const first = markOpenCodeEffortTransitions(full)
+  expect(first?.markerCount).toBe(2)
+  if (!first) throw new Error('Missing first effort plan')
+  const tracker = new OpenCodeEffortPlanTracker()
+  tracker.record(first)
+  const firstHeaders: Record<string, string> = {}
+  expect(
+    tracker.markHeaders({
+      sessionId: first.sessionId,
+      messageId: first.messageId,
+      headers: firstHeaders,
+    }),
+  ).toBe(true)
+  const firstHeader = firstHeaders['x-cortexkit-effort-plan']
+  expect(firstHeader).toBe(encodeOpenCodeEffortPlan(first))
+
+  const second = markOpenCodeEffortTransitions(full.slice(2))
+  expect(second?.markerCount).toBe(0)
+  if (!second) throw new Error('Missing re-recorded effort plan')
+  tracker.record(second)
+  const secondHeaders: Record<string, string> = {}
+  expect(
+    tracker.markHeaders({
+      sessionId: second.sessionId,
+      messageId: second.messageId,
+      headers: secondHeaders,
+    }),
+  ).toBe(true)
+  expect(secondHeaders['x-cortexkit-effort-plan']).not.toBe(firstHeader)
+  expect(tracker.resolveHeader(firstHeader)).toEqual(first)
+  expect(
+    tracker.resolveHeader(secondHeaders['x-cortexkit-effort-plan']),
+  ).toEqual(second)
+
+  // Explicitly retiring the message revokes both headers. Re-recording alone
+  // must preserve the old one while it is still in flight.
+  tracker.clear(first.sessionId, first.messageId)
+  expect(tracker.resolveHeader(firstHeader)).toBeUndefined()
+  expect(
+    tracker.resolveHeader(secondHeaders['x-cortexkit-effort-plan']),
+  ).toBeUndefined()
+})
+
+test('bounds the plan history and its reverse index while retaining the newest header', () => {
+  const tracker = new OpenCodeEffortPlanTracker()
+  const cap = 4096
+  const plan = (index: number) => ({
+    scope: 'a'.repeat(32),
+    baseline: 'high' as const,
+    markerCount: 0,
+    digest: index.toString(16).padStart(64, '0'),
+    transitionTokens: [],
+    sessionId: `ses_history_${index}`,
+    messageId: `msg_history_${index}`,
+  })
+  const oldest = plan(0)
+  const newest = plan(cap)
+  for (let index = 0; index <= cap; index++) tracker.record(plan(index))
+  const internals = tracker as unknown as {
+    history: Map<string, unknown>
+    historyByMessage: Map<string, Set<string>>
+  }
+  expect(internals.history.size).toBe(cap)
+  expect(internals.historyByMessage.size).toBe(cap)
+  expect(
+    tracker.resolveHeader(encodeOpenCodeEffortPlan(oldest)),
+  ).toBeUndefined()
+  expect(tracker.resolveHeader(encodeOpenCodeEffortPlan(newest))).toEqual(
+    newest,
+  )
+})
+
+test('refuses complete marker loss when an earlier message survives the supposed prefix trim', () => {
+  const messages = [
+    user('msg_low', 'ses_nonprefix_zero', 'claude-fable-5-1', 'low'),
+    user('msg_medium', 'ses_nonprefix_zero', 'claude-fable-5-1', 'medium'),
+    user('msg_high', 'ses_nonprefix_zero', 'claude-fable-5-1', 'high'),
+    user('msg_current', 'ses_nonprefix_zero', 'claude-fable-5-1', 'high'),
+  ]
+  const plan = markOpenCodeEffortTransitions(messages)
+  expect(plan?.markerCount).toBe(2)
+  if (!plan) throw new Error('Missing effort plan')
+  const body = {
+    model: 'claude-fable-5-1',
+    output_config: { effort: 'low' },
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'old reply' }] },
+      { role: 'user', content: [{ type: 'text', text: 'msg_current' }] },
+    ],
+  }
+  expect(() =>
+    applyOpenCodeEffortMarkers(
+      body,
+      true,
+      encodeOpenCodeEffortPlan(plan),
+      plan,
+    ),
+  ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
+})
+
+test('rebinds an identical zero-marker header across ordinary same-effort turns without revoking the newer turn', () => {
+  const first = markOpenCodeEffortTransitions([
+    user('msg_first', 'ses_zero_alias', 'claude-fable-5-1', 'high'),
+  ])
+  const second = markOpenCodeEffortTransitions([
+    user('msg_first', 'ses_zero_alias', 'claude-fable-5-1', 'high'),
+    user('msg_second', 'ses_zero_alias', 'claude-fable-5-1', 'high'),
+  ])
+  expect(first?.markerCount).toBe(0)
+  expect(second?.markerCount).toBe(0)
+  if (!first || !second) throw new Error('Missing same-effort plans')
+  const firstHeader = encodeOpenCodeEffortPlan(first)
+  const secondHeader = encodeOpenCodeEffortPlan(second)
+  expect(firstHeader).toBe(secondHeader)
+
+  const tracker = new OpenCodeEffortPlanTracker()
+  tracker.record(first)
+  tracker.record(second)
+  expect(tracker.resolveHeader(secondHeader)?.messageId).toBe(second.messageId)
+  tracker.clear(first.sessionId, first.messageId)
+  expect(
+    tracker.markHeaders({
+      sessionId: second.sessionId,
+      messageId: second.messageId,
+      headers: {},
+    }),
+  ).toBe(true)
+  expect(tracker.resolveHeader(secondHeader)?.messageId).toBe(second.messageId)
+  tracker.clear(second.sessionId, second.messageId)
+  expect(tracker.resolveHeader(secondHeader)).toBeUndefined()
+})
+
+test('rejects a cross-session plan collision even when its encoded zero-marker header is copied', () => {
+  const first = markOpenCodeEffortTransitions([
+    user('msg_first', 'ses_original', 'claude-fable-5-1', 'high'),
+  ])
+  expect(first?.markerCount).toBe(0)
+  if (!first) throw new Error('Missing plan')
+  const tracker = new OpenCodeEffortPlanTracker()
+  tracker.record(first)
+  const forged = { ...first, sessionId: 'ses_other', messageId: 'msg_other' }
+  expect(encodeOpenCodeEffortPlan(forged)).toBe(encodeOpenCodeEffortPlan(first))
+  expect(() => tracker.record(forged)).toThrow(
+    'Fable 5.1 effort plan header collision',
+  )
+  expect(tracker.resolveHeader(encodeOpenCodeEffortPlan(first))).toEqual(first)
+  expect(
+    tracker.markHeaders({
+      sessionId: forged.sessionId,
+      messageId: forged.messageId,
+      headers: {},
+    }),
+  ).toBe(false)
+})
+
+test('reports bounded shape metadata when every marker and anchor disappears but older history remains', () => {
+  const messages = [
+    user('msg_low', 'ses_missing_diag', 'claude-fable-5-1', 'low'),
+    user('msg_high', 'ses_missing_diag', 'claude-fable-5-1', 'high'),
+    user('msg_current', 'ses_missing_diag', 'claude-fable-5-1', 'high'),
+  ]
+  const plan = markOpenCodeEffortTransitions(messages)
+  expect(plan?.markerCount).toBe(1)
+  if (!plan) throw new Error('Missing effort plan')
+  const body = {
+    model: 'claude-fable-5-1',
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'operator private text' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'assistant private text' }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'current private text' }],
+      },
+    ],
+  }
+  let refusal: unknown
+  try {
+    applyOpenCodeEffortMarkers(body, true, encodeOpenCodeEffortPlan(plan), plan)
+  } catch (error) {
+    refusal = error
+  }
+  expect(refusal).toMatchObject({
+    check: 'missing_all_markers',
+    details: {
+      markerCount: 1,
+      resolvedPlan: true,
+      plannedBoundaryId: 'msg_current',
+      retainedMessageCount: 3,
+      retainedUserMessageCount: 2,
+      lastUserMessageIndex: 2,
+      lastUserTextBlockCount: 1,
+      lastUserToolResultBlockCount: 0,
+    },
+  })
+  expect(JSON.stringify(refusal)).not.toContain('private text')
 })

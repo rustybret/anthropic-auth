@@ -141,7 +141,7 @@ test('quota requests authorize freshly and report the exact served version', asy
   )
   await expect(f.runtime.fetchQuota('main', fetchImpl)).rejects.toThrow('401')
   expect(sent).toEqual(['Bearer vault-test-access'])
-  expect(f.gets).toHaveLength(1)
+  expect(f.gets).toHaveLength(2)
   expect(f.reports).toEqual([
     {
       credentialId: 'oauth:anthropic',
@@ -258,10 +258,15 @@ test('profile hydration uses a new scoped receipt and binds metadata to its prov
   expect(f.reports).toHaveLength(0)
 })
 
-test('profile 401 reports the version used for that fetch, even after concurrent rotation', async () => {
+test('profile 401 retries the new record and reports its version if it also fails', async () => {
   const f = await fixture()
+  const sent: string[] = []
   const http = Object.assign(
-    async () => {
+    async (
+      _input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      sent.push(new Headers(init?.headers).get('authorization') ?? '')
       f.client.getScoped = async (input) => ({
         credentialId: input.credentialId,
         accountId: f.rows[0]?.accountId,
@@ -275,7 +280,8 @@ test('profile 401 reports the version used for that fetch, even after concurrent
   )
   await expect(f.runtime.fetchProfile('main', http)).rejects.toThrow('401')
   expect(f.reports).toHaveLength(1)
-  expect(f.reports[0]?.recordVersion).toBe(3)
+  expect(sent).toEqual(['Bearer vault-test-access', 'Bearer new-vault-access'])
+  expect(f.reports[0]?.recordVersion).toBe(4)
 })
 
 test('cancelling a dispatch during connection setup does not wait for or cancel shared discovery', async () => {
@@ -348,3 +354,151 @@ test('shutdown rejects connection waiters immediately and closes a late client',
     connection.resolve(client)
   }
 })
+
+test('onRoster fires only when the discovery view changes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'scoped-runtime-view-'))
+  dirs.push(dir)
+  const storagePath = join(dir, 'accounts.json'),
+    tokenPath = join(dir, 'token.json')
+  await saveAccounts({ version: 1, accounts: [] }, storagePath)
+  await setClaustrumModePersistent('claustrum', storagePath)
+  await writeFile(
+    tokenPath,
+    JSON.stringify({ token: '02'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  let view = 'v1'
+  const seen: string[] = []
+  const runtime = new ClaustrumScopedRuntime({
+    storagePath,
+    tokenPath,
+    connect: async () => ({
+      listScoped: async () => ({
+        rows: [
+          {
+            id: 'oauth:anthropic',
+            accountId: 'provider-0',
+            categories: ['anthropic-native'],
+            serves: ['anthropic'],
+            credentialType: 'oauth',
+            refreshAdapter: 'anthropic',
+            operations: ['read'],
+            recordVersion: 1,
+            createdAtMs: null,
+            state: 'active',
+          },
+        ],
+        view,
+      }),
+      getScoped: async () => {
+        throw new Error('no dispatch in this test')
+      },
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }),
+    pollIntervalMs: 0,
+    onRoster: (roster) => {
+      seen.push(roster.view)
+    },
+  })
+  runtimes.push(runtime)
+  await runtime.refresh()
+  await runtime.refresh()
+  // Second poll with an identical view must not re-notify: subscribers
+  // refresh quotas and rewrite shared state files on every notification.
+  expect(seen).toEqual(['v1'])
+  view = 'v2'
+  await runtime.refresh()
+  expect(seen).toEqual(['v1', 'v2'])
+})
+
+test('two project runtimes sharing storage serve the persisted roster while a peer holds discovery lease', async () => {
+  const f = await fixture()
+  const original = await f.runtime.refresh()
+  expect(original?.primary?.credentialId).toBe('oauth:anthropic')
+  const entered = deferred<void>()
+  const release = deferred<void>()
+  let peerLists = 0
+  const peer = new ClaustrumScopedRuntime({
+    ...f.options,
+    connect: async () => ({
+      ...f.client,
+      listScoped: async () => {
+        peerLists++
+        entered.resolve()
+        await release.promise
+        return { rows: f.rows, view: 'new-view' }
+      },
+    }),
+  })
+  runtimes.push(peer)
+  const held = peer.refresh()
+  await entered.promise
+  const another = new ClaustrumScopedRuntime(f.options)
+  runtimes.push(another)
+  try {
+    const alreadyCommitted = await another.refresh()
+    expect(alreadyCommitted?.view).toBe(original?.view)
+    expect(alreadyCommitted?.primary?.accountId).toBe('provider-0')
+    expect(alreadyCommitted?.accounts[0]?.claustrumScopedCredentialId).toBe(
+      'oauth:anthropic:work',
+    )
+    expect(peerLists).toBe(1)
+    const receipt = await another.authorize('main')
+    expect(receipt.accountId).toBe('provider-0')
+    expect(f.gets.at(-1)?.credentialId).toBe('oauth:anthropic')
+  } finally {
+    release.resolve()
+    await held
+  }
+})
+
+test.each(['quota', 'profile'] as const)(
+  '%s recovers a 401 only when the same scoped account advances',
+  async (kind) => {
+    const f = await fixture()
+    let version = 3
+    const sent: string[] = []
+    f.client.getScoped = async (input) => {
+      f.gets.push(input)
+      return {
+        credentialId: input.credentialId,
+        accountId: f.rows[0]?.accountId,
+        material: `vault-v${version}`,
+        recordVersion: version,
+        expiresAtMs: Date.now() + 600_000,
+      }
+    }
+    const http = Object.assign(
+      async (
+        _input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        sent.push(authorization)
+        if (authorization === 'Bearer vault-v3') {
+          version = 4
+          return new Response(null, { status: 401 })
+        }
+        return kind === 'quota'
+          ? Response.json({ five_hour: { utilization: 10 } })
+          : Response.json({
+              organization: {
+                rate_limit_tier: 'default_claude_max_5x',
+                organization_type: 'individual',
+              },
+            })
+      },
+      { preconnect: fetch.preconnect },
+    )
+    const result =
+      kind === 'quota'
+        ? await f.runtime.fetchQuota('main', http)
+        : await f.runtime.fetchProfile('main', http)
+    expect(result).toBeDefined()
+    expect(sent).toEqual(['Bearer vault-v3', 'Bearer vault-v4'])
+    expect(f.gets).toHaveLength(2)
+    expect(f.reports).toEqual([])
+  },
+)

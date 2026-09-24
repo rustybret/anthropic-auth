@@ -29,6 +29,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import {
+  __prewarmPiCacheKeepForTest,
   closePiScopedRuntime,
   getPiScopedRuntime,
   streamCortexKitAnthropic,
@@ -257,44 +258,61 @@ test('fallback-first discovers a new account on the next turn and honors a live 
   expect(await readFile(f.path, 'utf8')).not.toContain('vault-test-access')
 })
 
-test('relay-to-direct fallback reauthorizes and reports only the direct attempt version', async () => {
-  const f = await fixture('main-first', true)
-  const credentials: string[] = []
-  globalThis.fetch = Object.assign(
-    async (
-      input: Parameters<typeof fetch>[0],
-      init?: Parameters<typeof fetch>[1],
-    ) => {
-      if (String(input).startsWith('https://relay.invalid')) {
-        const payload = JSON.parse(String(init?.body))
-        credentials.push(payload.upstream.headers.authorization)
-        return new Response('relay unavailable', { status: 500 })
+test.each([500, 401])(
+  'relay status %i falls back direct with a fresh version-fenced credential',
+  async (relayStatus) => {
+    const f = await fixture('main-first', true)
+    // Relay and direct use different records; no rotation occurs after the
+    // direct send, so a genuine 401 must report its exact served version.
+    f.client.getScoped = async (input) => {
+      f.gets.push(input)
+      const version = Math.min(f.gets.length, 2)
+      return {
+        credentialId: input.credentialId,
+        accountId: 'main-provider',
+        material: `vault-test-access-${version}`,
+        recordVersion: version,
+        expiresAtMs: Date.now() + 600_000,
       }
-      if (!String(input).startsWith('https://api.anthropic.com/v1/messages'))
-        throw new Error('Unexpected outbound request')
-      credentials.push(new Headers(init?.headers).get('authorization') ?? '')
-      return new Response('unauthorized', { status: 401 })
-    },
-    { preconnect: originalFetch.preconnect },
-  )
-  const result = await streamCortexKitAnthropic(model, context, {
-    sessionId: 'relay-fallback',
-  }).result()
-  expect(result.stopReason).toBe('error')
-  expect(credentials).toEqual([
-    'Bearer vault-test-access-1',
-    'Bearer vault-test-access-2',
-  ])
-  expect(f.reports).toEqual([
-    {
-      credentialId: 'oauth:anthropic',
-      enrollmentToken: '01'.repeat(32),
-      providerStatus: 401,
-      recordVersion: 2,
-      reporterSource: 'direct',
-    },
-  ])
-})
+    }
+    const credentials: string[] = []
+    globalThis.fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (String(input).startsWith('https://relay.invalid')) {
+          const payload = JSON.parse(String(init?.body))
+          credentials.push(payload.upstream.headers.authorization)
+          return new Response('relay unavailable', { status: relayStatus })
+        }
+        if (!String(input).startsWith('https://api.anthropic.com/v1/messages'))
+          throw new Error('Unexpected outbound request')
+        credentials.push(new Headers(init?.headers).get('authorization') ?? '')
+        return new Response('unauthorized', { status: 401 })
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await streamCortexKitAnthropic(model, context, {
+      sessionId: 'relay-fallback',
+    }).result()
+    expect(result.stopReason).toBe('error')
+    expect(credentials).toEqual([
+      'Bearer vault-test-access-1',
+      'Bearer vault-test-access-2',
+    ])
+    expect(f.gets).toHaveLength(3) // the 401 checks again but never resends unchanged v2
+    expect(f.reports).toEqual([
+      {
+        credentialId: 'oauth:anthropic',
+        enrollmentToken: '01'.repeat(32),
+        providerStatus: 401,
+        recordVersion: 2,
+        reporterSource: 'direct',
+      },
+    ])
+  },
+)
 
 test('scoped model switches reuse the existing sticky allocator and its Opus reserve preference', async () => {
   const f = await fixture('sticky-balanced')
@@ -512,5 +530,176 @@ test.each(hostCredentials)(
         { sessionManager: { getSessionId: () => undefined } },
       )
     }
+  },
+)
+
+test.each([200, 401])(
+  'Pi retries in-flight scoped 401 once and fences final status %i',
+  async (finalStatus) => {
+    const f = await fixture()
+    let version = 1
+    const gets: number[] = []
+    f.client.getScoped = async ({ credentialId }) => {
+      gets.push(version)
+      return {
+        credentialId,
+        accountId: 'main-provider',
+        material: `rotated-pi-${version}`,
+        recordVersion: version,
+        expiresAtMs: Date.now() + 600_000,
+      }
+    }
+    const sent: string[] = []
+    globalThis.fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (!String(input).includes('/v1/messages'))
+          throw new Error('unexpected upstream request')
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        sent.push(authorization)
+        if (authorization === 'Bearer rotated-pi-1') {
+          version = 2
+          return new Response('rotated credential rejected', { status: 401 })
+        }
+        return finalStatus === 401
+          ? new Response('current credential rejected', { status: 401 })
+          : success()
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await streamCortexKitAnthropic(model, context, {
+      sessionId: 'pi-rotation',
+    }).result()
+    expect(result.stopReason).toBe(finalStatus === 401 ? 'error' : 'stop')
+    expect(sent).toEqual(['Bearer rotated-pi-1', 'Bearer rotated-pi-2'])
+    expect(gets).toEqual([1, 2])
+    expect(f.reports.map((report) => report.recordVersion)).toEqual(
+      finalStatus === 401 ? [2] : [],
+    )
+  },
+)
+
+test.each([200, 401])(
+  'Pi HTTP relay retries rotated scoped credential once; final status %i',
+  async (finalStatus) => {
+    const f = await fixture('main-first', true)
+    let version = 1
+    const reports: number[] = [],
+      relayTokens: string[] = []
+    f.client.getScoped = async ({ credentialId }) => ({
+      credentialId,
+      accountId: 'main-provider',
+      material: `relay-pi-${version}`,
+      recordVersion: version,
+      expiresAtMs: Date.now() + 600_000,
+    })
+    f.client.reportAuthFailureScoped = async ({ recordVersion }) => {
+      reports.push(recordVersion)
+    }
+    globalThis.fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (!String(input).startsWith('https://relay.invalid'))
+          throw new Error('unexpected direct request')
+        const payload = JSON.parse(String(init?.body)) as {
+          upstream: { headers: Record<string, string> }
+        }
+        const authorization = payload.upstream.headers.authorization
+        if (!authorization) throw new Error('relay omitted scoped bearer')
+        relayTokens.push(authorization)
+        if (authorization === 'Bearer relay-pi-1') {
+          version = 2
+          return new Response('old record rejected', {
+            status: 401,
+            headers: { 'request-id': 'req_pi_old' },
+          })
+        }
+        return new Response(
+          finalStatus === 200 ? await success().text() : 'new record rejected',
+          {
+            status: finalStatus,
+            headers: { 'request-id': 'req_pi_new' },
+          },
+        )
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await streamCortexKitAnthropic(model, context, {
+      sessionId: 'pi-relay-rotation',
+    }).result()
+    expect(result.stopReason).toBe(finalStatus === 401 ? 'error' : 'stop')
+    expect(relayTokens).toEqual(['Bearer relay-pi-1', 'Bearer relay-pi-2'])
+    expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+  },
+)
+
+test.each([200, 401])(
+  'Pi CacheKeep retries a rotated scoped receipt once, final status %i',
+  async (finalStatus) => {
+    const f = await fixture()
+    let version = 1
+    const sent: string[] = []
+    f.client.getScoped = async ({ credentialId }) => ({
+      credentialId,
+      accountId: 'main-provider',
+      material: `pi-cachekeep-v${version}`,
+      recordVersion: version,
+      expiresAtMs: Date.now() + 600_000,
+    })
+    globalThis.fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (!String(input).includes('/v1/messages'))
+          throw new Error('unexpected Pi prewarm destination')
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        sent.push(authorization)
+        if (authorization === 'Bearer pi-cachekeep-v1') {
+          version = 2
+          return new Response('old token', { status: 401 })
+        }
+        return new Response(
+          finalStatus === 401
+            ? 'new token rejected'
+            : JSON.stringify({ usage: { input_tokens: 1 } }),
+          {
+            status: finalStatus,
+          },
+        )
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await __prewarmPiCacheKeepForTest({
+      sessionId: `pi-cachekeep-${finalStatus}`,
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: model.id,
+        max_tokens: 128,
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'warm' }],
+      }),
+      oauthAccountId: 'main',
+      oauthAccountIdentity: 'main-provider',
+      accountStoragePath: f.path,
+    })
+    expect(result.ok).toBe(finalStatus === 200)
+    expect(sent).toEqual(['Bearer pi-cachekeep-v1', 'Bearer pi-cachekeep-v2'])
+    expect(f.reports.map((report) => report.recordVersion)).toEqual(
+      finalStatus === 401 ? [2] : [],
+    )
   },
 )

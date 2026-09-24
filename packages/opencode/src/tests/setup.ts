@@ -3,7 +3,6 @@ import { mkdtempSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveCustodyHandlesPath } from '@cortexkit/anthropic-auth-core'
 import {
   assertLoopback,
   assertPreconnectUrl,
@@ -162,31 +161,12 @@ afterEach(() => {
 globalThis.fetch = guardedFetch
 
 const testDir = mkdtempSync(join(tmpdir(), 'anthropic-auth-opencode-test-'))
-const testManifestPath = join(testDir, 'handles.json')
-const testClaustrumConnectionPath = join(testDir, 'claustrum-connection.json')
 
 afterAll(async () => {
   await rm(testDir, { recursive: true, force: true }).catch(() => {})
 })
 
 process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = testDir
-process.env.CLAUSTRUM_OPENCODE_HANDLES = testManifestPath
-process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
-  testClaustrumConnectionPath
-const resolvedTestManifestPath = resolveCustodyHandlesPath(
-  undefined,
-  process.env,
-)
-const productionDefaultManifestPath = resolveCustodyHandlesPath(undefined, {
-  ...process.env,
-  CLAUSTRUM_OPENCODE_HANDLES: undefined,
-})
-if (
-  resolvedTestManifestPath !== testManifestPath ||
-  resolvedTestManifestPath === productionDefaultManifestPath
-) {
-  throw new Error('test manifest path escaped the isolated test directory')
-}
 process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(testDir, 'anthropic-auth.json')
 process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
   testDir,

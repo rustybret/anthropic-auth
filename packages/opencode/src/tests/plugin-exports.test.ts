@@ -17,7 +17,7 @@ describe('plugin module exports', () => {
     expect('__setBootProfileHydrationForTest' in pluginModule).toBe(false)
   })
 
-  test('does not expose a credential-cache construction hook', async () => {
+  test('does not expose a scoped custody construction hook', async () => {
     const { AnthropicAuthPlugin } = await import('../index')
     const plugin = await (
       AnthropicAuthPlugin as unknown as (
@@ -25,7 +25,7 @@ describe('plugin module exports', () => {
       ) => Promise<Record<string, unknown>>
     )({ client: { auth: { set: async () => {} } } })
 
-    expect('__ensureClaustrumCredentialCacheForTest' in plugin).toBe(false)
+    expect('__ensureScopedCustodyForTest' in plugin).toBe(false)
     await (plugin.dispose as (() => Promise<void>) | undefined)?.()
   })
 })

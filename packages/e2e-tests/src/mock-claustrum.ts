@@ -24,6 +24,7 @@ export type FakeClaustrumCredential = {
   record_version: number
   expires_at_ms: number
   cold?: boolean
+  state?: string
 }
 
 export type FakeClaustrumEnrollmentProposal = {
@@ -32,7 +33,7 @@ export type FakeClaustrumEnrollmentProposal = {
 }
 
 export type FakeClaustrumAuthFailure = {
-  handle?: string
+  credential_id?: string
   provider_status?: number
   record_version?: number
   reporter_source?: string
@@ -41,20 +42,25 @@ export type FakeClaustrumAuthFailure = {
 export type FakeClaustrumDaemon = {
   connectionFile: string
   credentialGets: string[]
+  scopedLists: number
   reportAuthFailures: FakeClaustrumAuthFailure[]
   enrollmentProposals: FakeClaustrumEnrollmentProposal[]
-  waitForCredentialGet: (handle: string) => Promise<void>
+  revokeScoped: (credentialId: string) => void
+  waitForCredentialGet: (credentialId: string) => Promise<void>
   waitForEnrollmentProposal: () => Promise<void>
   stop: () => Promise<void>
 }
 
 export async function startFakeClaustrumDaemon(input: {
   directory: string
-  credentials: Record<string, FakeClaustrumCredential>
+  /** Only explicitly listed native Anthropic OAuth IDs are visible to enrolled clients. */
+  scopedCredentials?: Record<string, FakeClaustrumCredential>
   connectionFile?: string
 }): Promise<FakeClaustrumDaemon> {
   const sockets = new Set<Socket>()
   const credentialGets: string[] = []
+  let scopedLists = 0
+  const revokedScoped = new Set<string>()
   const credentialGetWaiters = new Map<string, Set<() => void>>()
   const reportAuthFailures: FakeClaustrumAuthFailure[] = []
   const enrollmentProposals: FakeClaustrumEnrollmentProposal[] = []
@@ -155,45 +161,65 @@ export async function startFakeClaustrumDaemon(input: {
           writeResponse(socket, header, { result: { status: 'pending' } })
           continue
         }
-        if (request.method === 'credential.get') {
-          const handle = request.params?.handle
-          const credential =
-            typeof handle === 'string' ? input.credentials[handle] : undefined
-          if (typeof handle === 'string') credentialGets.push(handle)
-          if (credential?.cold) {
-            writeResponse(socket, header, {
-              result: { error: { code: 'cold', class: 'transient' } },
-            })
-            if (typeof handle === 'string') {
-              for (const resolve of credentialGetWaiters.get(handle) ?? [])
-                resolve()
-              credentialGetWaiters.delete(handle)
-            }
-            continue
-          }
+        if (request.method === 'credential.list_scoped') {
+          scopedLists++
+          const rows = Object.entries(input.scopedCredentials ?? {})
+            .filter(([id]) => !revokedScoped.has(id))
+            .map(([id, credential]) => ({
+              id,
+              account_id: credential.account_id,
+              type: 'oauth',
+              state: credential.state ?? 'active',
+              record_version: credential.record_version,
+              categories: ['anthropic-native'],
+              serves: ['anthropic'],
+              refresh_adapter: 'anthropic',
+              operations: ['read'],
+            }))
           writeResponse(socket, header, {
-            result: credential
-              ? {
-                  payload: payloadBytes(credential.payload),
-                  account_id: credential.account_id,
-                  credential_id: credential.credential_id,
-                  record_version: credential.record_version,
-                  expires_at_ms: credential.expires_at_ms,
-                }
-              : { error: { code: 'not_found', class: 'permanent' } },
+            result: {
+              credentials: rows,
+              view: JSON.stringify(
+                rows.map(({ id, account_id, state }) => [
+                  id,
+                  account_id,
+                  state,
+                ]),
+              ),
+            },
           })
-          if (typeof handle === 'string') {
-            for (const resolve of credentialGetWaiters.get(handle) ?? [])
-              resolve()
-            credentialGetWaiters.delete(handle)
+          continue
+        }
+        if (request.method === 'credential.get_scoped') {
+          const id = request.params?.credential_id
+          const credential =
+            typeof id === 'string' && !revokedScoped.has(id)
+              ? input.scopedCredentials?.[id]
+              : undefined
+          if (typeof id === 'string') credentialGets.push(id)
+          writeResponse(socket, header, {
+            result:
+              credential && !credential.cold
+                ? {
+                    payload: payloadBytes(credential.payload),
+                    credential_id: id,
+                    account_id: credential.account_id,
+                    record_version: credential.record_version,
+                    expires_at_ms: credential.expires_at_ms,
+                  }
+                : { error: { code: 'not_found', class: 'permanent' } },
+          })
+          if (typeof id === 'string') {
+            for (const resolve of credentialGetWaiters.get(id) ?? []) resolve()
+            credentialGetWaiters.delete(id)
           }
           continue
         }
         if (request.method === 'credential.report_auth_failure') {
           reportAuthFailures.push({
-            handle:
-              typeof request.params?.handle === 'string'
-                ? request.params.handle
+            credential_id:
+              typeof request.params?.credential_id === 'string'
+                ? request.params.credential_id
                 : undefined,
             provider_status:
               typeof request.params?.provider_status === 'number'
@@ -209,7 +235,12 @@ export async function startFakeClaustrumDaemon(input: {
                 : undefined,
           })
         }
-        writeResponse(socket, header, { result: {} })
+        writeResponse(socket, header, {
+          result:
+            request.method === 'credential.report_auth_failure'
+              ? { accepted: true }
+              : {},
+        })
       }
     })
   })
@@ -224,14 +255,18 @@ export async function startFakeClaustrumDaemon(input: {
   return {
     connectionFile,
     credentialGets,
+    get scopedLists() {
+      return scopedLists
+    },
+    revokeScoped: (credentialId) => revokedScoped.add(credentialId),
     reportAuthFailures,
     enrollmentProposals,
-    async waitForCredentialGet(handle: string) {
-      if (credentialGets.includes(handle)) return
+    async waitForCredentialGet(credentialId: string) {
+      if (credentialGets.includes(credentialId)) return
       await new Promise<void>((resolve) => {
-        const waiters = credentialGetWaiters.get(handle) ?? new Set()
+        const waiters = credentialGetWaiters.get(credentialId) ?? new Set()
         waiters.add(resolve)
-        credentialGetWaiters.set(handle, waiters)
+        credentialGetWaiters.set(credentialId, waiters)
       })
     },
     async waitForEnrollmentProposal() {

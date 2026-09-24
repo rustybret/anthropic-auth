@@ -28,7 +28,6 @@
   },
   "dependencies": {
     "@cortexkit/claustrum-client": "0.3.0",
-    "@cortexkit/subc-client": "^0.13.1",
     "xxhash-wasm": "^1.1.0"
   }
 }

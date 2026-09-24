@@ -391,6 +391,15 @@ export class CacheKeepManager {
         target: CacheKeepTarget,
         attempt: CacheKeepPrewarmAttempt,
       ) => Promise<Headers | undefined> | Headers | undefined
+      /** Optionally reauthorize a replayable prewarm after a genuine 401.
+       * Return headers only for a verified newer version of the same account;
+       * onResponse observes only the final physical attempt. */
+      retryOnUnauthorized?: (input: {
+        target: CacheKeepTarget
+        headers: Headers
+        bodyText: string
+        attempt: CacheKeepPrewarmAttempt
+      }) => Promise<Headers | undefined> | Headers | undefined
       onTrackedSessionsChanged?: (
         sessions: readonly CacheKeepTrackedSession[],
       ) => Promise<void> | void
@@ -687,7 +696,7 @@ export class CacheKeepManager {
 
       const fetchImpl = this.options.fetchImpl ?? fetch
       const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
-      const headers = this.options.prepareHeaders
+      let headers = this.options.prepareHeaders
         ? await this.options.prepareHeaders(
             new Headers(target.headers),
             prewarmTarget,
@@ -704,13 +713,40 @@ export class CacheKeepManager {
       headers.delete('content-length')
       headers.delete('transfer-encoding')
       let response: Response
-      try {
-        response = await fetchImpl(target.url, {
+      const send = (attemptHeaders: Headers) =>
+        fetchImpl(target.url, {
           method: 'POST',
-          headers,
+          headers: attemptHeaders,
           body: prewarm.bodyText,
           signal: attempt.signal,
         })
+      try {
+        response = await send(headers)
+        if (
+          response.status === 401 &&
+          !attempt.signal?.aborted &&
+          this.options.retryOnUnauthorized
+        ) {
+          let rotatedHeaders: Headers | undefined
+          try {
+            rotatedHeaders = await this.options.retryOnUnauthorized({
+              target: prewarmTarget,
+              headers,
+              bodyText: prewarm.bodyText,
+              attempt,
+            })
+          } catch {
+            // A failed credential lookup cannot justify replay. Observe and
+            // report the original 401 against its actual send-time receipt.
+          }
+          if (rotatedHeaders && !attempt.signal?.aborted) {
+            rotatedHeaders.delete('content-length')
+            rotatedHeaders.delete('transfer-encoding')
+            await response.body?.cancel().catch(() => {})
+            headers = rotatedHeaders
+            response = await send(headers)
+          }
+        }
       } catch (error) {
         return {
           ok: false,

@@ -75,8 +75,9 @@ const quotaHeaders = {
 }
 
 afterEach(async () => {
-  await harness?.dispose()
+  const finished = harness
   harness = null
+  await finished?.dispose()
 })
 
 describe('quota headers through relay', () => {

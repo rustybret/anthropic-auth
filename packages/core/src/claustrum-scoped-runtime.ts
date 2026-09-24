@@ -14,6 +14,7 @@ import {
   type ClaustrumScopedAttempt,
   type ClaustrumScopedClient,
   ClaustrumScopedCustody,
+  isScopedCredentialRotation,
 } from './claustrum-scoped.js'
 import {
   type ClaustrumScopedRoster,
@@ -37,6 +38,9 @@ export interface ClaustrumScopedRuntimeOptions {
   storagePath: string
   tokenPath: string
   connect: () => Promise<ClaustrumScopedClient>
+  /** Fired once per discovery change (including the initial snapshot),
+   * keyed by the inventory view digest. Repeat polls with an identical
+   * view do not notify. */
   onRoster?: (roster: ClaustrumScopedRoster) => void
   onError?: () => void
   setTimeoutImpl?: typeof setTimeout
@@ -140,8 +144,13 @@ export class ClaustrumScopedRuntime {
         signal: this.#shutdown.signal,
       })
       this.#assertOpen()
+      const changed = roster?.view !== this.#roster?.view
       this.#roster = roster
-      if (roster) this.#options.onRoster?.(roster)
+      // Notify only on discovery changes (including the initial snapshot).
+      // The poll loop runs every few seconds; unconditional notification
+      // would make every plugin instance rewrite shared state files on each
+      // tick, clobbering fresher cross-process data (e.g. CacheKeep counts).
+      if (roster && changed) this.#options.onRoster?.(roster)
       return roster
     })().finally(() => {
       this.#refreshing = undefined
@@ -240,7 +249,7 @@ export class ClaustrumScopedRuntime {
     const attempt = await this.authorize(routeId)
     return fetchOAuthQuotaSnapshot({
       accessToken: attempt.accessToken,
-      fetchImpl: this.#fetchForAttempt(attempt, fetchImpl),
+      fetchImpl: this.#fetchForAttempt(routeId, attempt, fetchImpl),
     })
   }
 
@@ -255,11 +264,12 @@ export class ClaustrumScopedRuntime {
       accountIdentity: attempt.accountId,
       providerAccountUuid: attempt.accountId as ProviderAccountUuid,
       signal,
-      fetchImpl: this.#fetchForAttempt(attempt, fetchImpl),
+      fetchImpl: this.#fetchForAttempt(routeId, attempt, fetchImpl),
     })
   }
 
   #fetchForAttempt(
+    routeId: string,
     attempt: ClaustrumScopedAttempt,
     fetchImpl: typeof fetch,
   ): typeof fetch {
@@ -269,16 +279,33 @@ export class ClaustrumScopedRuntime {
         init?: Parameters<typeof fetch>[1],
       ) => {
         this.#assertOpen()
-        const response = await fetchImpl(input, {
-          ...init,
-          signal: AbortSignal.any([
-            this.#shutdown.signal,
-            ...(init?.signal ? [init.signal] : []),
-          ]),
-        })
+        const signal = AbortSignal.any([
+          this.#shutdown.signal,
+          ...(init?.signal ? [init.signal] : []),
+        ])
+        let response = await fetchImpl(input, { ...init, signal })
+        let served = attempt
+        if (response.status === 401 && !signal.aborted) {
+          let current: ClaustrumScopedAttempt | undefined
+          try {
+            current = await this.authorize(routeId, signal)
+          } catch {
+            // No verified replacement: retain the response and report the
+            // exact receipt used by this physical request below.
+          }
+          if (isScopedCredentialRotation(served, current)) {
+            await response.body?.cancel().catch(() => {})
+            const headers = new Headers(init?.headers)
+            headers.set('authorization', `Bearer ${current.accessToken}`)
+            served = current
+            // The quota/profile requests are bodyless GETs. A transport
+            // failure on the second attempt is not an OAuth rejection.
+            response = await fetchImpl(input, { ...init, headers, signal })
+          }
+        }
         if (response.status === 401) {
-          await this.reportFailure(attempt, response.status, 'direct').catch(
-            () => this.#options.onError?.(),
+          await this.reportFailure(served, 401, 'direct').catch(() =>
+            this.#options.onError?.(),
           )
         }
         return response

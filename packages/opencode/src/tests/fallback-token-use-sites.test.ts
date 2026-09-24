@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
   CACHE_KEEP_TICK_MS,
+  type ClaustrumScopedClient,
   custodyTombstoneOAuth,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
@@ -45,6 +46,7 @@ const fixtureEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
   'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
 ] as const
 const fixtureEnv = new Map(fixtureEnvKeys.map((key) => [key, process.env[key]]))
 
@@ -141,6 +143,7 @@ async function createFixture(
     quotaEnabled?: boolean
     quotaSnapshot?: ReturnType<typeof quota>
     prime?: boolean
+    primeMainDue?: boolean
     cachekeep?: boolean
     recovery?: boolean
     profile?: boolean
@@ -154,11 +157,11 @@ async function createFixture(
   const mainVault = mainVaultToken(site)
   const mainProviderAccountId = `main-provider-${site}`
   const accountId = `fallback-${site}`
-  const handle = `ckh_${'F'.repeat(43)}`
-  const mainHandle = `ckh_${'M'.repeat(43)}`
+  const credentialId = `oauth:anthropic:${accountId}`
+  const mainCredentialId = 'oauth:anthropic'
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
-  const credentialGets: Array<{ handle?: string; isMain: boolean }> = []
+  const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
   let refusalPending = options.recovery === true
 
   if (options.now !== undefined) {
@@ -207,6 +210,14 @@ async function createFixture(
             ? {
                 mainQuota: {
                   ...quota(now, options.recovery ? 0 : 90),
+                  ...(options.primeMainDue
+                    ? {
+                        five_hour: {
+                          ...quota(now).five_hour,
+                          resetsAt: new Date(now - 120_000).toISOString(),
+                        },
+                      }
+                    : {}),
                   accountIdentity: mainProviderAccountId,
                 },
                 mainQuotaCheckedAt: now,
@@ -216,7 +227,12 @@ async function createFixture(
       : { enabled: false, failClosedOnUnknownQuota: false },
     claustrum: {
       mode: 'claustrum',
-      handlesFile: '',
+      scopedRoster: true,
+      primaryAccount: {
+        credentialId: mainCredentialId,
+        accountId: mainProviderAccountId as never,
+        state: 'active',
+      },
     },
     ...(options.prime ? { prime: { enabled: true } } : {}),
     ...(options.cachekeep || options.recovery
@@ -229,7 +245,12 @@ async function createFixture(
       {
         id: accountId,
         label: accountId,
-        ...custodyTombstoneOAuth('anthropic'),
+        type: 'oauth',
+        enabled: true,
+        refresh: '',
+        claustrumScopedCredentialId: credentialId,
+        claustrumScopedState: 'active',
+        anthropicAccountUuid: accountId as never,
         ...(options.quotaSnapshot ? { quota: options.quotaSnapshot } : {}),
       },
     ],
@@ -238,34 +259,13 @@ async function createFixture(
   const directory = await mkdtemp(join(tmpdir(), `fallback-census-${site}-`))
   tempDirs.add(directory)
   const accountFile = join(directory, 'anthropic-auth.json')
-  const handlesFile = join(directory, 'opencode-handles.json')
-  storage.claustrum!.handlesFile = handlesFile
+  const tokenFile = join(directory, 'opencode-enrollment.json')
   await writeFile(
-    handlesFile,
-    `${JSON.stringify({
-      version: 1,
-      providers: [
-        {
-          provider: 'anthropic',
-          shape: 'oauth',
-          serve: 'anthropic-auth',
-          accounts: [
-            {
-              label: 'main',
-              handle: mainHandle,
-              credential_id: 'oauth:anthropic:main',
-            },
-            {
-              label: accountId,
-              handle,
-              credential_id: `oauth:anthropic:${accountId}`,
-            },
-          ],
-        },
-      ],
-    })}\n`,
+    tokenFile,
+    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
   )
-  await chmod(handlesFile, 0o600)
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenFile
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountFile
   process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
     directory,
@@ -284,33 +284,50 @@ async function createFixture(
     await saveAccountState(storage, accountFile, { mainProfile: true })
   }
 
-  const connector = async () =>
-    ({
-      call: async (
-        _moduleId: string,
-        method: string,
-        params?: { handle?: string },
-      ) => {
-        if (method !== 'credential.get') return { result: {} }
-        const isMain = params?.handle === mainHandle
-        credentialGets.push({ handle: params?.handle, isMain })
-        return {
-          result: {
-            payload: Array.from(
-              new TextEncoder().encode(
-                JSON.stringify({
-                  access_token: isMain ? mainVault : vault,
-                  account_uuid: isMain ? mainProviderAccountId : accountId,
-                }),
-              ),
-            ),
-            expires_at_ms: now + 12 * 60 * 60_000,
-            record_version: 103,
-          },
-        }
-      },
-      close() {},
-    }) as never
+  const scopedClient: ClaustrumScopedClient = {
+    listScoped: async () => ({
+      view: `census-${site}`,
+      rows: [
+        {
+          id: mainCredentialId,
+          accountId: mainProviderAccountId,
+          categories: ['anthropic-native'],
+          serves: ['anthropic'],
+          credentialType: 'oauth',
+          refreshAdapter: 'anthropic',
+          operations: ['read'],
+          state: 'active' as const,
+          recordVersion: 103,
+          createdAtMs: null,
+        },
+        {
+          id: credentialId,
+          accountId,
+          categories: ['anthropic-native'],
+          serves: ['anthropic'],
+          credentialType: 'oauth',
+          refreshAdapter: 'anthropic',
+          operations: ['read'],
+          state: 'active' as const,
+          recordVersion: 103,
+          createdAtMs: null,
+        },
+      ],
+    }),
+    getScoped: async (input) => {
+      const isMain = input.credentialId === mainCredentialId
+      credentialGets.push({ credentialId: input.credentialId, isMain })
+      return {
+        credentialId: input.credentialId,
+        accountId: isMain ? mainProviderAccountId : accountId,
+        material: isMain ? mainVault : vault,
+        expiresAtMs: Date.now() + 12 * 60 * 60_000,
+        recordVersion: 103,
+      }
+    },
+    reportAuthFailureScoped: async () => {},
+    close() {},
+  }
 
   const refusalSse = [
     'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
@@ -432,7 +449,11 @@ async function createFixture(
         session: { promptAsync: mock(() => Promise.resolve()) },
       },
     },
-    { claustrumConnector: connector, setInterval, clearInterval },
+    {
+      claustrumScopedConnect: async () => scopedClient,
+      setInterval,
+      clearInterval,
+    },
   )) as any
   activePlugins.add(plugin)
   const result = await plugin.auth.loader(
@@ -444,6 +465,7 @@ async function createFixture(
   return {
     accountId,
     credentialGets,
+    scopedClient,
     intervals,
     plugin,
     records,
@@ -561,7 +583,7 @@ describe('vault-served fallback outbound token census', () => {
     const bootstrap = fixture.records.filter((record) =>
       record.url.includes('/claude_cli/bootstrap'),
     )
-    expect(bootstrap.length).toBeGreaterThan(0)
+    expectOnlyVaultToken(bootstrap, 'cachekeep', fixture.credentialGets)
   })
 
   test.serial(
@@ -683,3 +705,233 @@ describe('vault-served fallback outbound token census', () => {
     expectOnlyVaultToken(profiles, 'profile')
   })
 })
+
+describe('scoped maintenance rotation recovery', () => {
+  async function checkCacheKeepRotation(finalStatus: 200 | 401) {
+    const now = 1_000
+    const fixture = await createFixture('main-cachekeep', {
+      now,
+      cachekeep: true,
+      captureIntervals: true,
+      mainFirst: true,
+    })
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      stream: true,
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await (
+      await fixture.result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': `cachekeep-rotated-${finalStatus}` },
+        body,
+      })
+    ).text()
+    resetClaudeCodeIdentityCachesForTest()
+    const reports: number[] = []
+    const sent: string[] = []
+    let version = 103
+    const originalGet = fixture.scopedClient.getScoped.bind(
+      fixture.scopedClient,
+    )
+    fixture.scopedClient.getScoped = async (input) => {
+      const receipt = await originalGet(input)
+      return input.credentialId === 'oauth:anthropic'
+        ? {
+            ...receipt,
+            material: `scoped-cachekeep-v${version}`,
+            recordVersion: version,
+          }
+        : receipt
+    }
+    fixture.scopedClient.reportAuthFailureScoped = async ({
+      recordVersion,
+    }) => {
+      reports.push(recordVersion)
+    }
+    const originalRequest = globalThis.fetch
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      const requestBody = typeof init?.body === 'string' ? init.body : ''
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages') &&
+        (JSON.parse(requestBody) as { max_tokens?: number }).max_tokens === 0
+      ) {
+        sent.push(authorization)
+        if (authorization === 'Bearer scoped-cachekeep-v103') {
+          version = 104
+          return Promise.resolve(
+            new Response('rotated token rejected', { status: 401 }),
+          )
+        }
+        if (finalStatus === 401)
+          return Promise.resolve(
+            new Response('current token rejected', { status: 401 }),
+          )
+      }
+      return originalRequest(input as Parameters<typeof fetch>[0], init)
+    }) as unknown as typeof fetch
+    ;(
+      fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
+    ).clock(now + 55 * 60_000)
+    const interval = fixture.intervals.find(
+      (candidate) => candidate.ms === CACHE_KEEP_TICK_MS,
+    )
+    if (!interval) throw new Error('CacheKeep interval missing')
+    interval.callback()
+    await waitFor(
+      () => sent.length >= 2,
+      'rotated CacheKeep prewarm was not replayed',
+    )
+    await waitFor(
+      () => reports.length >= (finalStatus === 401 ? 1 : 0),
+      'CacheKeep final 401 was not reported',
+    )
+    expect(sent).toEqual([
+      'Bearer scoped-cachekeep-v103',
+      'Bearer scoped-cachekeep-v104',
+    ])
+    expect(reports).toEqual(finalStatus === 401 ? [104] : [])
+  }
+
+  test.serial(
+    'CacheKeep reauthorizes one rotated prewarm without reporting the obsolete receipt',
+    () => checkCacheKeepRotation(200),
+  )
+  test.serial(
+    'CacheKeep reports only the newly served version if the replay also receives 401',
+    () => checkCacheKeepRotation(401),
+  )
+
+  test.serial(
+    'Prime fires only once after in-flight rotation and reports the final rejected version',
+    async () => {
+      const now = Date.now() - 60_000
+      const dueQuota = quota(now)
+      dueQuota.five_hour.resetsAt = new Date(now - 120_000).toISOString()
+      const fixture = await createFixture('prime', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: dueQuota,
+        prime: true,
+      })
+      const reports: number[] = []
+      const sent: string[] = []
+      let version = 103
+      const originalGet = fixture.scopedClient.getScoped.bind(
+        fixture.scopedClient,
+      )
+      fixture.scopedClient.getScoped = async (input) => {
+        const receipt = await originalGet(input)
+        return input.credentialId === `oauth:anthropic:${fixture.accountId}`
+          ? {
+              ...receipt,
+              material: `scoped-prime-v${version}`,
+              recordVersion: version,
+            }
+          : receipt
+      }
+      fixture.scopedClient.reportAuthFailureScoped = async ({
+        recordVersion,
+      }) => {
+        reports.push(recordVersion)
+      }
+      const originalRequest = globalThis.fetch
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        const requestBody = typeof init?.body === 'string' ? init.body : ''
+        if (
+          url.includes('/v1/messages') &&
+          requestBody &&
+          (JSON.parse(requestBody) as { max_tokens?: number }).max_tokens ===
+            1 &&
+          authorization.startsWith('Bearer scoped-prime-v')
+        ) {
+          sent.push(authorization)
+          if (authorization === 'Bearer scoped-prime-v103') {
+            version = 104
+            return Promise.resolve(
+              new Response('rotated token rejected', { status: 401 }),
+            )
+          }
+          return Promise.resolve(
+            new Response('latest token rejected', { status: 401 }),
+          )
+        }
+        return originalRequest(input as Parameters<typeof fetch>[0], init)
+      }) as unknown as typeof fetch
+      await fixture.plugin.__primeManager.tick()
+      expect(sent).toEqual([
+        'Bearer scoped-prime-v103',
+        'Bearer scoped-prime-v104',
+      ])
+      expect(reports).toEqual([104])
+    },
+  )
+})
+
+test.serial(
+  'Prime quota preflight reports the actual scoped version used after a second 401',
+  async () => {
+    const now = Date.now() - 60_000
+    const dueQuota = quota(now)
+    dueQuota.five_hour.resetsAt = new Date(now - 120_000).toISOString()
+    const fixture = await createFixture('prime', {
+      now,
+      quotaEnabled: true,
+      quotaSnapshot: dueQuota,
+      prime: true,
+      primeMainDue: true,
+    })
+    const sent: string[] = []
+    const reports: number[] = []
+    let version = 103
+    const originalGet = fixture.scopedClient.getScoped.bind(
+      fixture.scopedClient,
+    )
+    fixture.scopedClient.getScoped = async (input) => {
+      const receipt = await originalGet(input)
+      return input.credentialId === 'oauth:anthropic'
+        ? {
+            ...receipt,
+            material: `scoped-prime-quota-v${version}`,
+            recordVersion: version,
+          }
+        : receipt
+    }
+    fixture.scopedClient.reportAuthFailureScoped = async ({
+      recordVersion,
+    }) => {
+      reports.push(recordVersion)
+    }
+    const originalRequest = globalThis.fetch
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (
+        url.includes('/api/oauth/usage') &&
+        authorization.startsWith('Bearer scoped-prime-quota-v')
+      ) {
+        sent.push(authorization)
+        version = 104
+        return Promise.resolve(
+          new Response('quota token rejected', { status: 401 }),
+        )
+      }
+      return originalRequest(input as Parameters<typeof fetch>[0], init)
+    }) as unknown as typeof fetch
+    await fixture.plugin.__primeManager.tick()
+    expect(sent).toEqual([
+      'Bearer scoped-prime-quota-v103',
+      'Bearer scoped-prime-quota-v104',
+    ])
+    expect(reports).toEqual([104])
+  },
+)

@@ -562,7 +562,11 @@ export async function buildAnthropicRequest(
     effortTransitions?: readonly MidConversationEffortTransition[]
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
   } = {},
-): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
+): Promise<{
+  body: AnthropicRequestBody
+  bodyText: string
+  hostTools: Tool[]
+}> {
   // Pi 0.86 passes a normalized transcript to providers. Resolve instructions,
   // named sections and tool changes through its own replay helpers; raw host
   // prompts (including ordered OMP blocks) still enter through normalization.
@@ -706,5 +710,8 @@ export async function buildAnthropicRequest(
 
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
-  return { body, bodyText }
+  // The stream decoder must use the exact tool set that produced this body.
+  // Pi 0.86's transcript has no top-level context.tools, and normalizing it
+  // again after dispatch would duplicate work and risk a different mapping.
+  return { body, bodyText, hostTools: context.tools ?? [] }
 }

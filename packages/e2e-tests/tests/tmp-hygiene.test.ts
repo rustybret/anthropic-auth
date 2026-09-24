@@ -15,7 +15,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import {
   cleanupE2ERun,
   createIsolatedEnv,
@@ -100,7 +100,7 @@ describe('e2e temporary directory hygiene', () => {
 
     await sweepStaleE2ETempDirs({ root, now: now.getTime() })
 
-    expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+    expect(await readdir(root)).toEqual([basename(env.tempDir)])
     await removeE2ETempDir(env.tempDir, { root })
   })
 
@@ -254,7 +254,7 @@ describe('e2e temporary directory hygiene', () => {
 
     await sweepStaleE2ETempDirs({ root, now: now.getTime() })
 
-    expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+    expect(await readdir(root)).toEqual([basename(env.tempDir)])
     await removeE2ETempDir(env.tempDir, { root })
   })
 
@@ -302,7 +302,7 @@ describe('e2e temporary directory hygiene', () => {
 
       await sweepStaleE2ETempDirs({ root, now: now.getTime() })
 
-      expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+      expect(await readdir(root)).toEqual([basename(env.tempDir)])
     } finally {
       child.kill()
       await child.exited
@@ -338,7 +338,7 @@ describe('e2e temporary directory hygiene', () => {
     await sweepStaleE2ETempDirs({ root, now: now.getTime() })
 
     expect((await readdir(root)).sort()).toEqual(
-      [env.tempDir.split('/').at(-1), 'handoff-target.txt'].sort(),
+      [basename(env.tempDir), 'handoff-target.txt'].sort(),
     )
     await removeE2ETempDir(env.tempDir, { root })
   })
@@ -374,7 +374,7 @@ describe('e2e temporary directory hygiene', () => {
     await utimes(env.tempDir, staleTime, staleTime)
     await sweepStaleE2ETempDirs({ root, now: now.getTime() })
 
-    expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+    expect(await readdir(root)).toEqual([basename(env.tempDir)])
     await removeE2ETempDir(env.tempDir, { root })
   })
 

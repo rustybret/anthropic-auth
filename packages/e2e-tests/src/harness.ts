@@ -233,14 +233,19 @@ export class E2EHarness {
   }
 
   async waitFor<T>(
-    predicate: () => T | false | null | undefined,
+    predicate: () =>
+      | T
+      | false
+      | null
+      | undefined
+      | Promise<T | false | null | undefined>,
     options: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
   ): Promise<T> {
     const timeoutMs = options.timeoutMs ?? 10_000
     const intervalMs = options.intervalMs ?? 100
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
-      const value = predicate()
+      const value = await predicate()
       if (value) return value
       await Bun.sleep(intervalMs)
     }

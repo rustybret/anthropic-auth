@@ -15,6 +15,13 @@ import type {
   ClaustrumScopedCustody,
 } from './claustrum-scoped.js'
 
+export class ClaustrumRosterBusyError extends Error {
+  readonly code = 'claustrum_roster_busy'
+  constructor() {
+    super('Claustrum account discovery is already in progress')
+  }
+}
+
 export interface ClaustrumScopedRoster {
   /** The vault's conventional default record; absent when only labeled accounts exist. */
   primary?: ClaustrumScopedAccount
@@ -166,6 +173,7 @@ export function projectClaustrumScopedRoster(
     claustrum: {
       ...storage.claustrum,
       scopedRoster: true,
+      rosterView: view,
       primaryAccount: primary
         ? {
             credentialId: primary.credentialId,
@@ -201,8 +209,48 @@ export async function refreshClaustrumScopedRoster(options: {
     ttlMs: 30_000,
     renew: true,
   })
-  if (!lease)
-    throw new Error('Claustrum account discovery is already in progress')
+  if (!lease) {
+    // A peer owns the only LIST/commit lease. Its last committed, secret-free
+    // roster is still authoritative for dispatch: getScoped revalidates the
+    // selected account and record version before every physical send.
+    const persisted = await loadAccounts(options.path)
+    options.signal?.throwIfAborted()
+    if (
+      getClaustrumMode(persisted) !== 'claustrum' ||
+      persisted?.claustrum?.scopedRoster !== true ||
+      !persisted.claustrum.primaryAccount?.credentialId ||
+      !persisted.claustrum.primaryAccount.accountId
+    ) {
+      throw new ClaustrumRosterBusyError()
+    }
+    const primary = persisted.claustrum.primaryAccount
+    const accounts = persisted.accounts.filter(
+      (account): account is OAuthAccount =>
+        isOAuthAccount(account) && Boolean(account.claustrumScopedCredentialId),
+    )
+    // Older rosters predate the persisted producer cursor; derive a stable
+    // one only for those stores. New commits reuse the exact producer view so
+    // competing instances do not alternate their onRoster notifications.
+    const view =
+      persisted.claustrum.rosterView ??
+      `persisted:${createHash('sha256')
+        .update(
+          JSON.stringify([
+            primary.credentialId,
+            primary.accountId,
+            primary.state,
+            accounts.map((account) => [
+              account.id,
+              account.claustrumScopedCredentialId,
+              account.anthropicAccountUuid,
+              account.claustrumScopedState,
+              account.enabled,
+            ]),
+          ]),
+        )
+        .digest('hex')}`
+    return { primary, accounts, storage: persisted, view }
+  }
   try {
     if (getClaustrumMode(await loadAccounts(options.path)) !== 'claustrum')
       return undefined

@@ -59,13 +59,42 @@ export async function setupClaustrumForHost(
   }
 
   try {
-    if (status.state === 'idle') {
+    const recoverableRequestCodes = new Set([
+      'superseded',
+      'not_found',
+      'already_consumed',
+    ])
+    if (
+      status.state === 'idle' ||
+      status.state === 'pending' ||
+      (status.state === 'blocked' && recoverableRequestCodes.has(status.code))
+    ) {
+      // Setup, unlike a plugin boot or status view, is an explicit enrollment
+      // action. Reconcile even an existing request before asking ck to approve
+      // it; a crash between secret persistence and propose must also resume.
       const manager = new ClaustrumEnrollmentManager({
         client: await ensureEnrollClient(),
         paths,
         proposedName,
       })
       status = await manager.reconcile()
+      if (
+        status.state === 'blocked' &&
+        recoverableRequestCodes.has(status.code)
+      ) {
+        // The daemon proved this request ID dead. Clear it only through the
+        // locked terminal reset, then issue at most one new proposal for this
+        // user-invoked setup. Denials and other blocked causes stay terminal.
+        const reset = await manager.resetTerminal()
+        if (reset !== 'reset') {
+          return {
+            ok: false,
+            message: `Enrollment changed during setup (state: ${reset}); retry setup`,
+            discoveredAccounts: [],
+          }
+        }
+        status = await manager.reconcile()
+      }
     }
 
     // 2. If pending, approve via ck CLI

@@ -12,6 +12,9 @@ import {
 } from './test-fetch'
 
 describe('test network guard', () => {
+  // Requests use 127.0.0.1. On macOS an IPv6 wildcard listener can share its
+  // ephemeral port with another process's IPv4 listener, routing test requests
+  // to that process instead. Bind each test server to the requested family.
   const guardedFetch = createGuardedFetch()
   test('rejects non-loopback fetches with an actionable error', async () => {
     await expect(
@@ -29,6 +32,7 @@ describe('test network guard', () => {
 
   test('allows fetches to loopback servers', async () => {
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: () => new Response('ok'),
     })
@@ -64,6 +68,7 @@ describe('test network guard', () => {
 
   test('rejects a loopback redirect to a non-loopback URL', async () => {
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: () => Response.redirect('https://example.invalid/pwned', 302),
     })
@@ -82,6 +87,7 @@ describe('test network guard', () => {
   test('follows redirects that stay on loopback', async () => {
     let requests = 0
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request): Response => {
         requests += 1
@@ -133,6 +139,7 @@ describe('test network guard', () => {
     })
     let responseTimer: ReturnType<typeof setTimeout> | undefined
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request): Response => {
         requests += 1
@@ -179,6 +186,7 @@ describe('test network guard', () => {
   test('rejects after exceeding the loopback redirect cap', async () => {
     const redirectHops = 21
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request): Response => {
         const hop = Number(new URL(request.url).pathname.slice('/hop/'.length))
@@ -201,6 +209,7 @@ describe('test network guard', () => {
 
   test('allows a redirect chain at the loopback redirect cap boundary', async () => {
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request): Response => {
         const hop = Number(new URL(request.url).pathname.slice('/hop/'.length))
@@ -311,6 +320,7 @@ describe('test network guard', () => {
   test('rejects a non-loopback target after multiple loopback hops', async () => {
     let requests = 0
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request): Response => {
         requests += 1
@@ -377,6 +387,7 @@ describe('test network guard', () => {
     const crossOriginHeaders: Record<string, string | null>[] = []
     const sameOriginHeaders: Record<string, string | null>[] = []
     const serverB = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request) => {
         const headers = new Headers(request.headers)
@@ -390,6 +401,7 @@ describe('test network guard', () => {
       },
     })
     const serverA = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request) => {
         const url = new URL(request.url)
@@ -553,6 +565,7 @@ describe('test network guard', () => {
 
   test('preconnect allows loopback hosts', async () => {
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: () => new Response('ok'),
     })

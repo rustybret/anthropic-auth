@@ -37,6 +37,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isScopedCredentialRotation,
   isValidApiBaseURL,
   killswitchPassesPolicy,
   loadAccounts,
@@ -80,6 +81,7 @@ import {
   type StopReason,
   type TextContent,
   type ThinkingContent,
+  type Tool,
   type ToolCall,
 } from '@earendil-works/pi-ai'
 
@@ -350,10 +352,44 @@ const cacheKeepManager = new CacheKeepManager({
     }
     return headers
   },
+  retryOnUnauthorized: async ({ target, headers, attempt }) => {
+    const entry = scopedPrewarmAttempts.get(attempt.id)
+    if (!entry) return undefined
+    let current: ClaustrumScopedAttempt | undefined
+    try {
+      current = await entry.runtime.authorize(
+        target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+        attempt.signal,
+      )
+    } catch {
+      return undefined
+    }
+    if (!isScopedCredentialRotation(entry.receipt, current)) return undefined
+    logger.info(
+      'claustrum',
+      'retrying Pi CacheKeep after scoped credential rotation',
+      {
+        accountId: target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+        previousVersion: entry.receipt.recordVersion,
+        newVersion: current.recordVersion,
+      },
+    )
+    const rotatedHeaders = new Headers(headers)
+    rotatedHeaders.set('authorization', `Bearer ${current.accessToken}`)
+    scopedPrewarmAttempts.set(attempt.id, {
+      runtime: entry.runtime,
+      receipt: current,
+    })
+    return rotatedHeaders
+  },
   onResponse: async ({ attempt, status }) => {
     const entry = scopedPrewarmAttempts.get(attempt.id)
-    if (entry)
-      await entry.runtime.reportFailure(entry.receipt, status, 'direct')
+    if (entry && status === 401)
+      await entry.runtime
+        .reportFailure(entry.receipt, status, 'direct')
+        .catch(() => {
+          logger.warn('claustrum', 'Pi CacheKeep scoped 401 report unavailable')
+        })
   },
   onComplete: ({ attempt }) => {
     scopedPrewarmAttempts.delete(attempt.id)
@@ -362,6 +398,13 @@ const cacheKeepManager = new CacheKeepManager({
 
 export async function getPiTrackedCacheKeepSessions() {
   return getPiCacheKeepRegistry().list(cacheKeepManager.trackedSessions())
+}
+
+/** Exercise the real prewarm dispatch without wall-clock or timer mocks. */
+export function __prewarmPiCacheKeepForTest(
+  input: Parameters<CacheKeepManager['prewarmNow']>[0],
+) {
+  return cacheKeepManager.prewarmNow(input)
 }
 
 function mapStopReason(reason: string | null | undefined): StopReason {
@@ -521,6 +564,7 @@ async function sendAnthropicRequest(options: {
   oauthAccountId?: string
   route?: string
   effortTransitions?: readonly MidConversationEffortTransition[]
+  onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
@@ -557,7 +601,7 @@ async function sendAnthropicRequest(options: {
             accountIdentity,
           )
         : undefined
-  const { body, bodyText } = await buildAnthropicRequest(
+  const { body, bodyText, hostTools } = await buildAnthropicRequest(
     options.model.id,
     options.context,
     options.streamOptions,
@@ -574,6 +618,7 @@ async function sendAnthropicRequest(options: {
         : getThinkingPrefixMismatchBehavior(storage),
     },
   )
+  options.onResolvedTools?.(hostTools)
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
     ? configureApiRouteHeaders(options.apiAccount, fastMode)
@@ -638,12 +683,49 @@ async function sendAnthropicRequest(options: {
   }
   const directFetch = async () => {
     // Every physical attempt, including relay-to-direct fallback, is authorized.
-    const attempt = scoped
+    let attempt = scoped
       ? await scoped.authorize(routeId, options.streamOptions?.signal)
       : undefined
     if (attempt) headers.set('authorization', `Bearer ${attempt.accessToken}`)
     try {
-      const response = await fetch(input, init)
+      let response = await fetch(input, init)
+      if (attempt && response.status === 401 && !init.signal?.aborted) {
+        let rotated: ClaustrumScopedAttempt | undefined
+        try {
+          rotated = await scoped?.authorize(
+            routeId,
+            options.streamOptions?.signal,
+          )
+        } catch {
+          // A failed lookup is not proof of a replacement: report the token
+          // that received the genuine 401 below, without using local material.
+        }
+        if (isScopedCredentialRotation(attempt, rotated)) {
+          await dumpDirectRequest({
+            affinity: relayAffinity,
+            route: options.route ?? 'oauth',
+            status: response.status,
+            bodyText,
+            url: input.toString(),
+            method: init.method,
+            headers,
+          })
+          await response.body?.cancel().catch(() => {})
+          logger.info(
+            'claustrum',
+            'retrying after scoped credential rotation',
+            {
+              accountId: routeId,
+              previousVersion: attempt.recordVersion,
+              newVersion: rotated.recordVersion,
+              transport: 'direct',
+            },
+          )
+          attempt = rotated
+          headers.set('authorization', `Bearer ${rotated.accessToken}`)
+          response = await fetch(input, init)
+        }
+      }
       if (attempt) await report(attempt, response.status, 'direct')
       await dumpDirectRequest({
         affinity: relayAffinity,
@@ -675,34 +757,70 @@ async function sendAnthropicRequest(options: {
 
   if (options.apiAccount) return directFetch()
 
-  return sendViaRelay({
-    config: getRelayConfig(storage),
-    input,
-    init,
-    headers,
-    body: bodyText,
-    fallback: directFetch,
-    affinity: relayAffinity,
-    authorizeAttempt: scoped
-      ? async () => {
-          const attempt = await scoped.authorize(
-            routeId,
-            options.streamOptions?.signal,
-          )
-          const authorizedHeaders = new Headers(headers)
-          authorizedHeaders.set(
-            'authorization',
-            `Bearer ${attempt.accessToken}`,
-          )
-          return {
-            headers: authorizedHeaders,
-            onUpstreamStatus: (status) => {
-              void report(attempt, status, 'relay_status_field')
-            },
+  let relay401Attempt: ClaustrumScopedAttempt | undefined
+  let relayReturned = false
+  const sendRelayAttempt = () =>
+    sendViaRelay({
+      config: getRelayConfig(storage),
+      input,
+      init,
+      headers,
+      body: bodyText,
+      fallback: directFetch,
+      affinity: relayAffinity,
+      authorizeAttempt: scoped
+        ? async () => {
+            const attempt = await scoped.authorize(
+              routeId,
+              options.streamOptions?.signal,
+            )
+            const authorizedHeaders = new Headers(headers)
+            authorizedHeaders.set(
+              'authorization',
+              `Bearer ${attempt.accessToken}`,
+            )
+            return {
+              headers: authorizedHeaders,
+              onUpstreamStatus: (status) => {
+                if (status !== 401) return
+                relay401Attempt = attempt
+                // WebSocket upstream status can arrive after the response was
+                // returned; HTTP status is held until a rotation check finishes.
+                if (relayReturned)
+                  void report(attempt, status, 'relay_status_field')
+              },
+            }
           }
-        }
-      : undefined,
-  })
+        : undefined,
+    })
+  let response = await sendRelayAttempt()
+  if (
+    scoped &&
+    relay401Attempt &&
+    response.status === 401 &&
+    !init.signal?.aborted
+  ) {
+    let rotated: ClaustrumScopedAttempt | undefined
+    try {
+      rotated = await scoped.authorize(routeId, options.streamOptions?.signal)
+    } catch {
+      // Report the actual rejected record below if no replacement can be read.
+    }
+    if (isScopedCredentialRotation(relay401Attempt, rotated)) {
+      await response.body?.cancel().catch(() => {})
+      logger.info('claustrum', 'retrying after scoped credential rotation', {
+        accountId: routeId,
+        previousVersion: relay401Attempt.recordVersion,
+        newVersion: rotated.recordVersion,
+        transport: 'relay',
+      })
+      relay401Attempt = undefined
+      response = await sendRelayAttempt()
+    }
+  }
+  relayReturned = true
+  if (relay401Attempt) await report(relay401Attempt, 401, 'relay_status_field')
+  return response
 }
 
 function quotaSnapshotIsExhausted(
@@ -749,6 +867,7 @@ async function executeWithFallback(options: {
   primaryAccessToken: string
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
+  onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   await ensurePiMainAccountId(options.storagePath)
   let storage = await loadAccounts(options.storagePath)
@@ -1520,6 +1639,7 @@ export function streamCortexKitAnthropic(
         getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum'
       )
         throw new Error('Missing Anthropic OAuth access token')
+      let hostTools: Tool[] = []
       const response = await executeWithFallback({
         model,
         context,
@@ -1527,6 +1647,9 @@ export function streamCortexKitAnthropic(
         primaryAccessToken: accessToken,
         storagePath,
         effortTransitions,
+        onResolvedTools: (tools) => {
+          hostTools = tools
+        },
       })
 
       if (!response.ok) {
@@ -1581,7 +1704,7 @@ export function streamCortexKitAnthropic(
             output.content.push({
               type: 'toolCall',
               id: String(block.id),
-              name: fromClaudeCodeToolName(String(block.name), context.tools),
+              name: fromClaudeCodeToolName(String(block.name), hostTools),
               arguments: {},
               partialJson: '',
               index: event.index,

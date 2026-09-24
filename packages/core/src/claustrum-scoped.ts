@@ -28,6 +28,19 @@ export interface ClaustrumScopedAttempt extends ClaustrumScopedIdentity {
   readonly expiresAtMs: number
 }
 
+/** Only a new version of the same account may replace an in-flight 401. */
+export function isScopedCredentialRotation(
+  served: ClaustrumScopedAttempt,
+  current: ClaustrumScopedAttempt | undefined,
+): current is ClaustrumScopedAttempt {
+  return (
+    current !== undefined &&
+    current.credentialId === served.credentialId &&
+    current.accountId === served.accountId &&
+    current.recordVersion !== served.recordVersion
+  )
+}
+
 const SERVING_MARGIN_MS = 300_000
 
 function accessTokenFromMaterial(material: string): string {

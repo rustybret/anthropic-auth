@@ -3,6 +3,7 @@ import { mock } from 'bun:test'
 export type PluginTimerOverrides = Partial<{
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
+  cacheKeepAggregateRefreshIntervalMs: number
 }>
 
 export function createTimerTracking() {
@@ -19,6 +20,7 @@ export function createTimerTracking() {
         return { unref() {} } as unknown as ReturnType<typeof setInterval>
       }) as unknown as typeof setInterval,
       clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+      cacheKeepAggregateRefreshIntervalMs: 0,
     }
   }
 

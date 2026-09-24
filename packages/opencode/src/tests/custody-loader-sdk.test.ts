@@ -1,171 +1,96 @@
 import { afterEach, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createAnthropic } from '@ai-sdk/anthropic'
-import {
-  custodyTombstoneOAuth,
-  saveAccounts,
-} from '@cortexkit/anthropic-auth-core'
-
-import { AnthropicAuthPlugin } from '../index'
-import {
-  connectorFor,
-  credentialResponse,
-  ruledMainHandle,
-  writeManifest,
-} from './custody-ruled-row.fixture'
+import { AnthropicAuthPlugin } from '../index.ts'
 
 const originalFetch = globalThis.fetch
+const originalPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  if (originalPath === undefined)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+  else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = originalPath
 })
 
-async function withFixtureEnvironment<T>(
-  fn: (directory: string, accountPath: string) => Promise<T>,
-): Promise<T> {
-  const originalAccountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  const originalManifestPath = process.env.CLAUSTRUM_OPENCODE_HANDLES
-  const directory = await mkdtemp(join(tmpdir(), 'anthropic-loader-sdk-'))
-  const accountPath = join(directory, 'accounts.json')
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
-  try {
-    return await fn(directory, accountPath)
-  } finally {
-    if (originalAccountPath === undefined) {
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    } else {
-      process.env.OPENCODE_ANTHROPIC_AUTH_FILE = originalAccountPath
-    }
-    if (originalManifestPath === undefined) {
-      delete process.env.CLAUSTRUM_OPENCODE_HANDLES
-    } else {
-      process.env.CLAUSTRUM_OPENCODE_HANDLES = originalManifestPath
-    }
-    await rm(directory, { recursive: true, force: true })
-  }
-}
-
-test('restores custody environment after fixture setup throws', async () => {
-  const originalAccountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  const originalManifestPath = process.env.CLAUSTRUM_OPENCODE_HANDLES
-
-  await expect(
-    withFixtureEnvironment(async (directory) => {
-      await writeManifest(directory, [
-        { label: 'main', handle: ruledMainHandle },
-      ])
-      throw new Error('fixture setup failed')
-    }),
-  ).rejects.toThrow('fixture setup failed')
-
-  expect(process.env.OPENCODE_ANTHROPIC_AUTH_FILE).toBe(originalAccountPath)
-  expect(process.env.CLAUSTRUM_OPENCODE_HANDLES).toBe(originalManifestPath)
-})
-
-test('routes RESUME_TAKEOVER through the Anthropic SDK fetch refusal', async () => {
-  globalThis.fetch = Object.assign(
-    async () => {
-      throw new Error('unexpected network request')
-    },
-    { preconnect: () => {} },
-  ) as unknown as typeof fetch
-
-  await withFixtureEnvironment(async (directory, accountPath) => {
-    const workAltHandle = `ckh_${'W'.repeat(43)}`
-    await saveAccounts(
-      {
-        version: 1,
-        claustrum: { mode: 'claustrum' },
-        accounts: [
-          {
-            id: 'work-alt',
-            label: 'work-alt',
-            type: 'oauth',
-            access: 'expired-local-access',
-            refresh: 'expired-local-refresh',
-            expires: 0,
-          },
-        ],
-      },
-      accountPath,
-    )
-    await writeManifest(directory, [
-      { label: 'main', handle: ruledMainHandle },
-      { label: 'work-alt', handle: workAltHandle },
-    ])
-    const plugin = (await (
-      AnthropicAuthPlugin as unknown as (
-        context: Parameters<typeof AnthropicAuthPlugin>[0],
-        overrides: Record<string, unknown>,
-      ) => ReturnType<typeof AnthropicAuthPlugin>
-    )(
-      {
-        client: {
-          auth: { set: mock(() => Promise.resolve()) },
-          session: { promptAsync: mock(() => Promise.resolve()) },
+test('stock Anthropic SDK reaches the custom fetch and refuses an obsolete custody roster before upstream I/O', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'anthropic-sdk-scoped-refusal-'))
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(root, 'anthropic-auth.json')
+  await writeFile(
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+    JSON.stringify({
+      version: 1,
+      claustrum: { mode: 'claustrum' },
+      accounts: [
+        {
+          id: 'old',
+          type: 'oauth',
+          enabled: true,
+          access: 'must-not-spend',
+          refresh: 'must-not-refresh',
+          expires: Date.now() + 3_600_000,
         },
-      } as never,
-      {
-        setInterval: mock(() => ({ unref() {} })) as never,
-        clearInterval: mock(() => {}) as never,
-        claustrumConnector: connectorFor([], (method, params) => {
-          if (method !== 'credential.get') return { result: {} }
-          return credentialResponse(
-            params.handle === ruledMainHandle
-              ? 'vault-main-access'
-              : 'vault-work-alt-access',
-            1,
-            Date.now() + 60_000,
-            undefined,
-            undefined,
-          )
-        }),
-      },
-    )) as any
-    try {
-      const loaded = (await plugin.auth.loader(
-        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
-        { models: {} },
-      )) as { apiKey?: string; fetch: typeof fetch }
-      let fetchCalls = 0
-      const model = createAnthropic({
-        apiKey: loaded.apiKey,
-        fetch: Object.assign(
-          async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-            fetchCalls += 1
-            return loaded.fetch(input, init)
-          },
-          { preconnect: () => {} },
-        ) as unknown as typeof fetch,
-      })('claude-sonnet-4-5')
-
-      await expect(
-        model.doStream({
-          abortSignal: undefined,
-          frequencyPenalty: undefined,
-          headers: undefined,
-          maxOutputTokens: 1,
-          presencePenalty: undefined,
-          prompt: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
-          providerOptions: undefined,
-          responseFormat: undefined,
-          seed: undefined,
-          stopSequences: undefined,
-          temperature: undefined,
-          toolChoice: undefined,
-          tools: undefined,
-          topK: undefined,
-          topP: undefined,
-        } as never),
-      ).rejects.toMatchObject({
-        code: 'custody_state_mismatch',
-        verdict: 'RESUME_TAKEOVER',
-      })
-      expect(fetchCalls).toBe(1)
-    } finally {
-      await plugin.dispose?.()
-    }
+      ],
+    }),
+    { mode: 0o600 },
+  )
+  const upstream = mock(() => {
+    throw new Error('no network call permitted')
   })
+  globalThis.fetch = upstream as unknown as typeof fetch
+  const plugin = await AnthropicAuthPlugin(
+    { directory: root } as never,
+    {
+      setInterval: mock(() => ({ unref() {} })) as never,
+      clearInterval: mock(() => {}) as never,
+    } as never,
+  )
+  try {
+    const loader = (await (plugin as any).auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: '',
+          refresh: 'claustrum-tombstone:v1:anthropic',
+          expires: 0,
+        }),
+      { models: {} },
+    )) as { apiKey?: string; fetch: typeof fetch }
+    // Without an apiKey property the SDK aborts before calling our fetch; this
+    // test would fail for that regression even if the plugin's own fetch refused.
+    expect(loader).toHaveProperty('apiKey', '')
+    let customFetches = 0
+    const anthropic = createAnthropic({
+      apiKey: loader.apiKey,
+      fetch: ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        customFetches++
+        return loader.fetch(input, init)
+      }) as typeof fetch,
+    })('claude-sonnet-4-5')
+    await expect(
+      anthropic.doStream({
+        abortSignal: undefined,
+        frequencyPenalty: undefined,
+        headers: undefined,
+        maxOutputTokens: 1,
+        presencePenalty: undefined,
+        prompt: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+        providerOptions: undefined,
+        seed: undefined,
+        stopSequences: undefined,
+        temperature: undefined,
+        toolChoice: undefined,
+        tools: undefined,
+        topK: undefined,
+        topP: undefined,
+      }),
+    ).rejects.toThrow()
+    expect(customFetches).toBe(1)
+    expect(upstream).not.toHaveBeenCalled()
+  } finally {
+    await plugin.dispose?.()
+    await rm(root, { recursive: true, force: true })
+  }
 })

@@ -451,7 +451,44 @@ async function sendRelayHttp(options: {
   }
   // Old workers already forward Anthropic request IDs. Without upstream
   // provenance a relay's own 401 must never invalidate an OAuth credential.
-  if (/^req_[A-Za-z0-9_-]+$/.test(response.headers.get('request-id') ?? '')) {
+  const upstreamProvenance = /^req_[A-Za-z0-9_-]+$/.test(
+    response.headers.get('request-id') ?? '',
+  )
+  if (response.status === 401 && !upstreamProvenance) {
+    // The relay rejected its own credentials, not the Claude account. Never
+    // let an account router interpret this as a permanent upstream OAuth 401.
+    await response.body?.cancel().catch(() => {})
+    if (config.fallbackToDirect) {
+      relayLog(
+        `relay authentication rejected; falling back direct session=${shortAffinity(actualPayload.affinity)}`,
+      )
+      return {
+        response: await fallback(),
+        payload: actualPayload,
+        transport: 'http',
+        protocol: actualPayload.protocol,
+        usedRelay: false,
+      }
+    }
+    return {
+      response: Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message:
+              'Relay authentication failed before Anthropic received the request',
+          },
+        },
+        { status: 502 },
+      ),
+      payload: actualPayload,
+      transport: 'http',
+      protocol: actualPayload.protocol,
+      usedRelay: false,
+    }
+  }
+  if (upstreamProvenance) {
     try {
       authorization?.onUpstreamStatus?.(response.status)
     } catch {}

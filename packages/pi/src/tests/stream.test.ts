@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadAccounts, saveAccounts } from '@cortexkit/anthropic-auth-core'
+import { normalizeContext } from '@earendil-works/pi-ai'
 
 import {
   buildExplicitBaseMessagesUrl,
@@ -979,4 +980,74 @@ describe('Pi Anthropic stream content blocks', () => {
       },
     ])
   })
+})
+
+test('Pi 0.86 normalized transcript maps a returned Claude Code tool name back to the callable host tool', async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-transcript-tool-roundtrip-'))
+  const storagePath = join(tempDir, 'anthropic-auth.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveAccounts(
+    { version: 1, accounts: [], quota: { enabled: false } },
+    storagePath,
+  )
+  const normalized = normalizeContext({
+    systemPrompt: 'You may run the bash tool.',
+    tools: [
+      {
+        name: 'bash',
+        description: 'Run shell commands',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+    ],
+    messages: [
+      { role: 'user', content: 'Run echo probe-ok', timestamp: Date.now() },
+    ],
+  } as any)
+  expect((normalized as { tools?: unknown }).tools).toBeUndefined()
+  let sentTools: Array<{ name: string }> | undefined
+  globalThis.fetch = mock(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes('/api/claude_cli/bootstrap')) {
+        return Response.json({
+          oauth_account: { account_uuid: 'pi-tool-account' },
+        })
+      }
+      const body = JSON.parse(String(init?.body)) as {
+        tools?: Array<{ name: string }>
+      }
+      sentTools = body.tools
+      return new Response(
+        [
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_tool","usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_probe","name":"Bash","input":{}}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"echo probe-ok\\"}"}}\n\n',
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ].join(''),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    },
+  ) as unknown as typeof fetch
+  const result = await streamCortexKitAnthropic(
+    anthropicModel,
+    normalized as any,
+    {
+      apiKey: 'sk-ant-oat-pi-tool',
+      sessionId: 'ses_pi_tool_roundtrip',
+    },
+  ).result()
+  expect(sentTools?.map((tool) => tool.name)).toContain('Bash')
+  expect(result.content).toContainEqual(
+    expect.objectContaining({
+      type: 'toolCall',
+      id: 'toolu_probe',
+      name: 'bash',
+      arguments: { command: 'echo probe-ok' },
+    }),
+  )
 })

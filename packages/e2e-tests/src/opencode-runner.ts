@@ -31,6 +31,7 @@ const activeRunDirs = new Set<string>()
 
 export type IsolatedEnv = {
   tempDir: string
+  homeDir: string
   configDir: string
   dataDir: string
   cacheDir: string
@@ -254,6 +255,7 @@ export function createIsolatedEnv(root = tmpdir()): IsolatedEnv {
   )
   const env = {
     tempDir: base,
+    homeDir: join(base, 'home'),
     configDir: join(base, 'config'),
     dataDir: join(base, 'data'),
     cacheDir: join(base, 'cache'),
@@ -393,6 +395,53 @@ export async function waitForOpencodeReady(
   }
 }
 
+export async function waitForOpencodeProjectReady(
+  child: ChildProcess,
+  url: string,
+  directory: string,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const controller = new AbortController()
+  const exited = (code: number | null, signal: NodeJS.Signals | null) => {
+    controller.abort(
+      new Error(
+        `opencode exited during project bootstrap (code=${code}, signal=${signal})`,
+      ),
+    )
+  }
+  const failed = (error: Error) => controller.abort(error)
+  child.once('exit', exited)
+  child.once('error', failed)
+  if (child.exitCode !== null || child.signalCode !== null)
+    exited(child.exitCode, child.signalCode)
+  try {
+    controller.signal.throwIfAborted()
+    // /global/health confirms only that the listener is up. OpenCode creates
+    // the project and loads its plugins lazily; exercise that real boundary
+    // before a test starts timing session.create or Anthropic dispatch.
+    const response = await fetch(
+      `${url}/config?directory=${encodeURIComponent(directory)}`,
+      {
+        signal: AbortSignal.any([
+          controller.signal,
+          AbortSignal.timeout(Math.max(1, timeoutMs)),
+        ]),
+      },
+    )
+    if (!response.ok)
+      throw new Error(
+        `opencode project bootstrap returned HTTP ${response.status}`,
+      )
+    await response.body?.cancel()
+  } catch (error) {
+    controller.signal.throwIfAborted()
+    throw error
+  } finally {
+    child.off('exit', exited)
+    child.off('error', failed)
+  }
+}
+
 export async function terminateChildProcess(
   child: ChildProcess,
   options: { termTimeoutMs?: number; killExitTimeoutMs?: number } = {},
@@ -514,6 +563,11 @@ export async function spawnOpencode(
     } else {
       delete childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     }
+    // XDG isolation alone is insufficient: OpenCode also reads ~/.opencode
+    // and ~/.claude/skills during lazy project bootstrap. Keep those reads
+    // inside the test run, away from the operator's live configuration.
+    childEnv.HOME = env.homeDir
+    childEnv.USERPROFILE = env.homeDir
     childEnv.XDG_CONFIG_HOME = env.configDir
     childEnv.XDG_DATA_HOME = env.dataDir
     childEnv.XDG_CACHE_HOME = env.cacheDir
@@ -574,6 +628,12 @@ export async function spawnOpencode(
       ),
       spawnFailure,
     ])
+    await waitForOpencodeProjectReady(
+      child,
+      url,
+      env.workdir,
+      deadline - Date.now(),
+    )
     return {
       url,
       port,

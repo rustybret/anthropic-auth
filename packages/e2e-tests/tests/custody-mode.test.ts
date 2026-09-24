@@ -1,87 +1,68 @@
 /// <reference types="bun-types" />
-
 import { afterEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  custodyCredentialId,
   custodyTombstoneKey,
-  type FallbackAccount,
   isOAuthAccount,
   loadAccounts,
-  saveAccounts,
-  setClaustrumModePersistent,
   setRoutingMode,
-  writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
 import { E2EHarness } from '../src/harness.ts'
-import { startFakeClaustrumDaemon } from '../src/mock-claustrum.ts'
+import {
+  type FakeClaustrumCredential,
+  startFakeClaustrumDaemon,
+} from '../src/mock-claustrum.ts'
 
 let harness: E2EHarness | null = null
 const roots: string[] = []
 const daemons: Array<{ stop: () => Promise<void> }> = []
-
-afterEach(async () => {
-  await harness?.dispose()
+async function disposeFixture() {
+  // A timed-out hook may finish after the next test has installed its own
+  // resources. Claim all of this test's slots before awaiting teardown so
+  // its eventual completion cannot erase a newer harness or stop its daemon.
+  const finished = harness
   harness = null
-  await Promise.all(daemons.splice(0).map((daemon) => daemon.stop()))
+  const retiredDaemons = daemons.splice(0)
+  const retiredRoots = roots.splice(0)
+  await finished?.dispose()
+  await Promise.all(retiredDaemons.map((daemon) => daemon.stop()))
   await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+    retiredRoots.map((root) => rm(root, { recursive: true, force: true })),
   )
-})
+}
+afterEach(disposeFixture)
 
-describe('custody mode', () => {
-  it('serves main and fallback credentials from the vault', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
+const credential = (
+  access: string,
+  accountId: string,
+  recordVersion: number,
+): FakeClaustrumCredential => ({
+  payload: access,
+  account_id: accountId,
+  record_version: recordVersion,
+  expires_at_ms: Date.now() + 3_600_000,
+})
+const mainId = 'oauth:anthropic'
+const workId = 'oauth:anthropic:work'
+
+describe('zero-bind scoped custody', () => {
+  it('discovers, authorizes and serves a new account without handles or a restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-scoped-e2e-'))
     roots.push(root)
-    const mainHandle = `ckh_${'M'.repeat(43)}`
-    const fallbackHandle = `ckh_${'F'.repeat(43)}`
-    const manifestPath = join(root, 'claustrum-handles.json')
+    const credentials: Record<string, FakeClaustrumCredential> = {
+      [mainId]: credential('scoped-main', 'account-main', 11),
+    }
     const daemon = await startFakeClaustrumDaemon({
       directory: root,
-      credentials: {
-        [mainHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-main' }),
-          account_id: 'account-main',
-          record_version: 11,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-        [fallbackHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-fallback' }),
-          account_id: 'account-fallback',
-          record_version: 12,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-      },
+      scopedCredentials: credentials,
     })
     daemons.push(daemon)
-    await expect(
-      writeCustodyHandleManifestEntry({
-        path: manifestPath,
-        entry: {
-          label: 'main',
-          handle: mainHandle,
-          credentialId: custodyCredentialId('main'),
-        },
-      }),
-    ).resolves.toEqual({ status: 'written' })
-    await expect(
-      writeCustodyHandleManifestEntry({
-        path: manifestPath,
-        entry: {
-          label: 'work-alt',
-          handle: fallbackHandle,
-          credentialId: custodyCredentialId('work-alt'),
-        },
-      }),
-    ).resolves.toEqual({ status: 'written' })
-
     harness = await E2EHarness.create({
       childEnv: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
           daemon.connectionFile,
-        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
         OPENCODE_AUTH_CONTENT: JSON.stringify({
           anthropic: {
             type: 'oauth',
@@ -92,472 +73,173 @@ describe('custody mode', () => {
         }),
       },
       beforeSpawn: async (env) => {
-        const accountPath = join(env.configDir, 'anthropic-auth.json')
-        await saveAccounts(
-          {
+        const path = join(env.configDir, 'anthropic-auth.json')
+        await writeFile(
+          path,
+          JSON.stringify({
             version: 1,
-            accounts: [
-              {
-                id: 'work-alt',
-                label: 'work-alt',
-                type: 'oauth',
-                enabled: true,
+            accounts: [],
+            quota: { enabled: false },
+            claustrum: {
+              mode: 'claustrum',
+              scopedRoster: true,
+              primaryAccount: {
+                credentialId: mainId,
+                accountId: 'account-main',
+                state: 'active',
               },
-            ],
-            claustrum: { handlesFile: manifestPath },
-          } as never,
-          accountPath,
+            },
+          }),
+          { mode: 0o600 },
         )
-        await setClaustrumModePersistent('claustrum', accountPath)
+        await writeFile(
+          join(env.configDir, 'claustrum-enrollment.json'),
+          JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
+          { mode: 0o600 },
+        )
       },
     })
     harness.script([
       { type: 'text', text: 'main served' },
-      { type: 'text', text: 'fallback served' },
+      { type: 'text', text: 'new account served' },
     ])
-
-    const mainSession = await harness.createSession()
-    await harness.sendPrompt(mainSession, 'use the main vault credential')
-    await harness.waitForSessionText(mainSession, 'main served')
+    const first = await harness.createSession()
+    await harness.sendPrompt(first, 'serve main')
+    await harness.waitForSessionText(first, 'main served')
     expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
-      'Bearer vault-main',
+      'Bearer scoped-main',
     )
-    await daemon.waitForEnrollmentProposal()
-    expect(daemon.enrollmentProposals).toHaveLength(1)
-    expect(daemon.enrollmentProposals[0]?.proposed_name).toBe(
-      'anthropic-auth-opencode',
+    expect(daemon.credentialGets).toContain(mainId)
+    expect(daemon.scopedLists).toBeGreaterThan(0)
+    credentials[workId] = credential('scoped-work', 'account-work', 12)
+    const accountPath = join(
+      harness.opencode.env.configDir,
+      'anthropic-auth.json',
     )
-    expect(daemon.enrollmentProposals[0]?.request_secret_hash).toMatch(
-      /^[0-9a-f]{64}$/,
+    await harness.waitFor(
+      async () => {
+        const storage = await loadAccounts(accountPath)
+        return storage?.accounts.some(
+          (a) => isOAuthAccount(a) && a.claustrumScopedCredentialId === workId,
+        )
+          ? true
+          : undefined
+      },
+      { timeoutMs: 15_000, label: 'new scoped account persisted' },
     )
+    const beforeMode = await loadAccounts(accountPath)
     expect(
-      JSON.parse(
-        await readFile(
+      beforeMode?.accounts.some(
+        (a) => isOAuthAccount(a) && a.claustrumScopedCredentialId === workId,
+      ),
+      JSON.stringify({
+        rows: beforeMode?.accounts.map((a) => [
+          a.id,
+          isOAuthAccount(a) ? a.claustrumScopedCredentialId : 'api',
+        ]),
+        raw: JSON.parse(await readFile(accountPath, 'utf8')).accounts?.map(
+          (a: { id: string }) => a.id,
+        ),
+        scopedLists: daemon.scopedLists,
+        vaultIds: Object.keys(credentials),
+      }),
+    ).toBe(true)
+    await setRoutingMode('fallback-first', accountPath)
+    const afterMode = await loadAccounts(accountPath)
+    expect(
+      afterMode?.accounts.some(
+        (a) => isOAuthAccount(a) && a.claustrumScopedCredentialId === workId,
+      ),
+    ).toBe(true)
+    const second = await harness.createSession()
+    await harness.sendPrompt(second, 'serve new fallback')
+    await harness.waitForSessionText(second, 'new account served')
+    expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
+      'Bearer scoped-work',
+    )
+    expect(daemon.credentialGets).toContain(workId)
+    expect(harness.anthropic.tokenRequests()).toBe(0)
+    const state = await readFile(
+      join(harness.opencode.env.configDir, 'anthropic-auth-state.json'),
+      'utf8',
+    )
+    expect(state).not.toContain('scoped-main')
+    expect(state).not.toContain('scoped-work')
+  }, 120_000)
+
+  it('refuses legacy handle-mode even when a vault daemon has a healthy credential', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-legacy-e2e-'))
+    roots.push(root)
+    const daemon = await startFakeClaustrumDaemon({
+      directory: root,
+      scopedCredentials: {
+        [mainId]: credential('must-not-send', 'account-main', 1),
+      },
+    })
+    daemons.push(daemon)
+    harness = await E2EHarness.create({
+      childEnv: {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
+          daemon.connectionFile,
+        OPENCODE_AUTH_CONTENT: JSON.stringify({
+          anthropic: {
+            type: 'oauth',
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+          },
+        }),
+      },
+      beforeSpawn: async (env) => {
+        await writeFile(
+          join(env.configDir, 'anthropic-auth.json'),
+          JSON.stringify({
+            version: 1,
+            accounts: [],
+            claustrum: { mode: 'claustrum' },
+          }),
+          { mode: 0o600 },
+        )
+      },
+    })
+    const session = await harness.createSession()
+    await harness.startPrompt(session, 'must fail before transport')
+    try {
+      await harness.waitForSessionStatusType(session, 'retry', 15_000)
+      expect(harness.anthropic.requests()).toHaveLength(0)
+      expect(daemon.credentialGets).toHaveLength(0)
+      expect(daemon.enrollmentProposals).toHaveLength(0)
+      await expect(
+        readFile(
           join(
             harness.opencode.env.configDir,
             'claustrum-enrollment-state.json',
           ),
           'utf8',
         ),
-      ),
-    ).toMatchObject({
-      phase: 'pending',
-      requestId: 'fake-enrollment-request',
-    })
-
-    const accountPath = join(
-      harness.opencode.env.configDir,
-      'anthropic-auth.json',
-    )
-    await setRoutingMode('fallback-first', accountPath)
-    const fallbackSession = await harness.createSession()
-    await harness.sendPrompt(
-      fallbackSession,
-      'use the fallback vault credential',
-    )
-    await harness.waitForSessionText(fallbackSession, 'fallback served')
-    expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
-      'Bearer vault-fallback',
-    )
-    expect(harness.anthropic.tokenRequests()).toBe(0)
-
-    const pluginLog = await readFile(
-      join(harness.opencode.env.tempDir, 'opencode-anthropic-auth.log'),
-      'utf8',
-    ).catch(() => '')
-    const publicOutput = `${harness.opencode.stdout()}\n${harness.opencode.stderr()}\n${pluginLog}`
-    expect(publicOutput).not.toContain(mainHandle)
-    expect(publicOutput).not.toContain(fallbackHandle)
-  }, 120_000)
-
-  it('enrolls and serves a newly bound fallback without restarting OpenCode', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
-    roots.push(root)
-    const mainHandle = `ckh_${'M'.repeat(43)}`
-    const addedHandle = `ckh_${'N'.repeat(43)}`
-    const manifestPath = join(root, 'claustrum-handles.json')
-    const daemon = await startFakeClaustrumDaemon({
-      directory: root,
-      credentials: {
-        [mainHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-main' }),
-          account_id: 'account-main',
-          credential_id: custodyCredentialId('main'),
-          record_version: 31,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-        [addedHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-added' }),
-          account_id: 'account-added',
-          credential_id: custodyCredentialId('added'),
-          record_version: 32,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-      },
-    })
-    daemons.push(daemon)
-    await writeCustodyHandleManifestEntry({
-      path: manifestPath,
-      entry: {
-        label: 'main',
-        handle: mainHandle,
-        credentialId: custodyCredentialId('main'),
-      },
-    })
-
-    harness = await E2EHarness.create({
-      childEnv: {
-        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
-          daemon.connectionFile,
-        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
-        OPENCODE_AUTH_CONTENT: JSON.stringify({
-          anthropic: {
-            type: 'oauth',
-            access: '',
-            refresh: custodyTombstoneKey('anthropic'),
-            expires: 0,
-          },
-        }),
-      },
-      beforeSpawn: async (env) => {
-        const accountPath = join(env.configDir, 'anthropic-auth.json')
-        await saveAccounts(
-          {
-            version: 1,
-            accounts: [],
-            claustrum: { handlesFile: manifestPath },
-          },
-          accountPath,
-        )
-        await setClaustrumModePersistent('claustrum', accountPath)
-        await setRoutingMode('fallback-first', accountPath)
-      },
-    })
-    harness.script([
-      { type: 'text', text: 'main ready' },
-      { type: 'text', text: 'new account served' },
-    ])
-    const initialSession = await harness.createSession()
-    await harness.sendPrompt(initialSession, 'initialize the active plugin')
-    await harness.waitForSessionText(initialSession, 'main ready')
-    expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
-      'Bearer vault-main',
-    )
-
-    await expect(
-      writeCustodyHandleManifestEntry({
-        path: manifestPath,
-        entry: {
-          label: 'added',
-          handle: addedHandle,
-          credentialId: custodyCredentialId('added'),
-        },
-      }),
-    ).resolves.toEqual({ status: 'written' })
-    await Promise.race([
-      daemon.waitForCredentialGet(addedHandle),
-      Bun.sleep(5_000).then(() => {
-        throw new Error('new manifest binding was not verified')
-      }),
-    ])
-
-    const accountPath = join(
-      harness.opencode.env.configDir,
-      'anthropic-auth.json',
-    )
-    const enrollmentDeadline = Date.now() + 5_000
-    let addedAccount: FallbackAccount | undefined
-    while (Date.now() < enrollmentDeadline) {
-      const storage = await loadAccounts(accountPath)
-      addedAccount = storage?.accounts.find(
-        (account) => account.label === 'added',
-      )
-      if (
-        addedAccount &&
-        isOAuthAccount(addedAccount) &&
-        addedAccount.refresh === custodyTombstoneKey('anthropic')
-      ) {
-        break
-      }
-      await Bun.sleep(20)
-    }
-    expect(addedAccount).toMatchObject({
-      id: 'added',
-      label: 'added',
-      enabled: true,
-      type: 'oauth',
-      access: '',
-      refresh: custodyTombstoneKey('anthropic'),
-      anthropicAccountUuid: 'account-added',
-    })
-    expect(JSON.stringify(addedAccount)).not.toContain(addedHandle)
-
-    const session = await harness.createSession()
-    await harness.sendPrompt(session, 'use the newly bound vault credential')
-    await harness.waitForSessionText(session, 'new account served')
-    expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe(
-      'Bearer vault-added',
-    )
-    expect(harness.anthropic.tokenRequests()).toBe(0)
-  }, 120_000)
-
-  it('keeps an initially cold vault main fail-closed while fallback-first serves', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
-    roots.push(root)
-    const mainHandle = `ckh_${'C'.repeat(43)}`
-    const fallbackHandle = `ckh_${'G'.repeat(43)}`
-    const manifestPath = join(root, 'claustrum-handles.json')
-    const daemon = await startFakeClaustrumDaemon({
-      directory: root,
-      credentials: {
-        [mainHandle]: {
-          payload: JSON.stringify({ access_token: 'unavailable-main' }),
-          account_id: 'account-main',
-          record_version: 21,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-          cold: true,
-        },
-        [fallbackHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-fallback' }),
-          account_id: 'account-fallback',
-          record_version: 22,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-      },
-    })
-    daemons.push(daemon)
-    await writeCustodyHandleManifestEntry({
-      path: manifestPath,
-      entry: {
-        label: 'main',
-        handle: mainHandle,
-        credentialId: custodyCredentialId('main'),
-      },
-    })
-    await writeCustodyHandleManifestEntry({
-      path: manifestPath,
-      entry: {
-        label: 'work-alt',
-        handle: fallbackHandle,
-        credentialId: custodyCredentialId('work-alt'),
-      },
-    })
-    harness = await E2EHarness.create({
-      childEnv: {
-        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
-          daemon.connectionFile,
-        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
-        OPENCODE_AUTH_CONTENT: JSON.stringify({
-          anthropic: {
-            type: 'oauth',
-            access: '',
-            refresh: custodyTombstoneKey('anthropic'),
-            expires: 0,
-          },
-        }),
-      },
-      beforeSpawn: async (env) => {
-        const accountPath = join(env.configDir, 'anthropic-auth.json')
-        await saveAccounts(
-          {
-            version: 1,
-            accounts: [
-              {
-                id: 'work-alt',
-                label: 'work-alt',
-                type: 'oauth',
-                enabled: true,
-              },
-            ],
-            claustrum: { handlesFile: manifestPath },
-          } as never,
-          accountPath,
-        )
-        await setClaustrumModePersistent('claustrum', accountPath)
-        await setRoutingMode('fallback-first', accountPath)
-      },
-    })
-    const mainSession = await harness.createSession()
-    const mainResult = await harness.sendPrompt(
-      mainSession,
-      'use the cold main',
-    )
-    expect(JSON.stringify(mainResult)).toContain(
-      'custody state mismatch: FAIL_CLOSED',
-    )
-    expect(harness.anthropic.requests()).toHaveLength(0)
-    expect(harness.anthropic.tokenRequests()).toBe(0)
-    expect(JSON.stringify(harness.anthropic.requests())).not.toContain(
-      custodyTombstoneKey('anthropic'),
-    )
-
-    // C|T|T|N is a global startup verdict, so a healthy fallback remains dark.
-    const accountPath = join(
-      harness.opencode.env.configDir,
-      'anthropic-auth.json',
-    )
-    await setRoutingMode('fallback-first', accountPath)
-    const fallbackSession = await harness.createSession()
-    const fallbackResult = await harness.sendPrompt(
-      fallbackSession,
-      'use the warm fallback after a cold boot',
-    )
-    expect(JSON.stringify(fallbackResult)).toContain(
-      'custody state mismatch: FAIL_CLOSED',
-    )
-    expect(harness.anthropic.requests()).toHaveLength(0)
-  }, 120_000)
-
-  it('fails closed when a previously warm main becomes cold after a served 401', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
-    roots.push(root)
-    const mainHandle = `ckh_${'L'.repeat(43)}`
-    const manifestPath = join(root, 'claustrum-handles.json')
-    const credentials = {
-      [mainHandle]: {
-        payload: JSON.stringify({ access_token: 'vault-main-late-cold' }),
-        account_id: 'account-main',
-        record_version: 31,
-        expires_at_ms: Date.now() + 60 * 60 * 1000,
-        cold: false,
-      },
-    }
-    const daemon = await startFakeClaustrumDaemon({
-      directory: root,
-      credentials,
-    })
-    daemons.push(daemon)
-    await writeCustodyHandleManifestEntry({
-      path: manifestPath,
-      entry: {
-        label: 'main',
-        handle: mainHandle,
-        credentialId: custodyCredentialId('main'),
-      },
-    })
-    harness = await E2EHarness.create({
-      childEnv: {
-        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
-          daemon.connectionFile,
-        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
-        OPENCODE_AUTH_CONTENT: JSON.stringify({
-          anthropic: {
-            type: 'oauth',
-            access: '',
-            refresh: custodyTombstoneKey('anthropic'),
-            expires: 0,
-          },
-        }),
-      },
-      beforeSpawn: async (env) => {
-        const accountPath = join(env.configDir, 'anthropic-auth.json')
-        await saveAccounts(
-          {
-            version: 1,
-            accounts: [],
-            claustrum: { handlesFile: manifestPath },
-          },
-          accountPath,
-        )
-        await setClaustrumModePersistent('claustrum', accountPath)
-      },
-    })
-
-    // Let the first provider turn warm v31, then make the daemon cold after
-    // it has answered credential.get. That turn still uses the resident
-    // credential; its 401 invalidates v31, and the next lookup observes cold.
-    harness.script([
-      {
-        type: 'error',
-        status: 401,
-        errorType: 'authentication_error',
-        message: 'expired vault access',
-      },
-    ])
-    const firstSession = await harness.createSession()
-    const firstPrompt = harness.sendPrompt(
-      firstSession,
-      'invalidate the warm main record',
-    )
-    await daemon.waitForCredentialGet(mainHandle)
-    credentials[mainHandle]!.cold = true
-    await firstPrompt
-    expect(harness.anthropic.requests()).toHaveLength(2)
-    expect(
-      harness.anthropic
-        .requests()
-        .every(
-          (request) =>
-            request.headers.authorization === 'Bearer vault-main-late-cold',
-        ),
-    ).toBe(true)
-    await harness.waitFor(() => daemon.reportAuthFailures.length === 1, 15_000)
-    expect(daemon.reportAuthFailures).toContainEqual({
-      handle: mainHandle,
-      provider_status: 401,
-      record_version: 31,
-      reporter_source: 'direct',
-    })
-
-    const secondSession = await harness.createSession()
-    await harness.startPrompt(
-      secondSession,
-      'the main vault record is now cold',
-    )
-    try {
-      await harness.waitForSessionStatusType(secondSession, 'retry', 15_000)
-      expect(harness.anthropic.requests()).toHaveLength(2)
+      ).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
-      await harness.abortSession(secondSession)
+      await harness.abortSession(session)
     }
-    expect(harness.anthropic.tokenRequests()).toBe(0)
   }, 120_000)
+})
 
-  it('reports a fallback 401 against its own served vault record', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
+describe('scoped credential rotations in the OpenCode process', () => {
+  it('replays only the refused turn when the vault rotates before the first 401 arrives', async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), 'anthropic-auth-scoped-rotation-e2e-'),
+    )
     roots.push(root)
-    const mainHandle = `ckh_${'R'.repeat(43)}`
-    const fallbackHandle = `ckh_${'S'.repeat(43)}`
-    const manifestPath = join(root, 'claustrum-handles.json')
+    const main = credential('scoped-main-v1', 'account-main', 11)
     const daemon = await startFakeClaustrumDaemon({
       directory: root,
-      credentials: {
-        [mainHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-main' }),
-          account_id: 'account-main',
-          record_version: 40,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-        [fallbackHandle]: {
-          payload: JSON.stringify({ access_token: 'vault-fallback' }),
-          account_id: 'account-fallback',
-          record_version: 41,
-          expires_at_ms: Date.now() + 60 * 60 * 1000,
-        },
-      },
+      scopedCredentials: { [mainId]: main },
     })
     daemons.push(daemon)
-    await writeCustodyHandleManifestEntry({
-      path: manifestPath,
-      entry: {
-        label: 'main',
-        handle: mainHandle,
-        credentialId: custodyCredentialId('main'),
-      },
-    })
-    await writeCustodyHandleManifestEntry({
-      path: manifestPath,
-      entry: {
-        label: 'work-alt',
-        handle: fallbackHandle,
-        credentialId: custodyCredentialId('work-alt'),
-      },
-    })
     harness = await E2EHarness.create({
       childEnv: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
           daemon.connectionFile,
-        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
         OPENCODE_AUTH_CONTENT: JSON.stringify({
           anthropic: {
             type: 'oauth',
@@ -568,24 +250,29 @@ describe('custody mode', () => {
         }),
       },
       beforeSpawn: async (env) => {
-        const accountPath = join(env.configDir, 'anthropic-auth.json')
-        await saveAccounts(
-          {
+        await writeFile(
+          join(env.configDir, 'anthropic-auth.json'),
+          JSON.stringify({
             version: 1,
-            accounts: [
-              {
-                id: 'work-alt',
-                label: 'work-alt',
-                type: 'oauth',
-                enabled: true,
+            accounts: [],
+            quota: { enabled: false },
+            claustrum: {
+              mode: 'claustrum',
+              scopedRoster: true,
+              primaryAccount: {
+                credentialId: mainId,
+                accountId: main.account_id,
+                state: 'active',
               },
-            ],
-            claustrum: { handlesFile: manifestPath },
-          } as never,
-          accountPath,
+            },
+          }),
+          { mode: 0o600 },
         )
-        await setClaustrumModePersistent('claustrum', accountPath)
-        await setRoutingMode('fallback-first', accountPath)
+        await writeFile(
+          join(env.configDir, 'claustrum-enrollment.json'),
+          JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
+          { mode: 0o600 },
+        )
       },
     })
     harness.script([
@@ -593,23 +280,83 @@ describe('custody mode', () => {
         type: 'error',
         status: 401,
         errorType: 'authentication_error',
-        message: 'fallback credential rejected',
+        message: 'old record rejected',
+        beforeRespond: () => {
+          main.payload = 'scoped-main-v2'
+          main.record_version = 12
+        },
       },
+      { type: 'text', text: 'rotated account served' },
     ])
-
     const session = await harness.createSession()
-    await harness.sendPrompt(session, 'use the fallback vault credential')
-    await harness.waitFor(() => daemon.reportAuthFailures.length === 1, 15_000)
-    expect(harness.anthropic.requests()[0]?.headers.authorization).toBe(
-      'Bearer vault-fallback',
-    )
-    expect(daemon.reportAuthFailures).toEqual([
-      {
-        handle: fallbackHandle,
-        provider_status: 401,
-        record_version: 41,
-        reporter_source: 'direct',
-      },
+    await harness.sendPrompt(session, 'test one in-flight rotation')
+    await harness.waitForSessionText(session, 'rotated account served')
+    const requests = harness.anthropic
+      .requests()
+      .filter((request) => request.body.model === 'claude-sonnet-4-5')
+    expect(requests.map((request) => request.headers.authorization)).toEqual([
+      'Bearer scoped-main-v1',
+      'Bearer scoped-main-v2',
     ])
+    expect(daemon.reportAuthFailures).toEqual([])
+    expect(
+      daemon.credentialGets.filter((id) => id === mainId).length,
+    ).toBeGreaterThanOrEqual(2)
   }, 120_000)
+})
+
+it('late fixture cleanup cannot dispose the next test’s harness, daemon or directory', async () => {
+  const previousRoot = await mkdtemp(join(tmpdir(), 'anthropic-auth-retired-'))
+  const nextRoot = await mkdtemp(join(tmpdir(), 'anthropic-auth-next-'))
+  let entered!: () => void
+  let release!: () => void
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let previousStops = 0
+  let nextStops = 0
+  harness = {
+    dispose: async () => {
+      entered()
+      await gate
+    },
+  } as unknown as E2EHarness
+  roots.push(previousRoot)
+  daemons.push({
+    stop: async () => {
+      previousStops++
+    },
+  })
+  const retiring = disposeFixture()
+  try {
+    await started
+    harness = {
+      dispose: async () => {
+        nextStops++
+      },
+    } as unknown as E2EHarness
+    await writeFile(join(nextRoot, 'marker'), 'new fixture')
+    roots.push(nextRoot)
+    daemons.push({
+      stop: async () => {
+        nextStops++
+      },
+    })
+    release()
+    await retiring
+    expect(previousStops).toBe(1)
+    expect(nextStops).toBe(0)
+    expect(harness).not.toBeNull()
+    expect(await readFile(join(nextRoot, 'marker'), 'utf8')).toBe('new fixture')
+  } finally {
+    release()
+    await retiring
+    await rm(previousRoot, { recursive: true, force: true })
+    if (!roots.includes(nextRoot))
+      await rm(nextRoot, { recursive: true, force: true })
+    // The registered afterEach owns the next fake fixture when installed.
+  }
 })

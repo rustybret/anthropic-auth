@@ -216,6 +216,27 @@ describe('quota header feed', () => {
     )
   })
 
+  test('does not expose even a complete lease before its atomic rename', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'committed-only',
+      now: () => 1_001,
+    })
+    const temporary = join(directory, 'committed-only.json.uncommitted.tmp')
+    await writeFile(
+      temporary,
+      JSON.stringify({
+        version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
+        lease_horizon_ms: QUOTA_HEADER_FEED_LEASE_MS,
+        entries: { a: entry() },
+      }),
+      { mode: 0o600 },
+    )
+    expect(await registry.list()).toEqual([])
+    await rename(temporary, join(directory, 'committed-only.json'))
+    expect(await registry.list()).toEqual([entry()])
+  })
+
   test('uses restrictive permissions and atomic temp rename', async () => {
     await chmod(directory, 0o777)
     expect((await stat(directory)).mode & 0o777).toBe(0o777)

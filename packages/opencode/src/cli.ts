@@ -6,25 +6,16 @@ import {
   type AccountStorage,
   addAccountPersistent,
   authorize,
-  custodyCredentialId,
   exchange,
   generateRelayToken,
-  getAccountStatePath,
   getAccountStoragePath,
   getClaustrumMode,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
-  resolveCustodyHandlesPath,
   saveAccounts,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
-
-import {
-  acknowledgeLocalOAuthLoginFromStorage,
-  lastVaultServedRecordVersion,
-  localAuthFingerprint,
-} from './local-login.ts'
 
 function defaultStorage(): AccountStorage {
   return {
@@ -347,39 +338,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     lastUsed: now,
     lastRefreshedAt: now,
   } as const
-  // Safe to derive here: this is the legacy handle migration path and every
-  // legacy handle file on disk today names a labelled credential whose real
-  // vault id matches `oauth:anthropic:<label>` (the only one is
-  // `.claustrum-handle-work-alt` -> `oauth:anthropic:work-alt`). If a legacy
-  // file naming an unlabelled credential ever appears, the derived id will
-  // resolve to nothing and the two-factor local-exit will fail closed.
-  const credentialId = custodyCredentialId(account.label ?? account.id)
   await addAccountPersistent(account)
-  await acknowledgeLocalOAuthLoginFromStorage(
-    {
-      accountId: account.id,
-      credentialId,
-      authFingerprint: localAuthFingerprint(result.access, result.refresh),
-      completedAt: now,
-    },
-    {
-      accountStoragePath: getAccountStoragePath(),
-      manifestPath: resolveCustodyHandlesPath(
-        (await loadAccounts())?.claustrum,
-        process.env,
-      ),
-      divergence: {
-        statePath: getAccountStatePath(getAccountStoragePath()),
-        lastVaultServedRecordVersion: lastVaultServedRecordVersion({
-          accountId: account.id,
-          warn: (accountId) =>
-            console.warn(
-              `Fallback login had no served vault record for ${accountId}`,
-            ),
-        }),
-      },
-    },
-  )
 
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }

@@ -21,6 +21,7 @@ import {
   type ClaustrumEnrollmentClient,
   ClaustrumEnrollmentManager,
   getClaustrumEnrollmentPaths,
+  getHostClaustrumEnrollmentPaths,
   readClaustrumEnrollmentStatus,
   readClaustrumEnrollmentToken,
 } from '../claustrum-enrollment.ts'
@@ -59,6 +60,25 @@ function manager(
     now: () => 1_000,
     ...extra,
   })
+}
+
+async function seedPendingRequest(
+  paths: Awaited<ReturnType<typeof fixture>>,
+  requestId?: string,
+) {
+  await writeFile(
+    paths.statePath,
+    `${JSON.stringify({
+      version: 1,
+      phase: 'pending',
+      proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+      requestSecret: secret,
+      ...(requestId === undefined ? {} : { requestId }),
+      createdAt: 1,
+      updatedAt: 1,
+    })}\n`,
+    { mode: 0o600 },
+  )
 }
 
 afterEach(async () => {
@@ -480,6 +500,99 @@ describe('ClaustrumEnrollmentManager', () => {
     }
   })
 
+  test('blocks a retryable poll refusal whose code is protocol-terminal and stops re-polling', async () => {
+    for (const code of [
+      'invalid_params',
+      'pending_exists',
+      'not_found',
+      'already_consumed',
+      'superseded',
+      'stale_generation',
+    ]) {
+      const paths = await fixture()
+      await seedPendingRequest(paths, 'request-1')
+      let polls = 0
+      const instance = manager(
+        paths,
+        client({
+          enrollPoll: async () => {
+            polls += 1
+            throw new ClaustrumCredentialError(code, 'transient', 'retry')
+          },
+        }),
+      )
+      const blocked = {
+        state: 'blocked' as const,
+        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        code,
+      }
+      await expect(instance.reconcile()).resolves.toEqual(blocked)
+      expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+        'blocked',
+      )
+      await expect(instance.reconcile()).resolves.toEqual(blocked)
+      expect(polls).toBe(1)
+    }
+  })
+
+  test('blocks a retryable propose refusal whose code is protocol-terminal', async () => {
+    for (const code of [
+      'invalid_params',
+      'pending_exists',
+      'not_found',
+      'already_consumed',
+      'superseded',
+      'stale_generation',
+    ]) {
+      const paths = await fixture()
+      await seedPendingRequest(paths)
+      const instance = manager(
+        paths,
+        client({
+          enrollPropose: async () => {
+            throw new ClaustrumCredentialError(code, 'transient', 'retry')
+          },
+        }),
+      )
+      await expect(instance.reconcile()).resolves.toEqual({
+        state: 'blocked',
+        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        code,
+      })
+      expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+        'blocked',
+      )
+    }
+  })
+
+  test('keeps genuinely retryable poll refusals pending', async () => {
+    for (const code of [
+      'pending_queue_full',
+      'store_error',
+      'transport_error',
+    ]) {
+      const paths = await fixture()
+      await seedPendingRequest(paths, 'request-1')
+      const instance = manager(
+        paths,
+        client({
+          enrollPoll: async () => {
+            throw new ClaustrumCredentialError(code, 'transient', 'retry')
+          },
+        }),
+      )
+      await expect(instance.reconcile()).resolves.toEqual({
+        state: 'pending',
+        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        requestId: 'request-1',
+        retryCode: code,
+      })
+      expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+        'pending',
+      )
+    }
+  })
+
   test('blocks approved metadata when the authoritative token file is missing', async () => {
     const paths = await fixture()
     await writeFile(
@@ -605,4 +718,99 @@ test('Pi token-only status uses its own consumer name', async () => {
   expect(
     await readClaustrumEnrollmentStatus(paths, 'anthropic-auth-pi'),
   ).toEqual(await instance.status())
+})
+
+test('a terminal refusal committed by one process stops an older process on its next tick', async () => {
+  const paths = await fixture()
+  await seedPendingRequest(paths, 'expired-request')
+  let oldProcessPolls = 0
+  const oldProcess = manager(
+    paths,
+    client({
+      enrollPoll: async () => {
+        oldProcessPolls++
+        return { status: 'pending' }
+      },
+    }),
+  )
+  const newProcess = manager(
+    paths,
+    client({
+      enrollPoll: async () => {
+        throw new ClaustrumCredentialError('superseded', 'transient', 'retry')
+      },
+    }),
+  )
+  expect(await oldProcess.reconcile()).toMatchObject({ state: 'pending' })
+  expect(oldProcessPolls).toBe(1)
+  expect(await newProcess.reconcile()).toEqual({
+    state: 'blocked',
+    proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+    code: 'superseded',
+  })
+  expect(await oldProcess.reconcile()).toMatchObject({
+    state: 'blocked',
+    code: 'superseded',
+  })
+  expect(oldProcessPolls).toBe(1)
+  expect(
+    JSON.parse(await readFile(paths.statePath, 'utf8')),
+  ).not.toHaveProperty('requestSecret')
+})
+
+test('OpenCode and Pi resolve separate owner-only enrollment paths from the same state root', () => {
+  const env = { XDG_STATE_HOME: join(tmpdir(), 'shared-state') }
+  const opencode = getHostClaustrumEnrollmentPaths('opencode', env)
+  const pi = getHostClaustrumEnrollmentPaths('pi', env)
+  expect(opencode.tokenPath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-enrollment.json',
+    ),
+  )
+  expect(opencode.statePath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-enrollment-state.json',
+    ),
+  )
+  expect(pi.tokenPath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'pi-enrollment.json',
+    ),
+  )
+  expect(pi.statePath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'pi-enrollment-state.json',
+    ),
+  )
+  expect(pi.tokenPath).not.toBe(opencode.tokenPath)
+})
+
+test('host-specific overrides resolve absolute and project-relative enrollment paths without crossing hosts', () => {
+  const project = join(tmpdir(), 'enrollment-project')
+  const piToken = join(project, 'owner', 'pi.json')
+  const env = {
+    XDG_STATE_HOME: join(project, 'state'),
+    PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: piToken,
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: 'owner/opencode.json',
+  }
+  expect(getHostClaustrumEnrollmentPaths('pi', env, project)).toEqual({
+    tokenPath: piToken,
+    statePath: join(project, 'owner', 'pi-state.json'),
+  })
+  expect(getHostClaustrumEnrollmentPaths('opencode', env, project)).toEqual({
+    tokenPath: join(project, 'owner', 'opencode.json'),
+    statePath: join(project, 'owner', 'opencode-state.json'),
+  })
 })

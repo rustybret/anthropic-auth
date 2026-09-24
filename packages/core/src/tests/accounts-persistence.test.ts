@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -7,6 +7,7 @@ import {
   type AccountStorage,
   createEmptyStorage,
   FallbackAccountManager,
+  getAccountStatePath,
   hasNoLocalCredential,
   loadAccounts,
   type OAuthAccount,
@@ -31,17 +32,18 @@ test('recognizes an OAuth account with no local credential', () => {
   expect(hasNoLocalCredential({ access: '' })).toBe(false)
 })
 
-test('preserves the Claustrum mode when a save supplies only handlesFile', async () => {
+test('preserves scoped mode when an unrelated writer saves account config', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
   directories.push(directory)
   const path = join(directory, 'anthropic-auth.json')
   const storage = createEmptyStorage()
-
-  await saveAccounts({ ...storage, claustrum: { mode: 'claustrum' } }, path)
-  await saveAccounts({ ...storage, claustrum: { handlesFile: '/x' } }, path)
-
+  await saveAccounts(
+    { ...storage, claustrum: { mode: 'claustrum', scopedRoster: true } },
+    path,
+  )
+  await saveAccounts(storage, path)
   await expect(loadAccounts(path)).resolves.toMatchObject({
-    claustrum: { mode: 'claustrum', handlesFile: '/x' },
+    claustrum: { mode: 'claustrum', scopedRoster: true },
   })
 })
 
@@ -59,92 +61,24 @@ test('saveAccounts cannot persist a Claustrum mode change', async () => {
   })
 })
 
-test('drops a persisted non-string Claustrum handlesFile', async () => {
+test('drops obsolete handle manifest settings on load', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
   directories.push(directory)
   const path = join(directory, 'anthropic-auth.json')
-
   await writeFile(
     path,
     JSON.stringify({
       version: 1,
       accounts: [],
-      claustrum: { handlesFile: 42 },
+      claustrum: {
+        mode: 'claustrum',
+        handlesFile: '/obsolete',
+        accounts: { old: { enabled: true } },
+      },
     }),
   )
-
-  await expect(loadAccounts(path)).resolves.not.toMatchObject({
-    claustrum: expect.anything(),
-  })
-})
-
-test('drops a persisted blank Claustrum handlesFile', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
-  directories.push(directory)
-  const path = join(directory, 'anthropic-auth.json')
-
-  await writeFile(
-    path,
-    JSON.stringify({
-      version: 1,
-      accounts: [],
-      claustrum: { handlesFile: '   ' },
-    }),
-  )
-
-  await expect(loadAccounts(path)).resolves.not.toMatchObject({
-    claustrum: expect.anything(),
-  })
-})
-
-test('excludes an empty-material vault fallback after its quota policy fails', async () => {
-  const now = 1_000_000
-  // @ts-expect-error A legacy vault row may omit all local OAuth material.
-  const account: OAuthAccount = {
-    id: 'vault-fallback',
-    type: 'oauth',
-    enabled: true,
-    quota: {
-      checkedAt: 0,
-      five_hour: { usedPercent: 96, remainingPercent: 4, checkedAt: 0 },
-      seven_day: { usedPercent: 96, remainingPercent: 4, checkedAt: 0 },
-    },
-  }
-  const storage: AccountStorage = {
-    version: 1,
-    claustrum: { mode: 'claustrum' },
-    quota: {
-      enabled: true,
-      minimumRemaining: { five_hour: 10, seven_day: 10 },
-      failClosedOnUnknownQuota: true,
-    },
-    accounts: [account],
-  }
-  const authorizations: string[] = []
-  const manager = new FallbackAccountManager({
-    now: () => now,
-    isFallbackAccountVaultEnabled: () => true,
-    isFallbackAccountVaultServed: () => true,
-    resolveFallbackAccessToken: () => ({
-      token: 'vault-fallback-access',
-      source: 'vault',
-    }),
-    fetchImpl: (async (
-      _input: Parameters<typeof fetch>[0],
-      init?: Parameters<typeof fetch>[1],
-    ) => {
-      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
-      return new Response(
-        JSON.stringify({
-          five_hour: { utilization: 96 },
-          seven_day: { utilization: 96 },
-        }),
-      )
-    }) as unknown as typeof fetch,
-  })
-
-  await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([])
-  expect(authorizations).toEqual(['Bearer vault-fallback-access'])
+  const loaded = await loadAccounts(path)
+  expect(loaded?.claustrum).toEqual({ mode: 'claustrum' })
 })
 
 test('keeps tombstone metadata when discarding a stale credential write', async () => {
@@ -262,5 +196,53 @@ test('main quota persistence ignores an unbound future observation timestamp', a
       },
       mainQuotaCheckedAt: 200,
     },
+  })
+})
+
+test('legacy Claustrum config never refreshes or probes retained local OAuth material', async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), 'accounts-incomplete-custody-'),
+  )
+  directories.push(directory)
+  const path = join(directory, 'anthropic-auth.json')
+  const account: OAuthAccount = {
+    id: 'old',
+    type: 'oauth',
+    enabled: true,
+    access: 'must-not-spend',
+    refresh: 'must-not-refresh',
+    expires: 0,
+  }
+  const storage: AccountStorage = {
+    version: 1,
+    accounts: [account],
+    claustrum: { mode: 'claustrum' },
+    quota: { enabled: true, checkIntervalMinutes: 5 },
+  }
+  await saveAccounts(storage, path)
+  const statePath = getAccountStatePath(path)
+  const beforeStateInode = (await stat(statePath).catch(() => null))?.ino
+  const outbound: string[] = []
+  const manager = new FallbackAccountManager({
+    configPath: path,
+    fetchImpl: (async (url: Parameters<typeof fetch>[0]) => {
+      outbound.push(String(url))
+      throw new Error('legacy local bearer must not reach the network')
+    }) as unknown as typeof fetch,
+  })
+  await manager.refreshDueAccounts()
+  await manager.refreshQuotaForDueAccounts()
+  expect(
+    (await manager.refreshQuotaForAllAccounts({ force: true })).errors,
+  ).toEqual([])
+  expect(await manager.getUsableFallbackAccounts()).toEqual([])
+  await expect(manager.refreshAccountQuota(account, storage)).rejects.toThrow(
+    'setup is incomplete',
+  )
+  expect(outbound).toEqual([])
+  expect((await stat(statePath).catch(() => null))?.ino).toBe(beforeStateInode)
+  expect((await loadAccounts(path))?.accounts[0]).toMatchObject({
+    access: 'must-not-spend',
+    refresh: 'must-not-refresh',
   })
 })

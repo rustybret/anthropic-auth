@@ -340,17 +340,14 @@ Fallback OAuth tokens refresh in the background so idle accounts do not expire b
 
 If Anthropic reports `invalid_grant`, that account must be logged in again. `/claude-account reset-backoff` manually clears the main account's refresh backoff and its matching quota backoff.
 
-### Claustrum manifest service (OpenCode)
+### Claustrum scoped custody (OpenCode and Pi)
 
-Claustrum custody is global. `/claude-account claustrum` enters custody, `/claude-account local` returns to local authentication, and bare `/claude-account` shows status. There are no per-account custody switches. Claustrum uses a handle manifest written by Claustrum tooling.
+Use `bunx @cortexkit/opencode-anthropic-auth setup` to enroll each host, grant `category:anthropic-native` read access, and activate custody while the hosts are stopped. OpenCode retains a non-secret OAuth tombstone so its custom fetch stays active; Pi uses native ambient authentication and a separate, independently revocable enrollment. The setup command asks for consent before removing a conflicting Pi OAuth credential.
 
-Entering custody preflights every enabled OAuth account. A refusal changes nothing, and the command reports every refusal in account order. The main account must already have been migrated by the operator. The plugin does not create or import vault records during this check.
+Claustrum's scoped inventory is the authority for every OAuth account, including main. New accounts added via `ck auth login --provider anthropic` are discovered automatically without per-account binding or a restart. The plugin stores only secret-free routing preferences, fetches initial quota for new accounts, and authorizes each outbound request via `getScoped`. A vault refusal never falls back to local OAuth tokens. API-key routes remain separate. An older Claustrum configuration without a scoped roster fails closed until setup completes.
 
-In custody, every enabled OAuth route is served from the vault, including the main account. A cold main vault record returns a typed startup refusal and holds every OAuth route until the next viable boot; after a warm boot, it returns a typed provider-unavailable error. The plugin does not fall back to sidecar credentials or send a tombstone as a bearer token. A cold fallback is excluded only for that request, so other warm routes can still serve.
+`/claude-account` reads custody and enrollment status without creating or polling a request. Only the offline setup wizard enrolls a host; it can resume a pending request or renew a proven-expired one. `/claude-account claustrum` directs you to setup; `/claude-account local` explains the verified local re-login requirement rather than changing custody while OpenCode is running. `/claude-account enrollment-reset` only clears denied or blocked ceremony state under lock, never proposes a replacement or resets an approved token. Run setup afterward.
 
-Leaving custody puts the main account back into interactive OpenCode sign-in. A fallback binding clears only after a login completed through the plugin's own login flow observes new credential material. To enter custody again for that fallback, the operator must import the new material into the vault with `--replace`; until then, `/claude-account claustrum` refuses with `binding_missing`. API-key routes are unaffected.
-
-Claustrum mode also starts the future scoped-discovery enrollment ceremony under the host identity `anthropic-auth-opencode`. The plugin durably stores the request secret before proposing, shares one locked ceremony across OpenCode project processes, and shows the request ID and approval command in `/claude-account`. The approved owner-only token defaults to `~/.local/state/cortexkit/anthropic-auth/opencode-enrollment.json`. Grant only `category:anthropic-native`; do not grant the broader `llm-provider` category. This release persists the enrollment but continues serving through the existing capability-handle manifest until scoped discovery lands. `/claude-account enrollment-reset` retries only denied or locally blocked ceremonies.
 ## Quota-aware routing
 
 When `quota.enabled` is true, the plugin checks Anthropic's OAuth usage endpoint and applies the configured remaining-quota thresholds to both main and fallback accounts.
@@ -805,10 +802,14 @@ Run checks:
 ```bash
 bun run typecheck
 bun run test
+bun run test:e2e
+bun run check:claustrum-golden
 bun run build
 bun run lint
 bun run format:check
 ```
+
+`bun run test` also runs an isolated Pi host tool-call round-trip against mocked Anthropic responses. The golden check verifies the fixture against canonical Claustrum over HTTPS.
 
 Verify Arcus packaging pipeline:
 

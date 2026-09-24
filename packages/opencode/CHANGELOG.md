@@ -4,6 +4,20 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Breaking Changes
+
+- Remove legacy capability-handle and manifest-based Claustrum custody. The plugin serves OAuth only via enrolled scoped credentials; old Claustrum configurations without `scopedRoster: true` fail closed until the offline `setup` wizard completes.
+
+### Patch Changes
+
+- Make Claustrum enrollment explicit: OpenCode boot and `/claude-account` no longer start proposals or per-process polling; status reads local state, and reset only clears terminal state. The setup wizard resumes interrupted enrollment and replaces a daemon-proven dead request at most once. Permanently refused requests now stop even if the client labels them retryable (#255).
+- Preserve authenticated Fable 5.1 effort transitions through tool-result continuations and merged user boundaries, logging refusal metadata without markers; keep bounded, revocable request-plan history after in-flight compaction without accepting missing-anchor marker loss.
+- Align the tombstone golden fixture with canonical Claustrum's empty-access form and verify its pinned commit ancestry and exact bytes rather than trusting a fork-controlled source.
+- Recover in-flight scoped OAuth rotations on replayable model requests, CacheKeep prewarms, Prime fires, and quota/profile queries: retry once only when the same account's record version advances, report only the final rejected send-time version, and reauthorize relay-to-direct fallback separately. A relay-owned 401 without upstream provenance no longer invalidates an account.
+- Fix scoped main quota polling by authorizing the `main` route rather than passing the provider account UUID as a fallback route ID; Prime's main-account preflight now reaches the usage endpoint.
+- Stop background local OAuth refresh or quota probing for incomplete legacy Claustrum configurations, even if old sidecar secrets remain.
+- Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick (opt-out via `cacheKeepAggregateRefreshIntervalMs: 0`) so per-request writes no longer clobber a sibling's count with a stale zero.
+
 ## 1.23.0
 
 ### Minor Changes

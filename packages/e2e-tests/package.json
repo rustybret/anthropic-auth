@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test tests"
+    "test": "bun test tests",
+    "typecheck": "tsc"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "1.18.30"
+    "@cortexkit/subc-client": "^0.13.1",
+    "@opencode-ai/sdk": "1.18.31"
   }
 }

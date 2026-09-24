@@ -4,6 +4,24 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Breaking Changes
+
+- Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Remove Core's process-shared enrollment-registry export; host path resolution remains available through the Core enrollment module. Local OAuth and API-key routes are unaffected.
+
+### Patch Changes
+
+- Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
+- Update OpenCode plugin and SDK test dependencies together to 1.18.31, plus Biome 2.5.14, Lefthook 2.1.14 and the dev-only Anthropic SDK 4.0.58; preserve packed TUI and custom-fetch compatibility checks.
+- Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).
+- Enforce Core/OpenCode/Pi unit-test count floors in CI and releases with one measured test pass, a PR merge-target ratchet and a release ratchet against the previous version tag rather than only the release commit's parent. A reduction requires an explicit from/to marker and reason; release checks reject stale tags or missing floor provenance, with v1.23.0's verified floorless baseline seeded at 290/1672/140. Both workflows check canonical Claustrum fixture provenance and the real Pi host tool-call round-trip.
+- Keep Fable 5.1 effort changes correlated through completed tool-call continuations and consecutive host user records merged onto one wire boundary; log safe refusal metadata and apply the last planned effort on each merged boundary. Retain a bounded, revocable history when compaction overwrites an in-flight request plan. Missing anchors still fail closed rather than treating unprovable marker loss as a valid prefix trim.
+- Pin the vendored Claustrum tombstone to the canonical `cortexkit/claustrum` source: update the fixture to the deployed empty-access shape and verify its exact bytes against a commit reachable from canonical `master`. Remove an obsolete "vault path not implemented" refresh error.
+- Recover in-flight scoped OAuth rotations on replayable model requests, CacheKeep prewarms, Prime fires, and quota/profile queries: reauthorize after a genuine upstream 401 and retry once only when the same account's record version advances. Report only the final rejected send-time version, reauthorize relay-to-direct fallbacks separately, and classify relay-owned 401s without an Anthropic request ID as transport errors rather than account failures.
+- Fix OpenCode main quota polling under scoped custody: resolve the quota account UUID to the `main` route before authorization. This also restores Prime's main-account quota preflight.
+- Restore Pi tool-call name mapping on normalized transcripts: the streaming response uses the exact host tool set resolved for its outgoing request, rather than the missing `context.tools` field on Pi ≥0.86.
+- Prevent background fallback refresh and quota polling from sending retained local OAuth material when a legacy Claustrum configuration is incomplete.
+- Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick so per-request writes no longer clobber a sibling's count with a stale zero.
+
 ## 1.23.0
 
 ### Minor Changes

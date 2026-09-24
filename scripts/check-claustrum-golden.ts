@@ -1,58 +1,133 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const fixtureDir = join(
+const CANONICAL_REPO = 'cortexkit/claustrum'
+const CANONICAL_BRANCH = 'master'
+const TOMBSTONE_PATH = 'packages/opencode/golden/tombstone.json'
+const defaultFixtureDir = join(
   import.meta.dir,
   '..',
   'packages/opencode/src/tests/fixtures/claustrum-golden',
 )
-const source = JSON.parse(
-  await readFile(join(fixtureDir, 'SOURCE.json'), 'utf8'),
-) as {
+
+type Source = {
   repo: string
   ref: string
-  paths: Record<string, string>
+  paths: { tombstone: string }
 }
 
 function rejectSource(reason: string): never {
-  console.error(`INVALID SOURCE.json: ${reason}`)
-  process.exit(1)
+  throw new Error(`INVALID SOURCE.json: ${reason}`)
 }
 
-if (!source.repo) rejectSource('repo is missing')
-if (!source.ref) rejectSource('ref is missing')
-if (!/^[0-9a-f]{40}$/.test(source.ref)) {
-  rejectSource('ref must be a 40-hex SHA')
-}
-const paths = Object.entries(source.paths ?? {})
-if (paths.length === 0) rejectSource('paths must contain at least one entry')
-
-for (const [name] of paths) {
-  try {
-    await readFile(join(fixtureDir, `${name}.json`))
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      rejectSource(`vendored file is missing: ${name}.json`)
-    }
-    throw error
+function readSource(value: unknown): Source {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return rejectSource('expected an object')
+  }
+  const record = value as Record<string, unknown>
+  if (record.repo !== CANONICAL_REPO) {
+    return rejectSource(`repo must be ${CANONICAL_REPO}`)
+  }
+  if (typeof record.ref !== 'string' || !/^[0-9a-f]{40}$/.test(record.ref)) {
+    return rejectSource('ref must be a 40-hex SHA')
+  }
+  const paths = record.paths
+  if (typeof paths !== 'object' || paths === null || Array.isArray(paths)) {
+    return rejectSource('paths must contain the canonical tombstone')
+  }
+  const entries = Object.entries(paths)
+  if (
+    entries.length !== 1 ||
+    entries[0]?.[0] !== 'tombstone' ||
+    entries[0]?.[1] !== TOMBSTONE_PATH
+  ) {
+    return rejectSource('paths must contain only the canonical tombstone')
+  }
+  return {
+    repo: CANONICAL_REPO,
+    ref: record.ref,
+    paths: { tombstone: TOMBSTONE_PATH },
   }
 }
 
-let drifted = false
-for (const [name, sourcePath] of paths) {
-  const url = `https://raw.githubusercontent.com/${source.repo}/${source.ref}/${sourcePath}`
-  const response = await fetch(url)
+export async function verifyClaustrumGolden(
+  options: {
+    fixtureDir?: string
+    fetchImpl?: typeof fetch
+    githubToken?: string
+  } = {},
+): Promise<string> {
+  const fixtureDir = options.fixtureDir ?? defaultFixtureDir
+  const fetchImpl = options.fetchImpl ?? fetch
+  const source = readSource(
+    JSON.parse(
+      await readFile(join(fixtureDir, 'SOURCE.json'), 'utf8'),
+    ) as unknown,
+  )
+  const local = await readFile(join(fixtureDir, 'tombstone.json')).catch(
+    (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return rejectSource('vendored file is missing: tombstone.json')
+      }
+      throw error
+    },
+  )
+
+  // Comparing an arbitrary fork with itself proves nothing. The pinned SHA
+  // must be reachable from the canonical repository's default branch. CI uses
+  // its read-only GitHub token to avoid shared-IP anonymous API limits; never
+  // forward that token to the raw fixture host or echo it in diagnostics.
+  const githubToken = options.githubToken ?? process.env.GITHUB_TOKEN
+  if (
+    githubToken !== undefined &&
+    !/^[A-Za-z0-9._-]{1,4096}$/.test(githubToken)
+  ) {
+    throw new Error('Invalid GitHub token format for golden provenance check')
+  }
+  const compare = await fetchImpl(
+    `https://api.github.com/repos/${CANONICAL_REPO}/compare/${source.ref}...${CANONICAL_BRANCH}`,
+    {
+      headers: {
+        accept: 'application/vnd.github+json',
+        'user-agent': 'cortexkit-anthropic-auth-golden-check',
+        ...(githubToken && { authorization: `Bearer ${githubToken}` }),
+      },
+    },
+  )
+  if (!compare.ok) {
+    throw new Error(
+      `Failed to validate Claustrum golden provenance: HTTP ${compare.status}`,
+    )
+  }
+  const relationship = (await compare.json()) as {
+    status?: unknown
+    behind_by?: unknown
+  }
+  if (
+    !relationship ||
+    !['ahead', 'identical'].includes(String(relationship.status)) ||
+    relationship.behind_by !== 0
+  ) {
+    return rejectSource('ref is not an ancestor of canonical Claustrum master')
+  }
+
+  const url = `https://raw.githubusercontent.com/${CANONICAL_REPO}/${source.ref}/${TOMBSTONE_PATH}`
+  const response = await fetchImpl(url)
   if (!response.ok) {
-    throw new Error(`Failed to fetch ${name} golden: ${response.status} ${url}`)
+    throw new Error(`Failed to fetch tombstone golden: HTTP ${response.status}`)
   }
   const remote = Buffer.from(await response.arrayBuffer())
-  const local = await readFile(join(fixtureDir, `${name}.json`))
-  if (Buffer.compare(remote, local) !== 0) {
-    console.error(`DRIFT: ${name}.json differs from ${url}`)
-    drifted = true
-    continue
+  if (!local.equals(remote)) {
+    throw new Error(`DRIFT: tombstone.json differs from ${url}`)
   }
-  console.log(`${name}.json: IDENTICAL (${source.ref})`)
+  return `tombstone.json: IDENTICAL (${source.ref})`
 }
 
-if (drifted) process.exitCode = 1
+if (import.meta.main) {
+  try {
+    console.log(await verifyClaustrumGolden())
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+  }
+}

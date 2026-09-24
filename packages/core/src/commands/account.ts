@@ -3,15 +3,8 @@ import type {
   ClaustrumMode,
   FallbackAccount,
 } from '../accounts.ts'
-import {
-  getClaustrumMode,
-  isOAuthAccount,
-  isOAuthAccountVaultOwned,
-} from '../accounts.ts'
-import type {
-  ClaustrumDetection,
-  CustodyHandleResolution,
-} from '../claustrum.ts'
+import { getClaustrumMode, isOAuthAccount } from '../accounts.ts'
+import type { ClaustrumDetection } from '../claustrum.ts'
 import type { ClaustrumEnrollmentStatus } from '../claustrum-enrollment.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
@@ -194,42 +187,34 @@ export function formatEnrollmentStatus(
   status: ClaustrumEnrollmentStatus,
   scopedServing = false,
 ): string[] {
+  const setup =
+    '- Next: Quit the host and run `bunx @cortexkit/opencode-anthropic-auth setup`'
   switch (status.state) {
     case 'idle':
       return ['- Enrollment: not enrolled']
     case 'busy':
-      return ['- Enrollment: another plugin process is reconciling']
+      return ['- Enrollment: setup is busy']
     case 'unavailable':
       return ['- Enrollment: temporarily unavailable']
     case 'pending':
       return status.requestId && /^[A-Za-z0-9_-]{1,128}$/.test(status.requestId)
-        ? [
-            `- Enrollment: pending approval (${status.requestId})`,
-            `- Approve: \`ck auth enroll approve --request-id ${status.requestId}\``,
+        ? [`- Enrollment: pending approval (${status.requestId})`, setup]
+        : [
+            status.requestId
+              ? '- Enrollment: pending approval'
+              : '- Enrollment: request not sent',
+            setup,
           ]
-        : status.requestId
-          ? [
-              '- Enrollment: pending approval; inspect it with `ck auth enroll list`',
-            ]
-          : ['- Enrollment: preparing request']
     case 'approved': {
       const name = status.approvedName ?? status.proposedName
       return /^[A-Za-z0-9_-]{1,128}$/.test(name)
         ? [
             `- Enrollment: approved as enrolled:${name} (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
-            ...(scopedServing
-              ? []
-              : [
-                  `- Grant: \`ck auth grant --principal enrolled:${name} --selector-kind category --selector anthropic-native --operation read\``,
-                ]),
+            ...(scopedServing ? [] : [setup]),
           ]
         : [
             `- Enrollment: approved (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
-            ...(scopedServing
-              ? []
-              : [
-                  '- Inspect the approved name with `ck auth enroll list` before granting access.',
-                ]),
+            ...(scopedServing ? [] : [setup]),
           ]
     }
     case 'denied':
@@ -310,7 +295,6 @@ export async function executeAccountCommand(input: {
   storage: AccountStorage
   claustrum?: ClaustrumDetection
   statusProjection?: AccountCommandStatusProjection
-  resolveCustodyBinding?: (account: FallbackAccount) => CustodyHandleResolution
   path?: string
   transition?: ClaustrumModeTransition
   resetEnrollment?: () => Promise<AccountCommandResult>
@@ -347,14 +331,13 @@ export async function executeAccountCommand(input: {
       const storedAccount = input.storage.accounts.find(
         (account) => account.id === a.id,
       )
-      const binding = storedAccount
-        ? input.resolveCustodyBinding?.(storedAccount)
-        : undefined
       const custody = projected
         ? custodyStatusLabel(projected.custodyState)
         : a.id !== mainId &&
             storedAccount &&
-            isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
+            getClaustrumMode(input.storage) === 'claustrum' &&
+            isOAuthAccount(storedAccount) &&
+            storedAccount.claustrumScopedCredentialId
           ? custodyStatusLabel('on-cold')
           : 'local'
       lines.push(
@@ -437,17 +420,6 @@ export async function executeAccountCommand(input: {
     ) {
       return {
         text: `Account "${target.label ?? id}" is managed by Claustrum. Disable it to stop routing, or remove it from the vault.`,
-      }
-    }
-    const binding = input.resolveCustodyBinding?.(target)
-    if (
-      getClaustrumMode(input.storage) === 'claustrum' &&
-      isOAuthAccount(target) &&
-      binding?.status === 'resolved' &&
-      binding.source === 'manifest'
-    ) {
-      return {
-        text: `Account "${target.label ?? id}" is bound by the Claustrum manifest. Disable it to stop routing, or remove its Claustrum binding before removing the routing row.`,
       }
     }
     return {

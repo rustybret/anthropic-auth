@@ -1,0 +1,17 @@
+{
+  "floors": {
+    "core": 290,
+    "opencode": 1675,
+    "pi": 140
+  },
+  "measurement": {
+    "head": "61a3e354e46080eee296c91453422af51f55d562",
+    "dirtyPaths": 0
+  },
+  "evidence": {
+    "_note": "Pinned Bun 1.3.14 runner totals after the scoped-only cutover. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
+    "core": "290 passing on clean CI run 35908244749 at commit 379fb64f",
+    "opencode": "1675 passing on clean committed source 61a3e354 under pinned Bun 1.3.14; the final CI run must confirm this count",
+    "pi": "140 passing on clean CI run 35908244749 at commit 379fb64f"
+  }
+}

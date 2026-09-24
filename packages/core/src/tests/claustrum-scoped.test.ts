@@ -7,6 +7,7 @@ import {
 import {
   type ClaustrumScopedClient,
   ClaustrumScopedCustody,
+  isScopedCredentialRotation,
 } from '../claustrum-scoped.ts'
 
 const identity = {
@@ -391,3 +392,27 @@ test.each([
     }
   },
 )
+
+test('only a changed record version for the same scoped credential and provider identity permits a 401 replay', () => {
+  const served = {
+    ...identity,
+    accessToken: 'old',
+    recordVersion: 7,
+    expiresAtMs: 1_000_000,
+  }
+  expect(
+    isScopedCredentialRotation(served, {
+      ...served,
+      accessToken: 'new',
+      recordVersion: 8,
+    }),
+  ).toBe(true)
+  for (const candidate of [
+    undefined,
+    { ...served, accessToken: 'new' },
+    { ...served, credentialId: 'oauth:anthropic:other', recordVersion: 8 },
+    { ...served, accountId: 'other-account', recordVersion: 8 },
+  ]) {
+    expect(isScopedCredentialRotation(served, candidate)).toBe(false)
+  }
+})
