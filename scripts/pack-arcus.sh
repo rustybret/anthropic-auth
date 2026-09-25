@@ -70,7 +70,7 @@ Usage: sh scripts/pack-arcus.sh [options]
   --release-id ID     Release identifier (default: <version> or <package_id>-<version>).
   --channel NAME      Distribution channel (default: stable).
   --payload DIR       Use a pre-staged payload directory (skips staging).
-  --output DIR        Output directory (default: dist/<version>/<sequence>/<package_id>).
+  --output DIR        Output directory (default: dist/<sequence>/<package_id>/<version>).
   --format FMT        Archive format: tar.zst, tar.gz, or zip (default: tar.zst).
   --key-file PATH     Ed25519 private key file. Use '-' to read stdin.
   --key-env NAME      Name of an environment variable holding the key.
@@ -230,7 +230,7 @@ fi
 [ -n "$RELEASE_ID" ] || die "could not derive a release_id from ${PACKAGE_ID} ${VERSION}"
 
 if [ -z "$OUTPUT_DIR" ]; then
-  OUTPUT_DIR="${REPO_ROOT}/dist/${VERSION}/${SEQUENCE}/${PACKAGE_ID}"
+  OUTPUT_DIR="${REPO_ROOT}/dist/${SEQUENCE}/${PACKAGE_ID}/${VERSION}"
 fi
 
 stage_payload() {

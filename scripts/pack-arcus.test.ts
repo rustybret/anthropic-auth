@@ -367,10 +367,10 @@ process.exit(0);
     }
   }, 25000)
 
-  it('enacts magic-context dist repo organization standard (dist/<version>/<sequence>/<package>)', () => {
+  it('enacts canonical Arcus dist layout (dist/<sequence>/<package>/<version>) with sequence as timeline', () => {
     const defaultDistDir = resolve(
       repoRoot,
-      `dist/${opencodePkg.version}/9998/opencode-anthropic-auth`,
+      `dist/9998/opencode-anthropic-auth/${opencodePkg.version}`,
     )
     const mockBinDir = mkdtempSync(join(tmpdir(), 'arcus-mock-bin-'))
     const mockArcus = join(mockBinDir, 'arcus')
@@ -450,7 +450,7 @@ process.exit(0);
       ).toBe(true)
       expect(existsSync(join(defaultDistDir, 'arcus-manifest.json'))).toBe(true)
     } finally {
-      rmSync(resolve(repoRoot, `dist/${opencodePkg.version}/9998`), {
+      rmSync(resolve(repoRoot, 'dist/9998'), {
         recursive: true,
         force: true,
       })

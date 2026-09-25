@@ -34,15 +34,19 @@ bun run pack:arcus
 bun run pipeline:arcus all
 ```
 
-Packaging artifacts are stored following the Arcus suite standard under:
-`dist/<version>/<sequence>/<package_id>/`
+Packaging artifacts are stored following the canonical Arcus dist standard under:
+`dist/<sequence>/<package_id>/<version>/`
+
+Sequence is the true immutable timeline (strictly monotonic, > current, never resetting to 1). For multi-component suites, sequence is synchronized across all suite packages:
+$$\text{suite\_seq} = \max(\text{all suite package sequences}) + 1$$
+Version is a display-only artifact.
 
 The self-contained submission bundle is emitted to:
-`dist/arcus/<package_id>-<release_id>/`
+`dist/<sequence>/<package_id>/<version>/` (or staged under `dist/arcus/<package_id>-<release_id>/`)
 
 Submit the release bundle to the Arcus gateway over authenticated HTTPS:
 ```sh
-arcus publish submit --bundle dist/arcus/<package_id>-<release_id>/ --gateway https://arcus-auth.rustybret.com --wait
+arcus publish submit --bundle dist/<sequence>/<package_id>/<version>/ --gateway https://arcus-auth.rustybret.com --wait
 ```
 
 Track submission status and hydration diagnostics:

@@ -6,11 +6,13 @@ This document describes the canonical Arcus v3 release, packaging, and distribut
 
 ### Key Characteristics:
 - **Zero Binaries in Git**: All compiled archives (`.tar.zst`, `.zip`, `.pwr`) are published as GitHub Release assets and served via the Arcus artifact gateway (`arcus-auth.rustybret.com`).
-- **Tidy `dist/` Release Organization**: Release outputs strictly follow the Arcus suite standard:
+- **Canonical Arcus Dist Release Organization**: Release outputs strictly follow the canonical Arcus dist standard:
   ```
-  dist/<version>/<sequence>/<package_id>/
+  dist/<sequence>/<package_id>/<version>/
   ```
-  All packages are neatly organized in version and sequence subdirectories (never dumped flat into the repository root).
+  Sequence is the true immutable timeline (strictly monotonic, > current, never resetting to 1). For multi-component suites, the lumped sequence must be the MAX across all components in the suite + 1:
+  $$\text{suite\_seq} = \max(\text{all suite package sequences}) + 1$$
+  Every component is assigned the unified suite sequence, establishing a compatibility lock and eliminating component sequence skew. Version is a display-only artifact. All packages are neatly organized in sequence, package, and version subdirectories (never dumped flat into the repository root).
 - **Cryptographic Signature Verification**: Every release manifest is cryptographically signed using Ed25519 and validated via `arcus manifest validate --with-envelope`.
 - **5 Canonical Targets**: Releases provide distinct, verified multi-arch artifacts across `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, and `windows-x64` satisfying distinct digest triples (`archive_sha256 != content_source_sha256 != tree_signature_sha256`).
 - **Consumer Template Architecture**: Toolchain scripts are symlinked directly to `packages/arcus/toolchain/scripts/*` via `packages/arcus/bootstrap.sh` and `arcus install arcus-publisher`. Git submodules of Arcus are strictly prohibited (Arcus R4).
@@ -27,13 +29,18 @@ anthropic-auth/
 ├── packages/
 │   └── arcus/                  # Arcus consumer template (bootstrap.sh, arcus.json)
 │       └── toolchain/          # -> Symlink to installed arcus-publisher
-├── dist/                       # Git-ignored tidy Arcus distribution directory
-│   └── <version>/
-│       └── <sequence>/
-│           └── opencode-anthropic-auth/
+├── dist/                       # Git-ignored canonical Arcus distribution directory
+│   └── <sequence>/             # Sequence as true immutable timeline
+│       └── opencode-anthropic-auth/ # Package / component
+│           └── <version>/      # Display-only version
 │               ├── opencode-anthropic-auth-<ver>-<target>.tar.zst
 │               ├── opencode-anthropic-auth-<ver>-<target>.pwr
 │               ├── opencode-anthropic-auth-<ver>-<target>-content.zip
+│               ├── release.json
+│               ├── release.index-policy.json
+│               ├── assets.sha256
+│               ├── toolchain.json
+│               ├── submission.json
 │               ├── pack-report.json
 │               ├── arcus-manifest.json
 │               └── releases/
