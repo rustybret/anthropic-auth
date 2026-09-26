@@ -22,8 +22,9 @@
     "dev:clean": "bun scripts/dev-clean.ts",
     "extract": "bun scripts/extract-system-prompt.ts",
     "check:claustrum-golden": "bun scripts/check-claustrum-golden.ts",
+    "check:pi-dist-imports": "bun scripts/check-pi-dist-imports.ts",
     "analyze:cache": "node scripts/analyze-cache-usage.mjs",
-    "test": "bun run build && cd packages/core && bun test src/tests && cd ../opencode && bun run test && cd ../pi && bun run test && cd ../.. && bun run test:pi-host && bun test scripts/pack-arcus.test.ts scripts/fork-sync.test.ts",
+    "test": "bun run build && bun run check:pi-dist-imports && cd packages/core && bun test src/tests && cd ../opencode && bun run test && cd ../pi && bun run test && cd ../.. && bun run test:pi-host && bun test scripts/pack-arcus.test.ts scripts/fork-sync.test.ts",
     "test:pi-host": "bun scripts/check-pi-tool-mapping.ts",
     "test:e2e": "cd packages/core && bun run build && cd ../.. && bun run --cwd packages/e2e-tests test",
     "typecheck": "cd packages/core && bun run build && bun run typecheck && cd ../opencode && bun run typecheck && cd ../pi && bun run typecheck && cd ../e2e-tests && bun run typecheck && cd ../.. && tsc -p tsconfig.scripts.json",
@@ -33,6 +34,7 @@
     "lint": "biome lint ."
   },
   "devDependencies": {
+    "@babel/parser": "7.29.7",
     "@biomejs/biome": "2.5.14",
     "@earendil-works/pi-ai": "0.86.1",
     "@earendil-works/pi-coding-agent": "0.86.1",

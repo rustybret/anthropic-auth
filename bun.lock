@@ -5,6 +5,7 @@
     "": {
       "name": "@cortexkit/anthropic-auth",
       "devDependencies": {
+        "@babel/parser": "7.29.7",
         "@biomejs/biome": "2.5.14",
         "@earendil-works/pi-ai": "0.86.1",
         "@earendil-works/pi-coding-agent": "0.86.1",
@@ -23,7 +24,7 @@
       "name": "@cortexkit/anthropic-auth-core",
       "version": "1.23.0",
       "dependencies": {
-        "@cortexkit/claustrum-client": "0.3.0",
+        "@cortexkit/claustrum-client": "0.4.0",
         "xxhash-wasm": "^1.1.0",
       },
     },
@@ -211,7 +212,7 @@
 
     "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.3.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1" } }, "sha512-vX28AlhG6vsk2PDNIQMkMmcP2gg+tcODuuz/xppVyLnveNL8aVZlZll1TkT1T9UMKeLDk/vvfOkeMSAC9ZaKGA=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.4.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.16.0" } }, "sha512-xjUXf/lB3T8R7oaOu9T1Obnn47bAdN5UbyaTpywyiY4wdvTbqHBnB3qX0KpDFTeZ7m35tRPDevcWvOzJIgUhMw=="],
 
     "@cortexkit/opencode-anthropic-auth": ["@cortexkit/opencode-anthropic-auth@workspace:packages/opencode"],
 
@@ -829,7 +830,7 @@
 
     "@babel/helper-create-class-features-plugin/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
-    "@cortexkit/claustrum-client/@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
+    "@cortexkit/claustrum-client/@cortexkit/subc-client": ["@cortexkit/subc-client@0.16.1", "", {}, "sha512-TJqOcfMVxhCfZMANmEH/9w+L+zYxFSy5p5Zl/shDErtGSeUF6HFiwZ7OR/P2qFvpSg/yxCbsdenZ7rs5SE6fhA=="],
 
     "@jridgewell/gen-mapping/@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 

@@ -39,7 +39,7 @@ This package is part of the `rustybret/anthropic-auth` downstream fork of upstre
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
 - **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
-- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models (`claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`).
+- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models (`claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`).
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5/5.1, Mythos 5/5.1, Opus 5, and Opus 5.5. OpenCode exposes native `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Fable 5.1, Opus 5, and Opus 5.5. On Opus 5.5, thinking is always on (adaptive summarized) per the model specification. OAuth Fable 5.1 sessions can change effort between turns without rewriting the cached prefix.
 - **Fable/Opus 5 and 5.5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
@@ -105,7 +105,7 @@ In the OpenCode fleet, this plugin is distributed through **Arcus v2** and loade
 
    ```json
    {
-     "plugin": ["@cortexkit/opencode-anthropic-auth@1.22.0"]
+     "plugin": ["@cortexkit/opencode-anthropic-auth@2.0.0"]
    }
    ```
 
@@ -125,7 +125,7 @@ pi -e file:///Volumes/Topper2TB/Git/anthropic-auth/packages/pi
 Or when running the upstream npm release:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth@1.22.0
+pi install npm:@cortexkit/pi-anthropic-auth@2.0.0
 ```
 
 The Pi package registers a CortexKit Anthropic provider extension under Pi's built-in `anthropic` provider ID. After installation, start or restart Pi and authenticate with Pi's normal login command:
@@ -568,7 +568,7 @@ Both OpenCode and Pi packages can persistently request Anthropic fast mode for s
 /claude-fast off
 ```
 
-When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, and `claude-opus-5`; Claude Fable and Mythos 5/5.1 are not fast-mode models.
+When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic supports fast mode for `claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`. Opus 4.7 rejects `speed: "fast"`, while Opus 4.6 runs at standard speed; Claude Fable and Mythos 5/5.1 are not fast-mode models.
 
 Fast and standard speeds do not share prompt-cache prefixes, so switching this setting can cause cache misses.
 

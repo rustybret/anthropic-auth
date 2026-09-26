@@ -60,6 +60,10 @@ describe('setup wizard command', () => {
 
     const env: NodeJS.ProcessEnv = {
       HOME: root,
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+        root,
+        'unavailable-subc-connection.json',
+      ),
       XDG_CONFIG_HOME: join(root, '.config'),
       XDG_DATA_HOME: join(root, '.local', 'share'),
       PI_CODING_AGENT_DIR: join(root, '.pi', 'agent'),
@@ -94,6 +98,10 @@ describe('setup wizard command', () => {
 
     const env: NodeJS.ProcessEnv = {
       HOME: root,
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+        root,
+        'unavailable-subc-connection.json',
+      ),
       XDG_CONFIG_HOME: join(root, '.config'),
       XDG_DATA_HOME: join(root, '.local', 'share'),
       PI_CODING_AGENT_DIR: join(root, 'nonexistent-pi'),
@@ -116,6 +124,10 @@ describe('setup wizard command', () => {
 
     const env: NodeJS.ProcessEnv = {
       HOME: root,
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+        root,
+        'unavailable-subc-connection.json',
+      ),
       XDG_CONFIG_HOME: join(root, '.config'),
       XDG_DATA_HOME: join(root, '.local', 'share'),
       PI_CODING_AGENT_DIR: join(root, 'nonexistent-pi'),
@@ -160,6 +172,10 @@ test('executes end-to-end Claustrum setup for OpenCode with mock ck and daemon',
 
   const env: NodeJS.ProcessEnv = {
     HOME: root,
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      root,
+      'unavailable-subc-connection.json',
+    ),
     XDG_CONFIG_HOME: join(root, '.config'),
     XDG_DATA_HOME: join(root, '.local', 'share'),
     XDG_STATE_HOME: join(root, '.local', 'state'),
@@ -279,6 +295,10 @@ test('approved enrollment never opens a live daemon connection', async () => {
 
   const env: NodeJS.ProcessEnv = {
     HOME: root,
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      root,
+      'unavailable-subc-connection.json',
+    ),
     XDG_CONFIG_HOME: join(root, '.config'),
     XDG_DATA_HOME: join(root, '.local', 'share'),
     XDG_STATE_HOME: join(root, '.local', 'state'),
@@ -374,6 +394,10 @@ test('executes Pi Claustrum setup: removes local OAuth and commits scoped roster
 
   const env: NodeJS.ProcessEnv = {
     HOME: root,
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      root,
+      'unavailable-subc-connection.json',
+    ),
     PI_CODING_AGENT_DIR: agentDir,
   }
 
@@ -472,6 +496,10 @@ async function enrollmentSetupFixture(
   testDirs.push(root)
   const env: NodeJS.ProcessEnv = {
     HOME: root,
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      root,
+      'unavailable-subc-connection.json',
+    ),
     XDG_CONFIG_HOME: join(root, 'config'),
     XDG_DATA_HOME: join(root, 'data'),
     XDG_STATE_HOME: join(root, 'state'),

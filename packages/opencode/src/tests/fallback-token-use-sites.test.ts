@@ -3,14 +3,18 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
   type AccountStorage,
   CACHE_KEEP_TICK_MS,
   type ClaustrumScopedClient,
   custodyTombstoneOAuth,
+  getLogLevel,
+  type LogTestRecord,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   saveAccountState,
   saveAccounts,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 
 import { AnthropicAuthPlugin } from '../index'
@@ -805,6 +809,119 @@ describe('scoped maintenance rotation recovery', () => {
   test.serial(
     'CacheKeep reports only the newly served version if the replay also receives 401',
     () => checkCacheKeepRotation(401),
+  )
+
+  test.serial(
+    'CacheKeep records reauthorize-failed and reports the served version when re-authorization throws',
+    async () => {
+      const now = 1_000
+      const fixture = await createFixture('main-cachekeep', {
+        now,
+        cachekeep: true,
+        captureIntervals: true,
+        mainFirst: true,
+      })
+      await (
+        await fixture.result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'cachekeep-reauthorize-failed' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            stream: true,
+            system: [
+              {
+                type: 'text',
+                text: 'stable',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        })
+      ).text()
+      resetClaudeCodeIdentityCachesForTest()
+      const reports: number[] = []
+      const sent: string[] = []
+      let failReauthorize = false
+      const originalGet = fixture.scopedClient.getScoped.bind(
+        fixture.scopedClient,
+      )
+      fixture.scopedClient.getScoped = async (input) => {
+        if (failReauthorize && input.credentialId === 'oauth:anthropic') {
+          throw new Error('vault unavailable')
+        }
+        const receipt = await originalGet(input)
+        return input.credentialId === 'oauth:anthropic'
+          ? {
+              ...receipt,
+              material: 'scoped-cachekeep-v103',
+              recordVersion: 103,
+            }
+          : receipt
+      }
+      fixture.scopedClient.reportAuthFailureScoped = async ({
+        recordVersion,
+      }) => {
+        reports.push(recordVersion)
+      }
+      const originalRequest = globalThis.fetch
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const requestBody = typeof init?.body === 'string' ? init.body : ''
+        if (
+          extractUrl(input as string | URL | Request).includes(
+            '/v1/messages',
+          ) &&
+          (JSON.parse(requestBody) as { max_tokens?: number }).max_tokens === 0
+        ) {
+          sent.push(new Headers(init?.headers).get('authorization') ?? '')
+          failReauthorize = true
+          return Promise.resolve(
+            new Response('token rejected', { status: 401 }),
+          )
+        }
+        return originalRequest(input as Parameters<typeof fetch>[0], init)
+      }) as unknown as typeof fetch
+
+      const records: LogTestRecord[] = []
+      const previousLevel = getLogLevel()
+      setLogLevel('debug')
+      __setLogTestSink((record) => records.push(record))
+      try {
+        ;(
+          fixture.intervals as IntervalRecord[] & {
+            clock: (now: number) => void
+          }
+        ).clock(now + 55 * 60_000)
+        const interval = fixture.intervals.find(
+          (candidate) => candidate.ms === CACHE_KEEP_TICK_MS,
+        )
+        if (!interval) throw new Error('CacheKeep interval missing')
+        interval.callback()
+        await waitFor(
+          () => reports.length >= 1,
+          'CacheKeep 401 was not reported after re-authorization failed',
+        )
+      } finally {
+        __setLogTestSink(null)
+        setLogLevel(previousLevel)
+      }
+
+      expect(sent).toEqual(['Bearer scoped-cachekeep-v103'])
+      expect(reports).toEqual([103])
+      expect(
+        records
+          .filter((record) => record.message === 'scoped 401 re-authorized')
+          .map((record) => record.payload),
+      ).toContainEqual(
+        expect.objectContaining({
+          site: 'cachekeep',
+          servedVersion: 103,
+          currentVersion: null,
+          retry: false,
+          reason: 'reauthorize-failed',
+        }),
+      )
+    },
   )
 
   test.serial(

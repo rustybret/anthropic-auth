@@ -1992,6 +1992,96 @@ describe('QuotaManager', () => {
       expect(pushed.quota.scoped).toEqual([])
     })
 
+    test('a header-only main entry stays due for its first usage poll', () => {
+      const qm = createQM()
+      qm.pushMainFromHeaders('token', headerSnapshot())
+
+      // Headers keep five_hour/seven_day fresh but never carry scoped windows,
+      // so without a poll the entry would never learn model-scoped limits.
+      expect(qm.isMainStale()).toBe(true)
+
+      qm.setMain('token', {
+        quota: { scoped: [], checkedAt: now, source: 'poll' },
+        checkedAt: now,
+        refreshAfter: now + 60_000,
+      })
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(false)
+    })
+
+    test('a failed first usage poll does not re-arm header-only staleness until the next interval', async () => {
+      let usageCalls = 0
+      const qm = createQM((async () => {
+        usageCalls += 1
+        return new Response('{"error":{"type":"permission_error"}}', {
+          status: 403,
+        })
+      }) as unknown as typeof fetch)
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+
+      await qm.refreshMain('token', 'access-token').catch(() => {})
+      expect(usageCalls).toBe(1)
+      // A usage 403 arms no quota backoff; the header-only rule must not
+      // turn every subsequent request into another poll.
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(false)
+
+      now += 5 * 60_000
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+    })
+
+    test('losing the cross-process quota lock does not count as a header-only poll attempt', async () => {
+      let usageCalls = 0
+      const qm = createQM((async () => {
+        usageCalls += 1
+        return Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 10 },
+        })
+      }) as unknown as typeof fetch)
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+
+      // Another process owns the main quota refresh: this contender returns
+      // its fresh header cache without sending a usage request.
+      const lock = await acquireRefreshFileLock({
+        name: 'opencode-main-quota-refresh',
+        ttlMs: 30_000,
+      })
+      expect(lock).not.toBeNull()
+      try {
+        await qm.refreshMain('token', 'access-token').catch(() => {})
+      } finally {
+        await lock?.release()
+      }
+
+      expect(usageCalls).toBe(0)
+      // No physical poll happened, so the header-only entry is still due.
+      expect(qm.isMainStale()).toBe(true)
+    })
+
+    test('a poll attempt for a previous main account does not delay the new account first poll', async () => {
+      let usageCalls = 0
+      const qm = createQM((async () => {
+        usageCalls += 1
+        return new Response('{"error":{"type":"permission_error"}}', {
+          status: 403,
+        })
+      }) as unknown as typeof fetch)
+      qm.pushMainFromHeaders('account-a', headerSnapshot())
+      await qm.refreshMain('account-a', 'access-a').catch(() => {})
+      expect(usageCalls).toBe(1)
+      qm.pushMainFromHeaders('account-a', headerSnapshot())
+      expect(qm.isMainStale()).toBe(false)
+
+      // The main account changes within the same interval: the new account has
+      // only header data and must still get its first usage poll.
+      qm.pushMainFromHeaders('account-b', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+    })
+
     test('header push never introduces poll-owned scoped data', () => {
       const qm = createQM()
       const incoming = {

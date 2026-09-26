@@ -135,6 +135,15 @@ export class QuotaManager {
 
   // --- Inflight deduplication ---
   private inflightMain: Promise<QuotaRefreshResult> | null = null
+  // When this process last started a main usage poll, whatever its outcome.
+  // Bounds the header-only staleness rule below: a usage 403 deliberately does
+  // not arm quota backoff, so without this a failing poll would repeat on
+  // every request that checks main staleness.
+  // Bound to the account it polled for, so a poll for a previous main account
+  // never delays the first poll of a new one.
+  private lastMainPollAttempt:
+    | { accountId: string | undefined; at: number }
+    | undefined
   private inflightMainAccountId: string | undefined
   private inflightMainAccessToken: string | undefined
   private inflightMainToken = 0
@@ -541,7 +550,18 @@ export class QuotaManager {
     }
     return (
       this.now() >= this.main.refreshAfter ||
-      this.scopedWindowIsStale(this.main, modelId)
+      this.scopedWindowIsStale(this.main, modelId) ||
+      // Model-scoped windows come only from the usage poll, and main has no
+      // background poll: header harvests keep five_hour/seven_day fresh and
+      // carry a polled `scoped` forward, so a main entry that has only ever
+      // seen headers would never learn its scoped (e.g. Fable weekly) limits.
+      // An empty array is a real poll result and does not qualify.
+      (this.main.quota.source === 'headers' &&
+        this.main.quota.scoped === undefined &&
+        (this.lastMainPollAttempt === undefined ||
+          this.lastMainPollAttempt.accountId !== this.mainAccountId ||
+          this.now() - this.lastMainPollAttempt.at >=
+            getQuotaCheckIntervalMs(this.storage)))
     )
   }
 
@@ -958,6 +978,13 @@ export class QuotaManager {
         }
         try {
           const fetchStartedAt = this.now()
+          // Record only a physical usage request. Backed-off, superseded or
+          // lock-losing contenders return above without polling and must not
+          // defer the header-only poll this process still owes.
+          this.lastMainPollAttempt = {
+            accountId: mainAccountId,
+            at: fetchStartedAt,
+          }
           const quota = this.fetchQuotaSnapshot
             ? await this.fetchQuotaSnapshot({
                 kind: 'main',

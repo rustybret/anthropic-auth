@@ -14,7 +14,7 @@ import {
   type ClaustrumScopedAttempt,
   type ClaustrumScopedClient,
   ClaustrumScopedCustody,
-  isScopedCredentialRotation,
+  decideScopedRetryAfter401,
 } from './claustrum-scoped.js'
 import {
   type ClaustrumScopedRoster,
@@ -293,7 +293,7 @@ export class ClaustrumScopedRuntime {
             // No verified replacement: retain the response and report the
             // exact receipt used by this physical request below.
           }
-          if (isScopedCredentialRotation(served, current)) {
+          if (decideScopedRetryAfter401('quota-profile', served, current)) {
             await response.body?.cancel().catch(() => {})
             const headers = new Headers(init?.headers)
             headers.set('authorization', `Bearer ${current.accessToken}`)

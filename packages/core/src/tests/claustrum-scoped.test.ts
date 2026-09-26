@@ -7,8 +7,30 @@ import {
 import {
   type ClaustrumScopedClient,
   ClaustrumScopedCustody,
+  decideScopedRetryAfter401,
   isScopedCredentialRotation,
 } from '../claustrum-scoped.ts'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
+
+async function captureLogs<T>(
+  run: () => Promise<T> | T,
+): Promise<{ result: T; records: LogTestRecord[] }> {
+  const records: LogTestRecord[] = []
+  const previousLevel = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  try {
+    return { result: await run(), records }
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  }
+}
 
 const identity = {
   credentialId: 'oauth:anthropic:work',
@@ -144,6 +166,41 @@ describe('scoped custody dispatch authorization', () => {
     ])
     expect(JSON.stringify(attempt)).not.toContain('test-access')
     expect(JSON.stringify(attempt)).not.toContain('01'.repeat(32))
+  })
+
+  test('logs a delivered 401 report with its served version and no credential material', async () => {
+    const f = fixture()
+    const attempt = await f.custody.authorize(identity)
+    const { records } = await captureLogs(() =>
+      f.custody.reportFailure(attempt, 401, 'direct'),
+    )
+    const reported = records.filter(
+      (record) => record.message === 'scoped 401 reported',
+    )
+    expect(reported).toHaveLength(1)
+    expect(reported[0]?.payload).toEqual({
+      credentialId: identity.credentialId,
+      recordVersion: 7,
+      reporterSource: 'direct',
+    })
+    const serialized = JSON.stringify(records)
+    expect(serialized).not.toContain('test-access')
+    expect(serialized).not.toContain('01'.repeat(32))
+  })
+
+  test('does not log a 401 report the vault did not accept', async () => {
+    const f = fixture({
+      reportAuthFailureScoped: async () => {
+        throw new Error('vault unavailable')
+      },
+    })
+    const attempt = await f.custody.authorize(identity)
+    const { records } = await captureLogs(() =>
+      f.custody.reportFailure(attempt, 401, 'direct').catch(() => {}),
+    )
+    expect(
+      records.some((record) => record.message === 'scoped 401 reported'),
+    ).toBe(false)
   })
 
   test('rejects a copied or foreign attempt receipt', async () => {
@@ -415,4 +472,75 @@ test('only a changed record version for the same scoped credential and provider 
   ]) {
     expect(isScopedCredentialRotation(served, candidate)).toBe(false)
   }
+})
+
+test('records both arms of a scoped 401 retry decision without credential material', async () => {
+  const served = {
+    ...identity,
+    accessToken: 'served-secret',
+    recordVersion: 7,
+    expiresAtMs: 1_000_000,
+  }
+  const rotated = { ...served, accessToken: 'rotated-secret', recordVersion: 8 }
+  const { result: retried, records } = await captureLogs(() => [
+    decideScopedRetryAfter401('model', served, rotated),
+    decideScopedRetryAfter401('cachekeep', served, { ...served }),
+    decideScopedRetryAfter401('prime', served, undefined),
+    decideScopedRetryAfter401('pi-model', served, {
+      ...rotated,
+      accountId: 'other-account',
+    }),
+    decideScopedRetryAfter401('pi-model-relay', served, {
+      ...rotated,
+      credentialId: 'oauth:anthropic:other',
+    }),
+  ])
+  expect(retried).toEqual([true, false, false, false, false])
+  expect(
+    records
+      .filter((record) => record.message === 'scoped 401 re-authorized')
+      .map((record) => record.payload),
+  ).toEqual([
+    {
+      site: 'model',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: 8,
+      retry: true,
+      reason: 'rotated',
+    },
+    {
+      site: 'cachekeep',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: 7,
+      retry: false,
+      reason: 'version-unchanged',
+    },
+    {
+      site: 'prime',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: null,
+      retry: false,
+      reason: 'reauthorize-failed',
+    },
+    {
+      site: 'pi-model',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: 8,
+      retry: false,
+      reason: 'account-changed',
+    },
+    {
+      site: 'pi-model-relay',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: 8,
+      retry: false,
+      reason: 'credential-changed',
+    },
+  ])
+  expect(JSON.stringify(records)).not.toContain('secret')
 })

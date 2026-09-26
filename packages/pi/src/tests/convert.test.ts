@@ -4,13 +4,9 @@ import {
   computeCcVersionSuffix,
   type ProviderAccountUuid,
 } from '@cortexkit/anthropic-auth-core'
-import {
-  type Context,
-  type Message,
-  normalizeContext,
-  Type,
-} from '@earendil-works/pi-ai'
+import { type Context, type Message, Type } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
+import { normalizeContext } from '../transcript.ts'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
@@ -78,6 +74,25 @@ async function buildMessages(
   )
   return body.messages
 }
+
+describe('fast mode model eligibility', () => {
+  test.each([
+    ['claude-opus-4-6', false],
+    ['claude-opus-4-7', false],
+    ['claude-opus-4-8', true],
+    ['claude-opus-5', true],
+    ['claude-opus-5-5', true],
+  ])('Pi sends speed only for eligible %s', async (model, enabled) => {
+    const { body } = await buildAnthropicRequest(
+      model,
+      { messages: [userMsg('hello')], tools: [] } as Context,
+      undefined,
+      defaultCache,
+      true,
+    )
+    expect(body.speed).toBe(enabled ? 'fast' : undefined)
+  })
+})
 
 describe('buildAnthropicRequest — prefill stripping', () => {
   test('strips single trailing assistant message', async () => {

@@ -3,8 +3,6 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadAccounts, saveAccounts } from '@cortexkit/anthropic-auth-core'
-import { normalizeContext } from '@earendil-works/pi-ai'
-
 import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
@@ -12,6 +10,7 @@ import {
   primaryResponseAllowsApiFallback,
   streamCortexKitAnthropic,
 } from '../stream.ts'
+import { normalizeContext } from '../transcript.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch

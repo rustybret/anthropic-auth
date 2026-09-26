@@ -100,7 +100,7 @@ export async function detectClaustrum(
   let daemonRunning = false
 
   try {
-    connectionPath = resolveClaustrumConnectionPath()
+    connectionPath = resolveClaustrumConnectionPath(undefined, env)
     if (connectionPath && existsSync(connectionPath)) {
       // Prove the daemon is actually running with a real handshake
       const client = await connectClaustrumEnrollmentClient({

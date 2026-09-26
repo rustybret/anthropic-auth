@@ -1,13 +1,10 @@
-import { afterAll, afterEach } from 'bun:test'
-import { mkdtempSync } from 'node:fs'
-import { rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { afterEach, beforeEach } from 'bun:test'
 import {
   assertLoopback,
   assertPreconnectUrl,
   fetchUrl,
 } from './network-guard-utils'
+import { restoreTestSafetyPaths } from './preload-sandbox'
 import { DEFAULT_FETCH_MOCK } from './test-fetch'
 
 const nativeFetch = globalThis.fetch
@@ -160,30 +157,8 @@ afterEach(() => {
 // the captured guarded implementation afterward.
 globalThis.fetch = guardedFetch
 
-const testDir = mkdtempSync(join(tmpdir(), 'anthropic-auth-opencode-test-'))
-
-afterAll(async () => {
-  await rm(testDir, { recursive: true, force: true }).catch(() => {})
-})
-
-process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = testDir
-process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(testDir, 'anthropic-auth.json')
-process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-  testDir,
-  'opencode-enrollment.json',
-)
-process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-  testDir,
-  'sidebar-state.json',
-)
-process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
-  testDir,
-  'cachekeep-registry',
-)
-process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
-  testDir,
-  'quota-header-feed',
-)
+beforeEach(restoreTestSafetyPaths)
+afterEach(restoreTestSafetyPaths)
 // User-level Anthropic overrides are valid runtime configuration, but they make
 // request-transform tests depend on the developer machine. Tests set these
 // explicitly when they exercise override behavior.

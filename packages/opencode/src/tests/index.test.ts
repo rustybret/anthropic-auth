@@ -9226,7 +9226,7 @@ describe('auth.loader', () => {
     await result.fetch(MESSAGES_URL, {
       method: 'POST',
       body: JSON.stringify({
-        model: 'claude-opus-4-7',
+        model: 'claude-opus-4-8',
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
@@ -9237,59 +9237,62 @@ describe('auth.loader', () => {
     expect(JSON.parse(capturedBody!).speed).toBe('fast')
   })
 
-  test('persistent claudeFast setting skips unsupported models', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        claudeFast: { enabled: true },
-      }),
-    )
-
-    let capturedHeaders: Headers | undefined
-    let capturedBody: string | undefined
-    globalThis.fetch = mock((input: any, init: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: { utilization: 0 },
-              seven_day: { utilization: 0 },
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      capturedHeaders = init?.headers
-      capturedBody = init?.body
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'token',
-          refresh: 'refresh',
-          expires: Date.now() + 100000,
+  test.each(['claude-opus-4-6', 'claude-opus-4-7', 'claude-sonnet-4-5'])(
+    'persistent claudeFast setting skips unsupported %s',
+    async (model) => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          claudeFast: { enabled: true },
         }),
-      { models: {} },
-    )
+      )
 
-    await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    })
+      let capturedHeaders: Headers | undefined
+      let capturedBody: string | undefined
+      globalThis.fetch = mock((input: any, init: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        capturedHeaders = init?.headers
+        capturedBody = init?.body
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }) as unknown as typeof fetch
 
-    expect(capturedHeaders?.get('anthropic-beta')).not.toContain(
-      'fast-mode-2026-02-01',
-    )
-    expect(JSON.parse(capturedBody!).speed).toBeUndefined()
-  })
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'token',
+            refresh: 'refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+
+      expect(capturedHeaders?.get('anthropic-beta')).not.toContain(
+        'fast-mode-2026-02-01',
+      )
+      expect(JSON.parse(capturedBody!).speed).toBeUndefined()
+    },
+  )
 
   test('/claude-cache on makes fetch wrapper set ttl on existing cache controls', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))

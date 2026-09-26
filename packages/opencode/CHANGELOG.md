@@ -4,12 +4,20 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+## 2.0.0
+
 ### Breaking Changes
 
 - Remove legacy capability-handle and manifest-based Claustrum custody. The plugin serves OAuth only via enrolled scoped credentials; old Claustrum configurations without `scopedRoster: true` fail closed until the offline `setup` wizard completes.
 
 ### Patch Changes
 
+- Exclude Opus 4.6 and 4.7 from fast mode: only Opus 4.8, Opus 5, and Opus 5.5 receive the `speed` field and beta header (#267).
+- On Opus 5.5, remove unsupported forced tool choice without removing the StructuredOutput tool; OpenCode accepts its validated schema result and fails closed when the model instead completes without it. Prefix named tool-choice references alongside tool definitions for other models (#268).
+- Keep the entire OpenCode unit-test environment under a disposable root, including fallback account/sidebar/cache/RPC paths and a nonexistent Claustrum connection. Setup detection respects its injected environment rather than consulting the operator's daemon (#264, #265).
+- Persist scoped main quotas with the vault's primary account identity, restore `/claude-quota` polling with scoped credentials, and discover model-scoped limits from usage polls even when response headers keep general windows fresh. A failed usage poll is bounded per account, without counting lock-losing contenders.
+- Log scoped OAuth 401 re-authorization decisions and delivered failure reports at debug level with record-version provenance but no bearer tokens.
+- Update scoped Claustrum transport through the shared 0.4.0 client; a daemon that does not serve the Claustrum module now fails without a futile reconnect.
 - Correct approved enrollment status in `/claude-account` and the TUI account dialog when the main account is vault-served; do not prompt configured users to rerun setup, and describe `enrollment-reset` as a state clear rather than an automatic retry.
 - Fix the packed CLI failing before `setup` under Node by externalizing `jsonc-parser` from the split bundle and checking a fresh packed CLI install in the smoke gate (#257).
 - Make Claustrum enrollment explicit: OpenCode boot and `/claude-account` no longer start proposals or per-process polling; status reads local state, and reset only clears terminal state. The setup wizard resumes interrupted enrollment and replaces a daemon-proven dead request at most once. Permanently refused requests now stop even if the client labels them retryable (#255).

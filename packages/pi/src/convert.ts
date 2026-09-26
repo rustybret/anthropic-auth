@@ -38,7 +38,7 @@ import {
   getCurrentSystemPrompt,
   getCurrentTools,
   normalizeContext,
-} from '@earendil-works/pi-ai'
+} from './transcript.ts'
 
 // Anchor identifying Pi's documentation paragraph — the only part of the prompt
 // that Anthropic currently rejects in system[]. Unknown prompt shapes take the
@@ -567,9 +567,10 @@ export async function buildAnthropicRequest(
   bodyText: string
   hostTools: Tool[]
 }> {
-  // Pi 0.86 passes a normalized transcript to providers. Resolve instructions,
-  // named sections and tool changes through its own replay helpers; raw host
-  // prompts (including ordered OMP blocks) still enter through normalization.
+  // Pi 0.86 passes a normalized transcript to providers, and later system
+  // messages can change the prompt, its named sections and the tool set. Resolve
+  // them through the local replay port; raw host prompts (including ordered OMP
+  // blocks) still enter through normalization.
   const transcript = collapseSystemMessages(
     normalizeContext({
       ...context,

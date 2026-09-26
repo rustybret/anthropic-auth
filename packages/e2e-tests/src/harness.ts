@@ -19,6 +19,7 @@ type SdkClient = {
         model: { providerID: string; modelID: string }
         parts: Array<{ type: 'text'; text: string }>
         variant?: string
+        format?: { type: 'json_schema'; schema: Record<string, unknown> }
       }
     }) => Promise<{ data?: unknown }>
     promptAsync: (options: {
@@ -136,6 +137,7 @@ export class E2EHarness {
     timeoutMs = 45_000,
     modelID = 'claude-sonnet-4-5',
     variant?: string,
+    format?: { type: 'json_schema'; schema: Record<string, unknown> },
   ) {
     const result = await this.withTimeout(
       this.client.session.prompt({
@@ -144,6 +146,7 @@ export class E2EHarness {
           model: { providerID: 'anthropic', modelID },
           parts: [{ type: 'text', text }],
           variant,
+          ...(format ? { format } : {}),
         },
       }),
       timeoutMs,

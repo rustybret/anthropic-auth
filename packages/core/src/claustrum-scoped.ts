@@ -7,6 +7,7 @@ import {
 import { CUSTODY_TOMBSTONE_PREFIX } from './claustrum.js'
 import { readClaustrumEnrollmentToken } from './claustrum-enrollment.js'
 import { parseJsonRedacted } from './json.js'
+import { logger } from './logger.js'
 
 export type ClaustrumScopedClient = Pick<
   ClaustrumClient,
@@ -39,6 +40,60 @@ export function isScopedCredentialRotation(
     current.accountId === served.accountId &&
     current.recordVersion !== served.recordVersion
   )
+}
+
+/** Send classes that retry once after a scoped 401, for diagnostics. */
+export type ScopedRetrySite =
+  | 'model'
+  | 'model-relay'
+  | 'cachekeep'
+  | 'prime'
+  | 'quota-profile'
+  | 'pi-model'
+  | 'pi-model-relay'
+  | 'pi-cachekeep'
+
+/** Why a scoped 401 did or did not retry. Never carries credential material. */
+export type ScopedRetryReason =
+  | 'rotated'
+  | 'reauthorize-failed'
+  | 'credential-changed'
+  | 'account-changed'
+  | 'version-unchanged'
+
+function scopedRetryReason(
+  served: ClaustrumScopedAttempt,
+  current: ClaustrumScopedAttempt | undefined,
+): ScopedRetryReason {
+  if (current === undefined) return 'reauthorize-failed'
+  if (current.credentialId !== served.credentialId) return 'credential-changed'
+  if (current.accountId !== served.accountId) return 'account-changed'
+  if (current.recordVersion === served.recordVersion) return 'version-unchanged'
+  return 'rotated'
+}
+
+/**
+ * Decide whether a request that got a 401 should retry with the freshly
+ * re-authorized receipt, and record the decision. The vault can refresh a
+ * credential between dispatch and the 401; this line is the consumer-side
+ * half of that timeline, pairing with the vault's refresh commit instant when
+ * a stale report has to be explained. Never logs credential material.
+ */
+export function decideScopedRetryAfter401(
+  site: ScopedRetrySite,
+  served: ClaustrumScopedAttempt,
+  current: ClaustrumScopedAttempt | undefined,
+): current is ClaustrumScopedAttempt {
+  const retry = isScopedCredentialRotation(served, current)
+  logger.debug('claustrum', 'scoped 401 re-authorized', {
+    site,
+    credentialId: served.credentialId,
+    servedVersion: served.recordVersion,
+    currentVersion: current?.recordVersion ?? null,
+    retry,
+    reason: scopedRetryReason(served, current),
+  })
+  return retry
 }
 
 const SERVING_MARGIN_MS = 300_000
@@ -266,6 +321,11 @@ export class ClaustrumScopedCustody {
     this.#reports.set(attempt, report)
     try {
       await report
+      logger.debug('claustrum', 'scoped 401 reported', {
+        credentialId: attempt.credentialId,
+        recordVersion: attempt.recordVersion,
+        reporterSource,
+      })
     } catch (error) {
       this.#reports.delete(attempt)
       throw error

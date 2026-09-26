@@ -50,6 +50,7 @@ import {
   createEmptyStorage,
   createStickyNoRouteResponse,
   type DumpHandle,
+  decideScopedRetryAfter401,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
   dumpDirectRequest,
@@ -118,7 +119,6 @@ import {
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
-  isScopedCredentialRotation,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -1388,10 +1388,35 @@ const anthropicAuthPlugin = async (
         model,
         credentialAccountUuid ?? mainSlotQuotaKey,
       )
-      // Non-oat adapters retain their local slot for quota fencing, but it is
-      // not a provider identity and must never reach a provider-facing field.
-      const quotaKey = mainSlotQuotaKey
       const currentStorage = await loadAccounts(accountStoragePath)
+      const scopedCustodyActive = isScopedCustodyActive(currentStorage)
+      const rosterPrimaryAccountId = scopedCustodyActive
+        ? currentStorage?.claustrum?.primaryAccount?.accountId
+        : undefined
+      // A scoped receipt may only bind quota to the account it was served
+      // for. If the roster primary or the custody mode changed after the
+      // receipt was issued, the receipt's quota must not land on the new
+      // account: fail closed without touching the global main identity.
+      if (
+        (scopedCustodyActive &&
+          (credentialAccountUuid === undefined ||
+            credentialAccountUuid !== rosterPrimaryAccountId)) ||
+        (!scopedCustodyActive && credentialAccountUuid !== undefined)
+      ) {
+        return {
+          quotaKey: undefined,
+          providerAccountUuid: undefined,
+          generation: quotaManager.getMainQuotaIdentityGeneration(),
+          stale: true,
+          state: 'on-identity-mismatch' as const,
+        }
+      }
+      // Scoped custody binds main runtime state to the roster's primary
+      // account id: core's state fence drops any main quota keyed otherwise,
+      // so a slot-keyed quota would never persist. Outside scoped custody,
+      // non-oat adapters keep their local slot for quota fencing; it is not a
+      // provider identity and must never reach a provider-facing field.
+      const quotaKey = rosterPrimaryAccountId ?? mainSlotQuotaKey
       const persistedProviderAccountUuid =
         currentStorage?.main?.profile?.providerAccountUuid ??
         (currentStorage?.main?.profile?.accountIdentity as
@@ -2265,9 +2290,11 @@ const anthropicAuthPlugin = async (
           ctx.directory,
         ).authorize(target.oauthAccountId ?? 'main', attempt.signal)
       } catch {
-        return undefined
+        // No verified replacement: fall through so the decision records
+        // reauthorize-failed, then keep the original 401.
       }
-      if (!isScopedCredentialRotation(served, current)) return undefined
+      if (!decideScopedRetryAfter401('cachekeep', served, current))
+        return undefined
       logger.info(
         'claustrum',
         'retrying CacheKeep after scoped credential rotation',
@@ -2423,7 +2450,14 @@ const anthropicAuthPlugin = async (
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const credential = await getCurrentMainCredential()
-    await resolveMainQuotaAccountIdentity(credential.accessToken)
+    const resolution = await resolveMainQuotaAccountIdentity(
+      credential.accessToken,
+      undefined,
+      credential.credentialAccountId,
+    )
+    if (resolution.stale && credential.credentialAccountId !== undefined) {
+      throw new Error('Main account identity changed before the prime refresh')
+    }
     // The quota transport obtains its own per-dispatch scoped receipt and
     // owns any 401 report. Reporting the earlier identity-preflight receipt
     // here would misattribute a rotation and potentially invalidate it.
@@ -2576,7 +2610,7 @@ const anthropicAuthPlugin = async (
           // The first 401 belongs to the original physical attempt unless
           // the vault confirms a newer version of this same account.
         }
-        if (isScopedCredentialRotation(scopedAttempt, current)) {
+        if (decideScopedRetryAfter401('prime', scopedAttempt, current)) {
           await response.body?.cancel().catch(() => {})
           logger.info(
             'claustrum',
@@ -3240,15 +3274,36 @@ const anthropicAuthPlugin = async (
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        if (auth.type === 'oauth' && auth.access) {
-          mainAccessToken = mainServedAccessToken ?? auth.access
-          await resolveMainQuotaAccountIdentity(mainAccessToken)
+        // Under scoped custody the host slot is a tombstone with empty access;
+        // main's credential comes from the vault per attempt instead.
+        const scopedMainCredential =
+          auth.type === 'oauth' &&
+          isScopedCustodyActive(await loadAccounts(accountStoragePath))
+            ? await getCurrentMainCredential()
+            : undefined
+        const commandAccessToken = scopedMainCredential
+          ? scopedMainCredential.accessToken
+          : auth.access
+            ? (mainServedAccessToken ?? auth.access)
+            : undefined
+        if (auth.type === 'oauth' && commandAccessToken) {
+          mainAccessToken = commandAccessToken
+          const resolution = await resolveMainQuotaAccountIdentity(
+            commandAccessToken,
+            undefined,
+            scopedMainCredential?.credentialAccountId,
+          )
+          if (resolution.stale && scopedMainCredential) {
+            throw new Error(
+              'Main account identity changed while checking quota; try again',
+            )
+          }
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.
           const quota = await quotaManager.refreshMain(
             mainQuotaAccountId,
-            mainAccessToken,
+            commandAccessToken,
           )
           accounts.push({
             name: 'OpenCode anthropic',
@@ -6098,7 +6153,13 @@ const anthropicAuthPlugin = async (
               } catch {
                 // Keep the 401 and report the exact relay-served record below.
               }
-              if (isScopedCredentialRotation(relay401Attempt, rotated)) {
+              if (
+                decideScopedRetryAfter401(
+                  'model-relay',
+                  relay401Attempt,
+                  rotated,
+                )
+              ) {
                 await response.body?.cancel().catch(() => {})
                 logger.info(
                   'claustrum',
@@ -6135,7 +6196,7 @@ const anthropicAuthPlugin = async (
               } catch {
                 // Preserve the genuine 401 if no replacement can be verified.
               }
-              if (isScopedCredentialRotation(directAttempt, rotated)) {
+              if (decideScopedRetryAfter401('model', directAttempt, rotated)) {
                 await response.body?.cancel().catch(() => {})
                 logger.info(
                   'claustrum',

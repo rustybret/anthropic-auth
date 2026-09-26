@@ -4,12 +4,21 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+## 2.0.0
+
 ### Breaking Changes
 
 - Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Remove Core's process-shared enrollment-registry export; host path resolution remains available through the Core enrollment module. Local OAuth and API-key routes are unaffected.
 
 ### Patch Changes
 
+- Stop sending `speed: "fast"` to Opus 4.7, where it returns 400, and Opus 4.6, where it has no effect. Fast mode now applies only to Opus 4.8, Opus 5, and Opus 5.5 in OpenCode and Pi (#267).
+- Remove Opus 5.5's unsupported forced `tool_choice` for OpenCode structured-output requests while retaining the schema tool. OpenCode still records validated structured output and reports an error if the model does not call it. Keep named `tool_choice` references aligned with prefixed tool definitions on other models (#268).
+- Isolate OpenCode tests from live account files, sidebar state, CacheKeep leases, RPC directories, and Claustrum sockets even when a test clears a feature-specific override. Setup detection now uses the supplied environment for its connection file (#264, #265).
+- Persist scoped main quota under the discovered primary account rather than the local host slot, and let `/claude-quota` poll with a freshly authorized scoped credential. A header-only main quota remains due for its first usage poll; failed polls are spaced by account without treating usage 403 as rate-limit backoff or counting requests that lose the cross-process refresh lock.
+- Load the Pi extension through Oh My Pi's legacy SDK compatibility layer by keeping transcript system-prompt and tool replay in the extension instead of importing helpers absent from the host. Check built Pi imports with a syntax-aware allowlist in CI and release workflows.
+- Add debug diagnostics for scoped 401 retry decisions and delivered failure reports across OpenCode and Pi, recording served and current record versions and a non-secret decision reason without logging bearer material.
+- Update the shared Claustrum client to 0.4.0 (with Subc client 0.16.x) for scoped custody. The client no longer reconnects on a terminal `unknown_module` response from a daemon without the Claustrum module.
 - Show an approved Claustrum enrollment as active in `/claude-account` and the account modal when the main account is vault-served; stop telling already configured users to rerun setup or request a grant. Clarify that `enrollment-reset` only clears terminal state.
 - Fix packed OpenCode CLI startup under Node: keep `jsonc-parser` external so its CommonJS `./impl/*` modules resolve from the installed dependency, and run the packed CLI's `--help` path alongside the TUI smoke gate (#257).
 - Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.

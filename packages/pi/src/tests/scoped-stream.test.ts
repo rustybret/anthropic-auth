@@ -3,11 +3,15 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
+  __setLogTestSink,
   type ClaustrumScopedClient,
+  getLogLevel,
+  type LogTestRecord,
   loadAccounts,
   saveAccounts,
   setAccountEnabledPersistent,
   setClaustrumModePersistent,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
   ClaustrumCredentialError,
@@ -570,14 +574,40 @@ test.each([200, 401])(
       },
       { preconnect: originalFetch.preconnect },
     )
-    const result = await streamCortexKitAnthropic(model, context, {
-      sessionId: 'pi-rotation',
-    }).result()
+    const records: LogTestRecord[] = []
+    const previousLevel = getLogLevel()
+    setLogLevel('debug')
+    __setLogTestSink((record) => records.push(record))
+    let result: Awaited<
+      ReturnType<ReturnType<typeof streamCortexKitAnthropic>['result']>
+    >
+    try {
+      result = await streamCortexKitAnthropic(model, context, {
+        sessionId: 'pi-rotation',
+      }).result()
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previousLevel)
+    }
     expect(result.stopReason).toBe(finalStatus === 401 ? 'error' : 'stop')
     expect(sent).toEqual(['Bearer rotated-pi-1', 'Bearer rotated-pi-2'])
     expect(gets).toEqual([1, 2])
     expect(f.reports.map((report) => report.recordVersion)).toEqual(
       finalStatus === 401 ? [2] : [],
+    )
+    // Pi's direct-model retry decision reaches the shared diagnostics line.
+    expect(
+      records
+        .filter((record) => record.message === 'scoped 401 re-authorized')
+        .map((record) => record.payload),
+    ).toContainEqual(
+      expect.objectContaining({
+        site: 'pi-model',
+        servedVersion: 1,
+        currentVersion: 2,
+        retry: true,
+        reason: 'rotated',
+      }),
     )
   },
 )

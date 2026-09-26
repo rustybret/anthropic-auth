@@ -62,7 +62,7 @@ anthropic-auth/
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, configurable Fable 5.1 prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, configurable Fable 5.1 prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `transcript.ts` (host-independent system-prompt and tool replay for Pi and Oh My Pi), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic, relay, and Claustrum servers
@@ -75,7 +75,7 @@ anthropic-auth/
 
 **`scripts/`:**
 - Purpose: Development, Arcus packaging, sync, and analysis utilities
-- Contains: `setup.sh` (toolchain bootstrap and symlink verification), `arcus-pipeline.sh` (symlinked unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager with sequence auto-allocation and self-test verification), Arcus v3 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`, `arcus-toolchain.json`), `fork-sync.sh` / `fork-sync-exclusions` / `fork-sync.test.ts` (upstream fork-synchronization automation with automated `bun install` dependency hydration), `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `check-claustrum-golden.ts` (pins canonical Claustrum tombstone ancestry and exact fixture bytes), `check-pi-tool-mapping.ts` (runs an isolated real Pi host tool round-trip against deterministic SSE), `check-test-count-floors.ts` (runs unit suites once; compares floors against the merge target in PR CI and the previous version tag at release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `workspace-lock.mjs` (manifest-to-lock validation)
+- Contains: `setup.sh` (toolchain bootstrap and symlink verification), `arcus-pipeline.sh` (symlinked unified lifecycle dispatcher), `pack-arcus.sh` / `pack-arcus.test.ts` (Arcus distribution packager with sequence auto-allocation and self-test verification), Arcus v3 lifecycle script symlinks (`sign-arcus.sh`, `validate-arcus.sh`, `publish-arcus.sh`, `migrate-arcus.sh`, `arcus-toolchain.json`), `fork-sync.sh` / `fork-sync-exclusions` / `fork-sync.test.ts` (upstream fork-synchronization automation with automated `bun install` dependency hydration), `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `check-claustrum-golden.ts` (pins canonical Claustrum tombstone ancestry and exact fixture bytes), `check-pi-tool-mapping.ts` (runs an isolated real Pi host tool round-trip against deterministic SSE), `check-pi-dist-imports.ts` (AST-validates emitted Pi host-SDK imports, rejecting unsupported or unverifiable dynamic imports in CI and release), `check-test-count-floors.ts` (runs unit suites once; compares floors against the merge target in PR CI and the previous version tag at release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `workspace-lock.mjs` (manifest-to-lock validation)
 
 ## Key File Locations
 
@@ -155,14 +155,15 @@ anthropic-auth/
 - `packages/pi/src/commands.ts`: Pi slash command registration (`/claude-*`) and persistent setting handlers
 - `packages/pi/src/paths.ts`: Pi-specific storage and config path resolution
 - `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including ordered system prompt block flattening, session-stable Claude Code billing suffixes, same-origin thinking-signature replay, configurable Fable 5.1 compaction behavior, mid-conversation effort markers, redacted_thinking mapping, Pi documentation-prompt relocation, and four-slot cache breakpoint placement
+- `packages/pi/src/transcript.ts`: Locally replays host system messages and tool changes rather than importing helpers absent from Oh My Pi's legacy SDK shim
 - `packages/pi/src/effort-history.ts`: Rebuilds Fable 5.1 effort transitions from Pi's active branch and compaction-aware context entries (locally derived when buildContextEntries is absent)
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation, including preservation of Anthropic redacted-thinking blocks for later replay, request-resolved host tool names for SSE tool-call mapping, API-key route versioned URL composition, and safe custom header application
 
 **Tests:**
 - `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces, accounts persistence, custom headers, model remap, claustrum)
-- `packages/opencode/src/tests/`: One test file per module (50+ test files covering core + opencode), including Claustrum client/custody, credential-handle blindness, billing lineage tracking, and fail-closed network-guard suites
+- `packages/opencode/src/tests/`: OpenCode unit and integration tests, including scoped Claustrum custody, billing lineage, a fail-closed network guard, and test-host filesystem/daemon isolation. `preload-sandbox.ts` initializes a disposable sandbox before `setup.ts` imports Core (whose logger/dump defaults are fixed at module load), then `setup.ts` restores account, sidebar, cache, RPC, dump, and daemon paths before/after tests so clearing a feature override cannot reach live state.
 - `packages/pi/src/tests/`: Pi-specific tests (commands, convert, effort-history, index, stream)
-- `packages/e2e-tests/tests/`: Integration tests (tool prefix, quota header relay, temp directory hygiene, custody mode, mock claustrum)
+- `packages/e2e-tests/tests/`: Process integration tests (tool prefix, quota header relay, temp directory hygiene, scoped custody, and Opus 5.5 structured output with and without the schema tool call)
 
 ## Naming Conventions
 

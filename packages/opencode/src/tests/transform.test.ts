@@ -102,6 +102,37 @@ describe('mergeHeaders', () => {
   })
 })
 
+describe('fast mode model eligibility', () => {
+  test.each([
+    ['claude-opus-4-6', false],
+    ['claude-opus-4-7', false],
+    ['claude-opus-4-7[1m]', false],
+    ['claude-opus-4-8', true],
+    ['claude-opus-5', true],
+    ['claude-opus-5-5', true],
+  ])(
+    'only eligible models receive speed and its beta on %s',
+    async (model, enabled) => {
+      const body = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            max_tokens: 10,
+            speed: 'fast',
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+          { fastModeEnabled: true },
+        ),
+      )
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'fixture-token', { body })
+      expect(body.speed).toBe(enabled ? 'fast' : undefined)
+      const betas = headers.get('anthropic-beta')?.split(',') ?? []
+      expect(betas.includes(FAST_MODE_BETA)).toBe(enabled)
+    },
+  )
+})
+
 describe('lane start request shaping', () => {
   const laneStartBody = (
     model: string,
@@ -798,6 +829,21 @@ describe('prefixToolNames', () => {
     const result = JSON.parse(prefixToolNames(body))
     expect(result.tools[0].name).toBe('mcp_Read_file')
     expect(result.tools[1].name).toBe('mcp_Write_file')
+  })
+
+  test('prefixes a named tool choice consistently with its tool definition', () => {
+    const result = JSON.parse(
+      prefixToolNames({
+        model: 'claude-opus-5',
+        tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+        tool_choice: { type: 'tool', name: 'get_weather' },
+      }),
+    )
+    expect(result.tools[0].name).toBe('mcp_Get_weather')
+    expect(result.tool_choice).toEqual({
+      type: 'tool',
+      name: 'mcp_Get_weather',
+    })
   })
 
   test('prefixes tool_use block names in messages', () => {
@@ -4520,6 +4566,57 @@ describe('sanitizeSystemText – realistic prompt', () => {
 })
 
 describe('Claude Opus 5.5 request transform', () => {
+  test.each([
+    ['claude-opus-5-5', { type: 'any' }],
+    ['claude-opus-5-5[1m]', { type: 'any' }],
+    ['claude-opus-5-5-20260918', { type: 'tool', name: 'StructuredOutput' }],
+  ])(
+    'removes forced tool choice rejected by %s without dropping tools',
+    async (model, toolChoice) => {
+      const body = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            thinking: { type: 'disabled' },
+            tool_choice: toolChoice,
+            tools: [
+              { name: 'StructuredOutput', input_schema: { type: 'object' } },
+            ],
+            messages: [{ role: 'user', content: 'return structured output' }],
+          }),
+        ),
+      )
+      expect(body.tool_choice).toBeUndefined()
+      expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+      expect(body.tools[0].name).toBe('mcp_StructuredOutput')
+    },
+  )
+
+  test('preserves optional and unforced tool choices on Opus 5.5', async () => {
+    for (const type of ['auto', 'none']) {
+      const body = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-opus-5-5',
+            tool_choice: { type },
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        ),
+      )
+      expect(body.tool_choice).toEqual({ type })
+    }
+    const opus5 = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-opus-5',
+          tool_choice: { type: 'any' },
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      ),
+    )
+    expect(opus5.tool_choice).toEqual({ type: 'any' })
+  })
+
   test('rewrites disabled thinking to adaptive summarized on Opus 5.5', async () => {
     const raw = JSON.stringify({
       model: 'claude-opus-5-5',

@@ -207,6 +207,15 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
     )
   }
 
+  const toolChoice = parsed.tool_choice
+  if (
+    isRecord(toolChoice) &&
+    toolChoice.type === 'tool' &&
+    typeof toolChoice.name === 'string'
+  ) {
+    parsed.tool_choice = { ...toolChoice, name: prefixName(toolChoice.name) }
+  }
+
   if (parsed.messages && Array.isArray(parsed.messages)) {
     parsed.messages = parsed.messages.map(
       (msg: {
@@ -1004,6 +1013,16 @@ function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {
   return removed
 }
 
+function removeUnsupportedForcedToolChoice(parsed: Record<string, unknown>) {
+  const toolChoice = parsed.tool_choice
+  if (
+    isRecord(toolChoice) &&
+    (toolChoice.type === 'any' || toolChoice.type === 'tool')
+  ) {
+    delete parsed.tool_choice
+  }
+}
+
 function normalizeFableMythosRequest(
   parsed: Record<string, unknown>,
 ): { replacedExisting: boolean } | null {
@@ -1011,13 +1030,7 @@ function normalizeFableMythosRequest(
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   parsed.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   if (isClaudeFableOrMythos51Model(parsed.model)) {
-    const toolChoice = parsed.tool_choice
-    if (
-      isRecord(toolChoice) &&
-      (toolChoice.type === 'any' || toolChoice.type === 'tool')
-    ) {
-      delete parsed.tool_choice
-    }
+    removeUnsupportedForcedToolChoice(parsed)
   }
   return { replacedExisting: hadThinking }
 }
@@ -1062,6 +1075,9 @@ function normalizeOpus5Request(
   parsed: Record<string, unknown>,
 ): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
   if (isClaudeOpus55Model(parsed.model)) {
+    // Opus 5.5 rejects forced tool choice, including OpenCode's
+    // `required` setting for its StructuredOutput tool.
+    removeUnsupportedForcedToolChoice(parsed)
     // Opus 5.5 has adaptive thinking ALWAYS ON: setting `type: "disabled"` or manual
     // `budget_tokens` returns a 400 invalid_request_error. Rewrite to adaptive summarized.
     const hadThinking = Object.hasOwn(parsed, 'thinking')
