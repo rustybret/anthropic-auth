@@ -4526,6 +4526,24 @@ describe('provider.models', () => {
     })
     expect(result?.['claude-mythos-5-1']?.variants).toBeUndefined()
     expect(result?.['claude-mythos-5-1']?.name).toBe('Claude Mythos 5.1')
+    expect(result?.['claude-sonnet-5-5']?.api?.id).toBe('claude-sonnet-5-5')
+    expect(result?.['claude-sonnet-5-5']?.release_date).toBe('2026-09-28')
+    expect(result?.['claude-sonnet-5-5']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+    expect(result?.['claude-sonnet-5-5']?.limit).toMatchObject({
+      context: 1_000_000,
+      output: 128_000,
+    })
+    expect(Object.keys(result?.['claude-sonnet-5-5']?.variants ?? {})).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
     expect(models['claude-opus-4-8'].cost).toEqual({
       input: 5,
       output: 25,
@@ -4573,6 +4591,11 @@ describe('provider.models', () => {
       output: 50,
       cache: { read: 0.25, write: 12.5 },
     })
+    expect(result?.['claude-sonnet-5-5']?.cost).toEqual({
+      input: 2,
+      output: 10,
+      cache: { read: 0.2, write: 2.5 },
+    })
   })
 
   test('replaces stale Opus 5 manual-thinking variants with adaptive efforts', async () => {
@@ -4603,6 +4626,10 @@ describe('provider.models', () => {
     )
 
     expect(result?.['claude-opus-5-5']?.name).toBe('Claude Opus 5.5')
+    expect(result?.['claude-sonnet-5-5']?.name).toBe('Claude Sonnet 5.5')
+    expect(result?.['claude-sonnet-5-5']?.variants).toEqual(
+      result?.['claude-opus-5']?.variants,
+    )
     expect(result?.['claude-opus-5-5']?.variants).toEqual(
       result?.['claude-opus-5']?.variants,
     )

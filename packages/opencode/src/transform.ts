@@ -13,6 +13,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
+  CLAUDE_SONNET_5_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
@@ -23,6 +24,7 @@ import {
   isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet5Model,
+  isClaudeSonnet55Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
@@ -1036,23 +1038,43 @@ function normalizeFableMythosRequest(
 }
 
 /**
- * Sonnet 5 has adaptive thinking on by default but defaults `display` to
- * "omitted", so the thinking field returns empty. Inject
- * `{type:"adaptive",display:"summarized"}` to make it visible — UNLESS the
- * caller explicitly disabled thinking. Unlike Fable/Mythos (which reject a
- * disable), Sonnet 5 accepts `{type:"disabled"}`, so an intentional opt-out is
- * preserved rather than force-enabled. A manual `{type:"enabled",budget_tokens}`
- * would 400 on Sonnet 5, so it is overwritten with the adaptive form.
+ * Sonnet 5 accepts disabled thinking, but Sonnet 5.5 instead requires the
+ * bare between_tools mode for an explicit opt-out (at effort high or below).
+ * Neither model returns readable thinking by default. Request summaries so
+ * the host can display adaptive reasoning.
  */
-function normalizeSonnet5Request(
-  parsed: Record<string, unknown>,
-): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+function normalizeSonnet5FamilyRequest(parsed: Record<string, unknown>): {
+  replacedExisting: boolean
+  display: 'summarized' | 'disabled' | 'between_tools'
+} | null {
+  if (isClaudeSonnet55Model(parsed.model)) {
+    removeUnsupportedForcedToolChoice(parsed)
+    const hadThinking = Object.hasOwn(parsed, 'thinking')
+    const thinking = parsed.thinking
+    if (
+      isRecord(thinking) &&
+      (thinking.type === 'disabled' || thinking.type === 'between_tools')
+    ) {
+      // Sonnet 5.5 rejects `disabled`. Convert either opt-out to bare
+      // `between_tools`, which rejects display and block_binding fields,
+      // and cap unsupported xhigh/max effort at high.
+      parsed.thinking = { type: 'between_tools' }
+      const outputConfig = parsed.output_config
+      if (
+        isRecord(outputConfig) &&
+        (outputConfig.effort === 'xhigh' || outputConfig.effort === 'max')
+      ) {
+        outputConfig.effort = 'high'
+      }
+      return { replacedExisting: hadThinking, display: 'between_tools' }
+    }
+    parsed.thinking = { ...CLAUDE_SONNET_5_5_ADAPTIVE_THINKING }
+    return { replacedExisting: hadThinking, display: 'summarized' }
+  }
   if (!isClaudeSonnet5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   const thinking = parsed.thinking
   if (isRecord(thinking) && thinking.type === 'disabled') {
-    // `display` is invalid alongside `type:"disabled"` (nothing to display) and
-    // can 400; canonicalize to a bare disabled object while keeping thinking off.
     parsed.thinking = { type: 'disabled' }
     return { replacedExisting: hadThinking, display: 'disabled' }
   }
@@ -1561,7 +1583,7 @@ export async function rewriteRequestBody(
       options.serverSideFallbackEnabled === true,
     )
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
-    const sonnet5Thinking = normalizeSonnet5Request(parsed)
+    const sonnet5Thinking = normalizeSonnet5FamilyRequest(parsed)
     const opus5Thinking = normalizeOpus5Request(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),

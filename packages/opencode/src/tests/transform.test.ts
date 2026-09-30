@@ -555,6 +555,64 @@ describe('setOAuthHeaders', () => {
     )
   })
 
+  test('binds adaptive Sonnet 5.5 and Opus 5.5 thinking only on replay, never on between_tools', async () => {
+    const signedHistory = [
+      { role: 'user', content: 'hello' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 'signature' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'continue' },
+    ]
+    for (const model of ['claude-sonnet-5-5', 'claude-opus-5-5']) {
+      const first = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+          { thinkingPrefixMismatchBehavior: 'drop_block' },
+        ),
+      )
+      expect(first.thinking.block_binding).toBeUndefined()
+      const adaptive = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({ model, messages: signedHistory }),
+          { thinkingPrefixMismatchBehavior: 'drop_block' },
+        ),
+      )
+      expect(adaptive.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+        block_binding: { prefix_mismatch_behavior: 'drop_block' },
+      })
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', { body: adaptive })
+      expect(headers.get('anthropic-beta')).toContain(
+        'thinking-binding-controls-2026-08-01',
+      )
+    }
+    const betweenTools = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-sonnet-5-5',
+          thinking: { type: 'disabled' },
+          messages: signedHistory,
+        }),
+        { thinkingPrefixMismatchBehavior: 'drop_block' },
+      ),
+    )
+    expect(betweenTools.thinking).toEqual({ type: 'between_tools' })
+    const headers = new Headers()
+    setOAuthHeaders(headers, 'token', { body: betweenTools })
+    expect(headers.get('anthropic-beta')).not.toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
+  })
+
   test('keeps signed Fable 5.1 history on the account default unless configured', async () => {
     const signedHistory = [
       { role: 'user', content: 'hello' },
@@ -2718,6 +2776,46 @@ describe('rewriteRequestBody', () => {
     const result = JSON.parse(await rewriteRequestBody(body))
 
     expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('Sonnet 5.5 preserves adaptive summaries, max effort, and qualified model IDs', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-sonnet-5-5[1m]',
+          messages: [{ role: 'user', content: 'hi' }],
+          thinking: { type: 'enabled', budget_tokens: 1024 },
+          output_config: { effort: 'max' },
+          tools: [
+            { name: 'StructuredOutput', input_schema: { type: 'object' } },
+          ],
+          tool_choice: { type: 'tool', name: 'StructuredOutput' },
+        }),
+      ),
+    )
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(result.output_config).toEqual({ effort: 'max' })
+    expect(result.tool_choice).toBeUndefined()
+    expect(result.tools).toHaveLength(1)
+  })
+
+  test('Sonnet 5.5 maps explicit disabled thinking to bare between_tools at supported effort', async () => {
+    for (const effort of ['high', 'xhigh', 'max']) {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-sonnet-5-5',
+            messages: [{ role: 'user', content: 'hi' }],
+            thinking: { type: 'disabled', display: 'summarized' },
+            output_config: { effort },
+            tool_choice: { type: 'any' },
+          }),
+        ),
+      )
+      expect(result.thinking).toEqual({ type: 'between_tools' })
+      expect(result.output_config.effort).toBe('high')
+      expect(result.tool_choice).toBeUndefined()
+    }
   })
 
   test('does not touch thinking for non-Sonnet5 models', async () => {

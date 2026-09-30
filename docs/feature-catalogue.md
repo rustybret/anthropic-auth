@@ -46,8 +46,8 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
   `rewriteRequestBody()` pipeline: strip trailing assistant msgs and foreign thinking → opt eligible
   Fable 5/5.1 or Opus 5 OAuth calls into server-side safety fallback and restore boundary markers →
   normalize Fable/Mythos 5/5.1 thinking → preserve Fable 5.1 per-turn effort changes with cache-stable
-  empty system markers recovered from request-correlated user-boundary markers that survive OpenCode host lowering and downstream transform persistence → conditionally attach configured Fable 5.1 thinking-prefix behavior for replayed
-  signed/redacted blocks → inject the Claude Code 2.1.258 billing header with a session-pinned
+  empty system markers recovered from request-correlated user-boundary markers that survive OpenCode host lowering and downstream transform persistence → conditionally attach configured Fable 5.1/Opus 5.5/Sonnet 5.5 adaptive-thinking prefix behavior for replayed
+  signed/redacted blocks → inject the Claude Code 2.1.280 billing header with a session-pinned
   suffix → sanitize system prompt (remove OpenCode identity, prepend Claude Code identity;
   `sanitize-memo.ts` memoized + `prompt-context.ts`) → apply cache strategy → add fast mode → prefix tool
   names `mcp_` → sign the final body with `cch` (xxhash). `createStrippedStream()` reverses

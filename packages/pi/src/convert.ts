@@ -9,6 +9,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
+  CLAUDE_SONNET_5_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
@@ -16,6 +17,7 @@ import {
   isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet5Model,
+  isClaudeSonnet55Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   type MidConversationEffortTransition,
@@ -654,17 +656,17 @@ export async function buildAnthropicRequest(
 
   const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
   const isSonnet5 = isClaudeSonnet5Model(modelId)
+  const isSonnet55 = isClaudeSonnet55Model(modelId)
   const isOpus5 = isClaudeOpus5Model(modelId)
   const isOpus55 = isClaudeOpus55Model(modelId)
-  // Sonnet 5, Opus 5, and Opus 5.5 share Fable/Mythos's adaptive-summarized contract: make
-  // adaptive thinking visible (display defaults to "omitted") and map reasoning
-  // to output_config effort. Pi's typed options cannot express
-  // thinking-disabled, so there is no disable case here (see transform.ts for
-  // the raw-body path). Each model refs its own per-family constant —
-  // families can diverge, so the constant rather than a shared alias keeps
-  // the call sites explicit.
+  // Request summaries so the host can display adaptive reasoning.
+  // Pi's typed options cannot express the disabled-thinking setting;
+  // OpenCode handles it by transforming the raw request body. Separate model
+  // constants let each model's thinking configuration change independently.
   if (isFableOrMythos5) {
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  } else if (isSonnet55) {
+    body.thinking = { ...CLAUDE_SONNET_5_5_ADAPTIVE_THINKING }
   } else if (isSonnet5) {
     body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
   } else if (isOpus55) {
@@ -674,7 +676,10 @@ export async function buildAnthropicRequest(
   }
 
   if (options?.reasoning) {
-    if (isFableOrMythos5 || isSonnet5 || isOpus5 || isOpus55) {
+    if (isSonnet55 && options.reasoning === 'minimal') {
+      throw new Error('Claude Sonnet 5.5 does not support minimal effort')
+    }
+    if (isFableOrMythos5 || isSonnet5 || isSonnet55 || isOpus5 || isOpus55) {
       body.output_config = { effort: options.reasoning }
     } else {
       const budgets: Record<string, number> = {

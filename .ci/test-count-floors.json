@@ -1,17 +1,17 @@
 {
   "floors": {
-    "core": 302,
-    "opencode": 1700,
-    "pi": 145
+    "core": 309,
+    "opencode": 1703,
+    "pi": 149
   },
   "measurement": {
-    "head": "c0052410b5a58dc1116b1b53512f0ddacea4306e",
+    "head": "297ac373da93fbd37ecd1682e55a5e993becbf47",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "Pinned Bun 1.3.14 runner totals after the scoped-only cutover. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
-    "core": "302 passing on clean CI run 36175474561 at commit c0052410",
-    "opencode": "1700 passing on clean CI run 36175474561 at commit c0052410",
-    "pi": "145 passing on clean CI run 36175474561 at commit c0052410"
+    "_note": "Pinned Bun 1.3.14 runner totals after Sonnet 5.5 support and replayed-thinking controls. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
+    "core": "309 passing on clean CI run 36648574283 at commit 297ac373",
+    "opencode": "1703 passing on clean CI run 36648574283 at commit 297ac373",
+    "pi": "149 passing on clean CI run 36648574283 at commit 297ac373"
   }
 }

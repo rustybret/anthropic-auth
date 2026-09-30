@@ -4,6 +4,10 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Features
+
+- Publish Claude Sonnet 5.5 with its native API ID, official 1M/128K limits and pricing, and adaptive `low`–`max` effort variants. Preserve explicit no-up-front-thinking requests as bare `between_tools` at effort `high` or below, remove forced tool choice while retaining structured-output validation, and allow configured adaptive-thinking prefix controls on Sonnet 5.5 and Opus 5.5 continuations.
+
 ## 2.0.0
 
 ### Breaking Changes

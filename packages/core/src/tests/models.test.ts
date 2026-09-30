@@ -14,6 +14,12 @@ import {
   CLAUDE_OPUS_5_5_PRICING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_MODEL_ID,
+  CLAUDE_SONNET_5_5_ADAPTIVE_THINKING,
+  CLAUDE_SONNET_5_5_CONTEXT_WINDOW,
+  CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_SONNET_5_5_MODEL_ID,
+  CLAUDE_SONNET_5_5_PRICING,
+  CLAUDE_SONNET_5_5_RELEASE_DATE,
   getClaudeFableMythos5ReleaseDate,
   isClaudeFable51Model,
   isClaudeFableOrMythos5Model,
@@ -21,6 +27,7 @@ import {
   isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet5Model,
+  isClaudeSonnet55Model,
   normalizeAnthropicModelId,
 } from '../models'
 
@@ -108,6 +115,12 @@ describe('isClaudeSonnet5Model', () => {
     expect(isClaudeSonnet5Model('claude-sonnet-4-6')).toBe(false)
   })
 
+  test('does not match Sonnet 5.5 despite sharing the Sonnet 5 prefix', () => {
+    expect(isClaudeSonnet5Model('claude-sonnet-5-5')).toBe(false)
+    expect(isClaudeSonnet5Model('claude-sonnet-5-5[1m]')).toBe(false)
+    expect(isClaudeSonnet5Model('claude-sonnet-5-5-20260928')).toBe(false)
+  })
+
   test('does not match the Fable/Mythos ids', () => {
     expect(isClaudeSonnet5Model('claude-fable-5')).toBe(false)
     expect(isClaudeSonnet5Model('claude-mythos-5')).toBe(false)
@@ -120,6 +133,46 @@ describe('isClaudeSonnet5Model', () => {
   test('does not match non-string input', () => {
     expect(isClaudeSonnet5Model(undefined)).toBe(false)
     expect(isClaudeSonnet5Model(42)).toBe(false)
+  })
+})
+
+describe('Claude Sonnet 5.5 model', () => {
+  test('uses Anthropic model metadata and actual API prices', () => {
+    expect(CLAUDE_SONNET_5_5_MODEL_ID).toBe('claude-sonnet-5-5')
+    expect(CLAUDE_SONNET_5_5_RELEASE_DATE).toBe('2026-09-28')
+    expect(CLAUDE_SONNET_5_5_CONTEXT_WINDOW).toBe(1_000_000)
+    expect(CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS).toBe(128_000)
+    expect(CLAUDE_SONNET_5_5_PRICING).toEqual({
+      input: 2,
+      output: 10,
+      cacheRead: 0.2,
+      cacheWrite5m: 2.5,
+      cacheWrite1h: 4,
+    })
+    expect(CLAUDE_SONNET_5_5_ADAPTIVE_THINKING).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+    })
+  })
+
+  test('recognizes exact, context-qualified, and dated model IDs only', () => {
+    for (const model of [
+      'claude-sonnet-5-5',
+      'claude-sonnet-5-5[1m]',
+      'claude-sonnet-5-5-20260928',
+    ]) {
+      expect(isClaudeSonnet55Model(model)).toBe(true)
+      expect(isClaudeSonnet5Model(model)).toBe(false)
+    }
+    for (const model of [
+      'claude-sonnet-5',
+      'claude-sonnet-5-20260630',
+      'claude-opus-5-5',
+      'claude-sonnet-5-50',
+      null,
+    ]) {
+      expect(isClaudeSonnet55Model(model)).toBe(false)
+    }
   })
 })
 

@@ -85,6 +85,30 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     })
   })
 
+  test('exposes Claude Sonnet 5.5 with native limits and prices', async () => {
+    const { pi, providers } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+
+    const sonnet55 = providers
+      .get('anthropic')
+      ?.models?.find((model) => model.id === 'claude-sonnet-5-5')
+    expect(sonnet55).toMatchObject({
+      id: 'claude-sonnet-5-5',
+      name: 'Claude Sonnet 5.5',
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        xhigh: 'xhigh',
+        max: 'max',
+      },
+      input: ['text', 'image'],
+      cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+    })
+  })
+
   test('exposes Claude Fable and Mythos 5.1 in the Pi Anthropic catalog', async () => {
     const { pi, providers } = mockPi()
 

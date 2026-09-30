@@ -117,3 +117,51 @@ describe('Fable 5.1 thinking binding controls', () => {
     ).toBe('account-default')
   })
 })
+
+describe('Sonnet 5.5 thinking binding controls', () => {
+  test('only explicit behavior with replayed thinking on adaptive requests adds the control', () => {
+    for (const block of [
+      { type: 'thinking', thinking: '', signature: 'signed' },
+      { type: 'redacted_thinking', data: 'redacted-payload' },
+    ]) {
+      const body = bodyWith('claude-sonnet-5-5[1m]', block)
+      expect(applyThinkingBindingControls(body, 'account-default')).toBe(false)
+      expect(body.thinking.block_binding).toBeUndefined()
+      expect(applyThinkingBindingControls(body, 'drop_block')).toBe(true)
+      expect(body.thinking.block_binding).toEqual({
+        prefix_mismatch_behavior: 'drop_block',
+      })
+    }
+  })
+
+  test('never puts block_binding on between_tools', () => {
+    const body = bodyWith('claude-sonnet-5-5', {
+      type: 'thinking',
+      thinking: '',
+      signature: 'signed',
+    })
+    body.thinking.type = 'between_tools'
+    expect(applyThinkingBindingControls(body, 'drop_block')).toBe(false)
+    expect(body.thinking.block_binding).toBeUndefined()
+  })
+
+  test('does not apply Sonnet 5.5 controls to Sonnet 5', () => {
+    const body = bodyWith('claude-sonnet-5', {
+      type: 'thinking',
+      thinking: '',
+      signature: 'signed',
+    })
+    expect(applyThinkingBindingControls(body, 'drop_block')).toBe(false)
+  })
+})
+
+test('Opus 5.5 uses the same explicit adaptive-thinking prefix control', () => {
+  const body = bodyWith('claude-opus-5-5', {
+    type: 'redacted_thinking',
+    data: 'redacted-payload',
+  })
+  expect(applyThinkingBindingControls(body, 'error')).toBe(true)
+  expect(body.thinking.block_binding).toEqual({
+    prefix_mismatch_behavior: 'error',
+  })
+})

@@ -146,8 +146,34 @@ export function isClaudeSonnet5Model(model: unknown) {
   if (typeof model !== 'string') return false
   const normalized = normalizeAnthropicModelId(model)
   return (
-    normalized === CLAUDE_SONNET_5_MODEL_ID ||
-    normalized.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`)
+    !isClaudeSonnet55Model(normalized) &&
+    (normalized === CLAUDE_SONNET_5_MODEL_ID ||
+      normalized.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`))
+  )
+}
+
+export const CLAUDE_SONNET_5_5_MODEL_ID = 'claude-sonnet-5-5'
+export const CLAUDE_SONNET_5_5_RELEASE_DATE = '2026-09-28'
+export const CLAUDE_SONNET_5_5_CONTEXT_WINDOW = 1_000_000
+export const CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS = 128_000
+
+export const CLAUDE_SONNET_5_5_PRICING = {
+  input: 2,
+  output: 10,
+  cacheRead: 0.2,
+  cacheWrite5m: 2.5,
+  cacheWrite1h: 4,
+} as const
+
+export const CLAUDE_SONNET_5_5_ADAPTIVE_THINKING =
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
+
+export function isClaudeSonnet55Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return (
+    normalized === CLAUDE_SONNET_5_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_SONNET_5_5_MODEL_ID}-`)
   )
 }
 

@@ -36,6 +36,11 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  CLAUDE_SONNET_5_5_CONTEXT_WINDOW,
+  CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_SONNET_5_5_MODEL_ID,
+  CLAUDE_SONNET_5_5_PRICING,
+  CLAUDE_SONNET_5_5_RELEASE_DATE,
   CLAUDE_START_COMMAND_NAME,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   type ClaustrumScopedAttempt,
@@ -108,6 +113,7 @@ import {
   isClaudeOpus5FamilyModel,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
+  isClaudeSonnet55Model,
   isCostZeroingEnabled,
   isCustodyTombstoneOAuth,
   isDumpPersistentlyEnabled,
@@ -848,7 +854,7 @@ type AnthropicProviderModel = {
   [key: string]: unknown
 }
 
-function addFableMythos5Models<
+function addNativeClaudeModels<
   T extends Record<string, AnthropicProviderModel>,
 >(models: T) {
   const base =
@@ -895,6 +901,39 @@ function addFableMythos5Models<
         ]
       }),
     ),
+    ...(models[CLAUDE_SONNET_5_5_MODEL_ID]
+      ? {}
+      : {
+          [CLAUDE_SONNET_5_5_MODEL_ID]: {
+            ...base,
+            id: CLAUDE_SONNET_5_5_MODEL_ID,
+            name: 'Claude Sonnet 5.5',
+            api: base.api
+              ? { ...base.api, id: CLAUDE_SONNET_5_5_MODEL_ID }
+              : undefined,
+            cost: {
+              input: CLAUDE_SONNET_5_5_PRICING.input,
+              output: CLAUDE_SONNET_5_5_PRICING.output,
+              cache: {
+                read: CLAUDE_SONNET_5_5_PRICING.cacheRead,
+                write: CLAUDE_SONNET_5_5_PRICING.cacheWrite5m,
+              },
+            },
+            limit: {
+              ...(base.limit ?? {}),
+              context: CLAUDE_SONNET_5_5_CONTEXT_WINDOW,
+              output: CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
+            },
+            capabilities: {
+              ...(base.capabilities ?? {}),
+              reasoning: true,
+              attachment: true,
+              toolcall: true,
+            },
+            release_date: CLAUDE_SONNET_5_5_RELEASE_DATE,
+            variants: createNativeAdaptiveEffortVariants(),
+          },
+        }),
     ...(models[CLAUDE_OPUS_5_5_MODEL_ID]
       ? {}
       : {
@@ -925,17 +964,23 @@ function addFableMythos5Models<
               toolcall: true,
             },
             release_date: CLAUDE_OPUS_5_5_RELEASE_DATE,
-            variants: createClaudeOpus5Variants(),
+            variants: createNativeAdaptiveEffortVariants(),
           },
         }),
   } as T
 }
 
-const CLAUDE_OPUS_5_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+const CLAUDE_NATIVE_ADAPTIVE_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
 
-function createClaudeOpus5Variants() {
+function createNativeAdaptiveEffortVariants() {
   return Object.fromEntries(
-    CLAUDE_OPUS_5_EFFORTS.map((effort) => [
+    CLAUDE_NATIVE_ADAPTIVE_EFFORTS.map((effort) => [
       effort,
       {
         thinking: { type: 'adaptive', display: 'summarized' },
@@ -953,8 +998,10 @@ function applyNativeAdaptiveEffortVariants<
       const modelId = model.api?.id ?? model.id ?? id
       return [
         id,
-        isClaudeOpus5FamilyModel(modelId) || isClaudeFable51Model(modelId)
-          ? { ...model, variants: createClaudeOpus5Variants() }
+        isClaudeOpus5FamilyModel(modelId) ||
+        isClaudeFable51Model(modelId) ||
+        isClaudeSonnet55Model(modelId)
+          ? { ...model, variants: createNativeAdaptiveEffortVariants() }
           : model,
       ]
     }),
@@ -4772,7 +4819,7 @@ const anthropicAuthPlugin = async (
         context: { auth?: { type?: string } },
       ) {
         const models = applyNativeAdaptiveEffortVariants(
-          addFableMythos5Models(provider.models),
+          addNativeClaudeModels(provider.models),
         )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
         // Opt out via persisted config costZeroing.enabled=false to show real costs.

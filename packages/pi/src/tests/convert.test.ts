@@ -699,6 +699,67 @@ describe('buildAnthropicRequest — Sonnet 5 thinking', () => {
   })
 })
 
+describe('buildAnthropicRequest — Sonnet 5.5 thinking', () => {
+  test('sends adaptive summaries and native effort for Sonnet 5.5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-5-5',
+      { messages: [userMsg('hello')], tools: [] } as Context,
+      { reasoning: 'high' },
+      defaultCache,
+    )
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'high' })
+    expect(body.speed).toBeUndefined()
+  })
+
+  test('refuses unsupported minimal effort rather than sending an invalid Sonnet 5.5 request', async () => {
+    await expect(
+      buildAnthropicRequest(
+        'claude-sonnet-5-5',
+        { messages: [userMsg('hello')], tools: [] } as Context,
+        { reasoning: 'minimal' },
+        defaultCache,
+      ),
+    ).rejects.toThrow('Claude Sonnet 5.5 does not support minimal effort')
+  })
+
+  test('honors explicit prefix-mismatch behavior on a signed Sonnet 5.5 continuation', async () => {
+    const identity = {
+      deviceId: 'd'.repeat(64),
+      accountIdentity: 'main',
+      accountUuid: 'account-uuid' as ProviderAccountUuid,
+      sessionId: 'sonnet-5-5-binding',
+    }
+    const context = {
+      messages: [
+        userMsg('original'),
+        thinkingToolMsg('reason', 'signature', 'tool_1', {
+          model: 'claude-sonnet-5-5',
+        }),
+        toolResultMsg('tool_1', 'result'),
+        userMsg('continue'),
+      ],
+      tools: [],
+    } as Context
+    const { body, bodyText } = await buildAnthropicRequest(
+      'claude-sonnet-5-5',
+      context,
+      { sessionId: 'sonnet-5-5-binding' },
+      defaultCache,
+      false,
+      identity,
+      { thinkingPrefixMismatchBehavior: 'drop_block' },
+    )
+    expect(body.thinking).toMatchObject({
+      type: 'adaptive',
+      display: 'summarized',
+    })
+    expect(bodyText).toContain(
+      '"block_binding":{"prefix_mismatch_behavior":"drop_block"}',
+    )
+  })
+})
+
 describe('buildAnthropicRequest — Opus 5 thinking', () => {
   test('requests summarized adaptive thinking for Opus 5 without reasoning', async () => {
     const { body } = await buildAnthropicRequest(
