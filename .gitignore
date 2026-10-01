@@ -1,7 +1,7 @@
 # Dependencies and build outputs
 node_modules/
 dist/
-dist-arcus/
+dist-*/
 packages/*/dist/
 packages/opencode/src/tui-compiled/
 *.tsbuildinfo
