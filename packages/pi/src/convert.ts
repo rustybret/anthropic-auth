@@ -2,6 +2,7 @@ import {
   applyClaudeCodeMetadata,
   applyMidConversationOutputConfig,
   applyThinkingBindingControls,
+  assertNoMeaningfulTrailingAssistant,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -23,6 +24,7 @@ import {
   type MidConversationEffortTransition,
   orderClaudeCodeBody,
   signRequestBody,
+  stripEmptyTrailingAssistantMessages,
   type ThinkingPrefixMismatchBehavior,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -584,14 +586,12 @@ export async function buildAnthropicRequest(
     systemPrompt: getCurrentSystemPrompt(transcript.messages),
     tools: getCurrentTools(transcript.messages),
   }
+  // Conversion can discard opaque or incomplete blocks. Check context.messages
+  // first so those losses cannot hide a meaningful final assistant turn. Check
+  // the Anthropic messages again after conversion removes empty user messages.
+  assertNoMeaningfulTrailingAssistant(context.messages)
   const messages = convertMessages(context.messages, modelId)
-  // Strip trailing assistant messages — Anthropic rejects prefill on some models
-  while (
-    messages.length &&
-    messages[messages.length - 1]?.role === 'assistant'
-  ) {
-    messages.pop()
-  }
+  stripEmptyTrailingAssistantMessages(messages)
   const system = [
     {
       type: 'text',
