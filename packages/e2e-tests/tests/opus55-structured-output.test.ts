@@ -31,11 +31,7 @@ test.each(['claude-opus-5-5', 'claude-sonnet-5-5'])(
   async (modelId) => {
     harness = await E2EHarness.create()
     harness.script([
-      {
-        type: 'tool_use',
-        name: 'mcp_StructuredOutput',
-        input: { answer: 'ok' },
-      },
+      { type: 'tool_use', name: 'mcp_StructuredOutput', input: { answer: 'ok' } },
     ])
     const successId = await harness.createSession()
     const success = await harness.sendPrompt(
@@ -50,16 +46,14 @@ test.each(['claude-opus-5-5', 'claude-sonnet-5-5'])(
     expect(successInfo?.structured).toEqual({ answer: 'ok' })
     expect(successInfo?.error).toBeUndefined()
 
-    const first = harness.anthropic
-      .requests()
-      .find(
-        (request) =>
-          request.body.model === modelId &&
-          Array.isArray(request.body.tools) &&
-          request.body.tools.some(
-            (tool: { name?: string }) => tool.name === 'mcp_StructuredOutput',
-          ),
-      )
+    const first = harness.anthropic.requests().find(
+      (request) =>
+        request.body.model === modelId &&
+        Array.isArray(request.body.tools) &&
+        request.body.tools.some(
+          (tool: { name?: string }) => tool.name === 'mcp_StructuredOutput',
+        ),
+    )
     expect(first).toBeDefined()
     expect(first?.body.tool_choice).toBeUndefined()
     expect(first?.body.thinking).toMatchObject({ type: 'adaptive' })
@@ -85,6 +79,7 @@ test.each(['claude-opus-5-5', 'claude-sonnet-5-5'])(
   90_000,
 )
 
+
 test('Sonnet 5.5 xhigh variant keeps adaptive thinking and requested effort through OpenCode', async () => {
   harness = await E2EHarness.create()
   harness.script([{ type: 'text', text: 'yes' }])
@@ -97,9 +92,9 @@ test('Sonnet 5.5 xhigh variant keeps adaptive thinking and requested effort thro
     'xhigh',
   )
 
-  const request = harness.anthropic
-    .requests()
-    .find((entry) => entry.body.model === 'claude-sonnet-5-5')
+  const request = harness.anthropic.requests().find(
+    (entry) => entry.body.model === 'claude-sonnet-5-5',
+  )
   expect(request).toBeDefined()
   expect(request?.body.thinking).toMatchObject({
     type: 'adaptive',

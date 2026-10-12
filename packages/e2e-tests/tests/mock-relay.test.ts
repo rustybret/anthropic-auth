@@ -9,8 +9,7 @@ test('mock relay exclusively owns its advertised IPv4 endpoint', async () => {
   try {
     try {
       duplicate = Bun.serve({
-        hostname: '127.0.0.1',
-        port,
+        hostname: '127.0.0.1', port,
         fetch: () => new Response('wrong listener'),
       })
     } catch (error) {

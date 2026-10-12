@@ -24,9 +24,7 @@ const clients: Array<{ close: () => void }> = []
 afterEach(async () => {
   for (const client of clients.splice(0)) client.close()
   await Promise.all(daemons.splice(0).map((daemon) => daemon.stop()))
-  await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-  )
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 describe('fake Claustrum daemon', () => {
@@ -47,11 +45,7 @@ describe('fake Claustrum daemon', () => {
     daemons.push(daemon)
     const client = await SubcClient.connect({
       connectionFile: daemon.connectionFile,
-      identity: {
-        project_root: root,
-        harness: 'e2e',
-        session: 'fixture-smoke',
-      },
+      identity: { project_root: root, harness: 'e2e', session: 'fixture-smoke' },
     })
     clients.push(client)
 
@@ -63,9 +57,7 @@ describe('fake Claustrum daemon', () => {
 
     expect(response).toEqual({
       result: {
-        payload: Array.from(
-          new TextEncoder().encode('{"access_token":"vault-main"}'),
-        ),
+        payload: Array.from(new TextEncoder().encode('{"access_token":"vault-main"}')),
         credential_id: 'oauth:anthropic',
         account_id: 'account-main',
         record_version: 7,
@@ -101,10 +93,7 @@ describe('fake Claustrum daemon', () => {
         Buffer.from(
           JSON.stringify({
             method: 'credential.get_scoped',
-            params: {
-              credential_id: 'oauth:anthropic',
-              enrollment_token: 'aa'.repeat(32),
-            },
+            params: { credential_id: 'oauth:anthropic', enrollment_token: 'aa'.repeat(32) },
           }),
         ),
       )
@@ -115,7 +104,9 @@ describe('fake Claustrum daemon', () => {
       expect(header.ty).toBe(FrameType.Error)
       expect(
         JSON.parse(
-          frame.subarray(HEADER_LEN, HEADER_LEN + header.len).toString('utf8'),
+          frame
+            .subarray(HEADER_LEN, HEADER_LEN + header.len)
+            .toString('utf8'),
         ),
       ).toEqual({ code: 'unknown_channel' })
     } finally {

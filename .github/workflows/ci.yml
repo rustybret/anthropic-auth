@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -15,15 +17,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
-      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: bun install --frozen-lockfile
+      - name: Install the locked OC1 config dependency fixture
+        run: npm ci --prefix packages/e2e-tests/fixtures/opencode1-config-deps --ignore-scripts --no-audit --no-fund
+      - run: bun run check:workspace-lock
       - run: bun run types
       - run: bun run build
+      - run: bun test --cwd packages/opencode scripts/check-bundle-globals.test.ts
+      - run: bun test scripts/check-pi-dist-imports.test.ts
+      - run: bun run check:pi-dist-imports
+      - run: bun run --cwd packages/core test:scripts
+      - run: bun test scripts/tests/run-mutation-ci.test.ts scripts/tests/run-mutation-bun.test.ts
+      - run: bun run check:claustrum-golden
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: bun test scripts/check-test-count-floors.test.ts
+      # UNCHECKED exits nonzero too: a missing merge target must not look green.
+      - name: Verify unit-count floors
+        env:
+          FLOOR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ ! "$FLOOR_BASE_SHA" =~ ^[0-9a-f]{40}$ || "$FLOOR_BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+            echo "::error::Unit-count floor verification requires a nonzero event base SHA."
+            exit 1
+          fi
+          bun scripts/check-test-count-floors.ts --base-ref "$FLOOR_BASE_SHA"
       - run: bun run --cwd packages/opencode smoke:tui
         env:
           TUI_SMOKE_SKIP_BUILD: "1"
-      - run: bun run test
-      - run: npm install -g opencode-ai@1.18.18
+      - run: bun run test:pi-host
       - run: bun run test:e2e
+        env:
+          ANTHROPIC_AUTH_E2E_OPENCODE_CONFIG_DEPS: ${{ github.workspace }}/packages/e2e-tests/fixtures/opencode1-config-deps
       - run: bun run format:check
       - run: bun run lint

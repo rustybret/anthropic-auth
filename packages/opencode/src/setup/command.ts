@@ -1,3 +1,4 @@
+import type { Writable } from 'node:stream'
 import {
   confirm,
   intro,
@@ -8,21 +9,24 @@ import {
   outro,
   spinner,
 } from '@clack/prompts'
-import { writeOpenCodeTombstoneAuth } from './activation.ts'
-import { setupClaustrumForHost } from './claustrum.ts'
+import { readNativeEnrollmentMode } from '@cortexkit/anthropic-auth-core'
+import { reportInstallerFailure, reportThrownFailure } from '../cli-failure.ts'
 import { defaultCommandRunner } from './command-runner.ts'
 import { detectAll } from './detect.ts'
+import { activateNativeVaultForHost } from './native-activation.ts'
+import { migrateNativeLocalForHost } from './native-local.ts'
+import { loginNativeOffline } from './native-login.ts'
+import {
+  requireDisjointNativeSetupPaths,
+  resolveNativeSetupPaths,
+} from './native-paths.ts'
 import {
   ensureOpenCodePluginConfig,
   ensureOpenCodeTuiConfig,
 } from './opencode-config.ts'
-import { getOpenCodeAuthPath, getSetupPackageVersion } from './paths.ts'
-import { cleanPiLocalAnthropicAuth, installPiExtension } from './pi.ts'
-import {
-  assertHostsStopped,
-  defaultProcessFence,
-  ProcessFenceViolationError,
-} from './process-fence.ts'
+import { getSetupPackageVersion } from './paths.ts'
+import { installPiExtension } from './pi.ts'
+import { assertHostsStopped, defaultProcessFence } from './process-fence.ts'
 import type { CommandRunner, HarnessKind, ProcessFence } from './types.ts'
 
 export interface SetupCommandOptions {
@@ -30,6 +34,13 @@ export interface SetupCommandOptions {
   fence?: ProcessFence
   env?: NodeJS.ProcessEnv
   isInteractive?: boolean
+  /** Let tests substitute host detection and per-host vault activation. */
+  detect?: typeof detectAll
+  activate?: typeof activateNativeVaultForHost
+  migrateLocal?: typeof migrateNativeLocalForHost
+  localLogin?: typeof loginNativeOffline
+  /** Where setup prints its progress and errors; defaults to stdout. */
+  output?: Writable
 }
 
 export async function runSetupCommand(
@@ -39,18 +50,34 @@ export async function runSetupCommand(
   const env = options.env ?? process.env
   const runner = options.runner ?? defaultCommandRunner
   const fence = options.fence ?? defaultProcessFence
+  const activate = options.activate ?? activateNativeVaultForHost
+  const migrateLocal = options.migrateLocal ?? migrateNativeLocalForHost
+  const ui = { output: options.output }
 
   const nonInteractive = argv.includes('--yes') || argv.includes('-y')
   const dryRun = argv.includes('--dry-run')
   const explicitNoClaustrum = argv.includes('--no-claustrum')
   const explicitClaustrum = argv.includes('--claustrum')
+  const explicitRemovePiAuth = argv.includes('--remove-pi-auth')
+  const explicitLogin = argv.includes('--login')
+  const localLogin = explicitLogin
+    ? (options.localLogin ?? loginNativeOffline)
+    : undefined
 
-  intro('CortexKit Anthropic Auth Setup')
+  if (explicitLogin && explicitClaustrum) {
+    log.error(
+      'Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.',
+      ui,
+    )
+    return 1
+  }
+
+  intro('CortexKit Anthropic Auth Setup', ui)
 
   // 1. Detect environment
-  const s = spinner()
+  const s = spinner(ui)
   s.start('Detecting installed environments…')
-  const detection = await detectAll(env, runner)
+  const detection = await (options.detect ?? detectAll)(env, runner)
   s.stop('Environment detection complete.')
 
   const opencodeStatus = detection.opencode.installed
@@ -65,14 +92,15 @@ export async function runSetupCommand(
       ? 'ck installed, daemon not running'
       : 'not installed'
 
-  log.info(`OpenCode:   ${opencodeStatus}`)
-  log.info(`Pi:         ${piStatus}`)
-  log.info(`Claustrum:  ${claustrumStatus}`)
+  log.info(`OpenCode:   ${opencodeStatus}`, ui)
+  log.info(`Pi:         ${piStatus}`, ui)
+  log.info(`Claustrum:  ${claustrumStatus}`, ui)
 
   if (!detection.opencode.installed && !detection.pi.installed) {
-    log.error('Neither OpenCode nor Pi was detected on this system.')
+    log.error('Neither OpenCode nor Pi was detected on this system.', ui)
     outro(
       'Install OpenCode (https://opencode.ai) or Pi (https://github.com/badlogic/pi-mono) first.',
+      ui,
     )
     return 1
   }
@@ -109,10 +137,11 @@ export async function runSetupCommand(
       options: choices,
       initialValues: choices.map((c) => c.value),
       required: true,
+      ...ui,
     })
 
     if (isCancel(selection)) {
-      outro('Setup cancelled.')
+      outro('Setup cancelled.', ui)
       return 0
     }
 
@@ -120,7 +149,7 @@ export async function runSetupCommand(
   }
 
   if (selectedHosts.length === 0) {
-    outro('No integrations selected.')
+    outro('No integrations selected.', ui)
     return 0
   }
 
@@ -129,20 +158,20 @@ export async function runSetupCommand(
   const claustrumAvailable =
     detection.claustrum.daemonRunning && detection.claustrum.ckInstalled
 
+  // Vault custody is explicit only: --yes alone never switches custody.
   if (claustrumAvailable && !explicitNoClaustrum) {
     if (explicitClaustrum) {
       useClaustrum = true
-    } else if (nonInteractive) {
-      useClaustrum = true
-    } else {
+    } else if (!nonInteractive) {
       const claustrumChoice = await confirm({
         message:
-          'Claustrum daemon is running. Use Claustrum custody to manage Anthropic accounts securely in the vault?',
-        initialValue: true,
+          'Use Claude accounts from the Claustrum vault? Local account files stay unchanged and are not used while connected.',
+        initialValue: false,
+        ...ui,
       })
 
       if (isCancel(claustrumChoice)) {
-        outro('Setup cancelled.')
+        outro('Setup cancelled.', ui)
         return 0
       }
 
@@ -150,30 +179,60 @@ export async function runSetupCommand(
     }
   }
 
-  // 4. If Pi selected and Claustrum chosen, handle local auth conflict
+  if (localLogin && useClaustrum) {
+    log.error(
+      'Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.',
+      ui,
+    )
+    return 1
+  }
+  if (localLogin || !useClaustrum) {
+    for (const host of selectedHosts) {
+      if ((await readNativeEnrollmentMode(host, env)) !== 'local') {
+        log.error('Disconnect from the vault first.', ui)
+        return 1
+      }
+    }
+  }
+
+  // Pi chooses its stored Anthropic login before the extension's account pool.
+  // Moving it aside requires separate consent; ordinary --yes is insufficient.
   let removePiLocalAuth = false
-  if (
-    selectedHosts.includes('pi') &&
-    useClaustrum &&
-    detection.pi.hasLocalAuth
-  ) {
+  if (selectedHosts.includes('pi') && detection.pi.hasLocalAuth) {
     if (nonInteractive) {
+      // Moving a stored login needs its own flag; --yes is not consent.
+      if (!explicitRemovePiAuth) {
+        log.error(
+          useClaustrum
+            ? 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to preserve it privately during vault use and restore it on disconnect.'
+            : 'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.',
+          ui,
+        )
+        outro('Setup aborted.', ui)
+        return 1
+      }
       removePiLocalAuth = true
     } else {
       log.warn(
-        'Pi has a stored local Anthropic OAuth token. Claustrum custody replaces local credentials.',
+        useClaustrum
+          ? 'Pi has stored Anthropic authentication. Vault setup must preserve it privately and restore it on disconnect.'
+          : 'Pi has a stored Anthropic OAuth token. Native account-pool setup moves credentials out of the host auth store.',
+        ui,
       )
       const consent = await confirm({
-        message:
-          'Remove local Pi Anthropic OAuth credential so Claustrum custody can serve requests?',
-        initialValue: true,
+        message: useClaustrum
+          ? 'Move Pi authentication aside privately for vault use, then restore it on disconnect?'
+          : 'Move the Pi Anthropic OAuth login into the native account pool and remove its stored copy?',
+        initialValue: false,
+        ...ui,
       })
 
       if (isCancel(consent) || !consent) {
         log.error(
-          'Claustrum custody cannot be enabled for Pi while a local OAuth token takes precedence.',
+          'Native account-pool setup cannot finish while the stored Pi OAuth token takes precedence.',
+          ui,
         )
-        outro('Setup aborted.')
+        outro('Setup aborted.', ui)
         return 1
       }
 
@@ -181,28 +240,60 @@ export async function runSetupCommand(
     }
   }
 
-  // 5. Verify host quiescence before any changes
+  // 5. Verify all hosts are stopped before making changes. A genuine list of
+  // running hosts is shown word for word; any other failure gets the fixed
+  // screen and a private diagnostics file.
   try {
     await assertHostsStopped(fence)
   } catch (error) {
-    if (error instanceof ProcessFenceViolationError) {
-      log.error(error.message)
-      outro('Setup aborted — quit active hosts and rerun setup.')
-      return 1
-    }
-    throw error
+    log.error(await reportThrownFailure('setup-process-check', error, env), ui)
+    outro('Setup aborted — quit active hosts and rerun setup.', ui)
+    return 1
   }
 
+  const plans = []
+  for (const host of selectedHosts)
+    plans.push(await resolveNativeSetupPaths(host, env))
+  await requireDisjointNativeSetupPaths(plans)
+
   if (dryRun) {
-    log.info('[dry-run] Planned actions:')
-    log.info(`  - Target integrations: ${selectedHosts.join(', ')}`)
-    log.info(`  - Claustrum custody: ${useClaustrum ? 'enabled' : 'disabled'}`)
-    if (removePiLocalAuth) log.info('  - Pi local OAuth token will be removed')
-    outro('Dry run complete. No changes were made.')
+    log.info('[dry-run] Planned actions:', ui)
+    log.info(`  - Target integrations: ${selectedHosts.join(', ')}`, ui)
+    log.info(
+      `  - Claustrum custody: ${useClaustrum ? 'enabled' : 'disabled'}`,
+      ui,
+    )
+    if (removePiLocalAuth)
+      log.info('  - Pi local OAuth token will be removed', ui)
+    outro('Dry run complete. No changes were made.', ui)
     return 0
   }
 
   const version = await getSetupPackageVersion()
+
+  // Each host is enrolled and activated on its own. A failure stops setup
+  // before the next host; a host already switched stays switched.
+  const activateHost = async (host: HarnessKind, label: string) => {
+    s.start(`Switching ${label} to Claustrum vault custody…`)
+    try {
+      const outcome = await activate(host, {
+        env,
+        runner,
+        fence,
+        removePiAnthropicAuth: host === 'pi' && removePiLocalAuth,
+      })
+      s.stop(
+        outcome === 'already-vault'
+          ? `${label} already uses Claustrum vault custody.`
+          : `${label} now uses Claustrum vault custody.`,
+      )
+      return true
+    } catch (error: unknown) {
+      s.stop(`${label} vault custody setup failed.`)
+      log.error(await reportThrownFailure('setup-activation', error, env), ui)
+      return false
+    }
+  }
 
   // 6. Execute OpenCode setup
   if (selectedHosts.includes('opencode')) {
@@ -211,32 +302,22 @@ export async function runSetupCommand(
       await ensureOpenCodePluginConfig(version, env)
       await ensureOpenCodeTuiConfig(version, env)
       s.stop('OpenCode configuration updated.')
-
-      if (useClaustrum) {
-        s.start('Enrolling OpenCode into Claustrum custody…')
-        const result = await setupClaustrumForHost('opencode', {
-          runner,
-          env,
-        })
-        if (!result.ok) {
-          s.stop('Claustrum enrollment failed.')
-          log.error(result.message)
-          return 1
-        }
-        s.stop(`OpenCode enrolled into Claustrum: ${result.message}`)
-
-        s.start('Installing Anthropic activation tombstone…')
-        await writeOpenCodeTombstoneAuth({
-          authPath: getOpenCodeAuthPath(env),
-          fence,
-        })
-        s.stop('Anthropic activation tombstone installed.')
-      }
     } catch (error: unknown) {
       s.stop('OpenCode setup failed.')
-      log.error(error instanceof Error ? error.message : String(error))
+      log.error(
+        await reportThrownFailure('setup-opencode-config', error, env),
+        ui,
+      )
       return 1
     }
+    if (localLogin || !useClaustrum)
+      await migrateLocal('opencode', {
+        env,
+        fence,
+        removePiAnthropicAuth: false,
+        login: localLogin,
+      })
+    if (useClaustrum && !(await activateHost('opencode', 'OpenCode'))) return 1
   }
 
   // 7. Execute Pi setup
@@ -246,35 +327,26 @@ export async function runSetupCommand(
       const installRes = await installPiExtension(version, runner, env)
       if (!installRes.ok) {
         s.stop('Pi extension installation failed.')
-        log.error(installRes.message)
+        log.error(
+          await reportInstallerFailure('setup-pi-install', installRes, env),
+          ui,
+        )
         return 1
       }
       s.stop('Pi Anthropic extension installed.')
-
-      if (useClaustrum) {
-        if (removePiLocalAuth) {
-          s.start('Removing local Pi Anthropic OAuth credential…')
-          await cleanPiLocalAnthropicAuth(env)
-          s.stop('Local Pi Anthropic OAuth credential removed.')
-        }
-
-        s.start('Enrolling Pi into Claustrum custody…')
-        const result = await setupClaustrumForHost('pi', {
-          runner,
-          env,
-        })
-        if (!result.ok) {
-          s.stop('Pi Claustrum enrollment failed.')
-          log.error(result.message)
-          return 1
-        }
-        s.stop(`Pi enrolled into Claustrum: ${result.message}`)
-      }
     } catch (error: unknown) {
       s.stop('Pi setup failed.')
-      log.error(error instanceof Error ? error.message : String(error))
+      log.error(await reportThrownFailure('setup-pi', error, env), ui)
       return 1
     }
+    if (localLogin || !useClaustrum)
+      await migrateLocal('pi', {
+        env,
+        fence,
+        removePiAnthropicAuth: removePiLocalAuth,
+        login: localLogin,
+      })
+    if (useClaustrum && !(await activateHost('pi', 'Pi'))) return 1
   }
 
   // 8. Next steps note
@@ -294,7 +366,7 @@ export async function runSetupCommand(
     )
   }
 
-  note(nextSteps.join('\n'), 'Next Steps')
-  outro('Setup complete!')
+  note(nextSteps.join('\n'), 'Next Steps', ui)
+  outro('Setup complete!', ui)
   return 0
 }

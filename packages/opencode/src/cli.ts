@@ -3,41 +3,48 @@
 import { stdin as input, stdout as output } from 'node:process'
 import { createInterface } from 'node:readline/promises'
 import {
-  type AccountStorage,
-  addAccountPersistent,
   authorize,
+  createNativeAccountRuntime,
   exchange,
+  formatNativeAccountState,
   generateRelayToken,
   getAccountStoragePath,
-  getClaustrumMode,
-  isOAuthAccount,
   isValidApiBaseURL,
-  loadAccounts,
-  saveAccounts,
+  type NativeAccountRuntime,
+  readNativeEnrollmentMode,
+  resolveNativePoolPaths,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
+import { type CliFailureStage, reportThrownFailure } from './cli-failure.ts'
 
-function defaultStorage(): AccountStorage {
-  return {
-    version: 1,
-    main: { type: 'opencode', provider: 'anthropic' },
-    fallbackOn: [401, 403, 429],
-    refresh: {
-      enabled: true,
-      intervalMinutes: 10,
-      refreshBeforeExpiryMinutes: 240,
-    },
-    quota: {
-      enabled: true,
-      checkIntervalMinutes: 5,
-      minimumRemaining: {
-        five_hour: 10,
-        seven_day: 20,
-      },
-      failClosedOnUnknownQuota: true,
-    },
-    accounts: [],
+async function withNativeAccounts<T>(
+  run: (runtime: NativeAccountRuntime) => Promise<T>,
+): Promise<T> {
+  if (process.env.OPENCODE_AUTH_CONTENT !== undefined)
+    throw new Error(
+      'Native account changes require offline setup without OPENCODE_AUTH_CONTENT',
+    )
+  const paths = await resolveNativePoolPaths()
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+  try {
+    await runtime.read()
+    return await run(runtime)
+  } finally {
+    runtime.close()
   }
+}
+
+/**
+ * This host's Claustrum enrollment files, not account settings, decide whether
+ * credentials come from the vault. In vault mode the local account pool must
+ * not gain accounts, so commands that add local credentials refuse before
+ * reading the pool or asking for anything, and check again right before
+ * writing in case setup enrolled the host while a prompt was open. Unreadable
+ * enrollment state throws as well: it never counts as local mode.
+ */
+async function requireLocalCustody() {
+  if ((await readNativeEnrollmentMode('opencode', process.env)) !== 'local')
+    throw new Error('Disconnect from the vault first.')
 }
 
 function usage() {
@@ -48,7 +55,8 @@ function usage() {
   opencode-anthropic-auth list
   opencode-anthropic-auth relay setup
 
-Fallback accounts are stored in:
+Native credentials are managed by the offline setup migration.
+Legacy import source:
   ${getAccountStoragePath()}`)
 }
 
@@ -204,16 +212,23 @@ type FetchLike = (
 export interface RelaySetupDeps {
   fetchImpl?: FetchLike
   prompt?: (message: string) => Promise<string>
+  /** Receives each credential this command handles, for redacting failure detail. */
+  secrets?: string[]
+  /** Prints a non-fatal warning; defaults to console.warn. */
+  warn?: (message: string) => void
 }
 
 export async function relaySetup(deps: RelaySetupDeps = {}) {
+  await withNativeAccounts((runtime) => runtime.read())
   const fetchImpl = deps.fetchImpl ?? fetch
   const ask = deps.prompt ?? prompt
+  const warn = deps.warn ?? ((message: string) => console.warn(message))
   const token = requireText(
     process.env.CLOUDFLARE_API_TOKEN?.trim() ||
       (await ask('Cloudflare API token: ')),
     'Cloudflare API token',
   )
+  deps.secrets?.push(token)
   const accountId = requireText(
     process.env.CLOUDFLARE_ACCOUNT_ID || (await ask('Cloudflare account ID: ')),
     'Cloudflare account ID',
@@ -223,6 +238,7 @@ export async function relaySetup(deps: RelaySetupDeps = {}) {
     'opencode-anthropic-relay'
   const kvTitle = `${scriptName}-state`
   const relayToken = generateRelayToken()
+  deps.secrets?.push(relayToken)
 
   console.log('Creating Cloudflare KV namespace...')
   const namespace = await createKvNamespace(
@@ -240,10 +256,15 @@ export async function relaySetup(deps: RelaySetupDeps = {}) {
     relayToken,
     fetchImpl,
   })
+  // Cloudflare's error text can echo request details, so the warning names
+  // only a fixed code and the private file holding the scrubbed detail.
   await enableWorkersDev(token, accountId, scriptName, fetchImpl).catch(
-    (error) => {
-      console.warn(
-        `Could not enable workers.dev automatically: ${error instanceof Error ? error.message : String(error)}`,
+    async (error) => {
+      warn(
+        await reportThrownFailure('cli-relay-workers-dev', error, process.env, [
+          token,
+          relayToken,
+        ]),
       )
     },
   )
@@ -256,20 +277,20 @@ export async function relaySetup(deps: RelaySetupDeps = {}) {
     defaultUrl ||
     requireText(await prompt('Relay Worker URL: '), 'Relay Worker URL')
 
-  // Provisioning can take minutes. Reload immediately before commit so the
-  // relay setup cannot overwrite fallback accounts changed while it was open.
-  const storage = (await loadAccounts()) ?? defaultStorage()
-  storage.relay = {
-    enabled: true,
-    url,
-    token: relayToken,
-    fallbackToDirect: true,
-    transport: 'http',
-  }
-  await saveAccounts(storage)
+  // Provisioning can take minutes. The relay transaction updates private
+  // connection authorization and settings without replacing account metadata.
+  await withNativeAccounts((runtime) =>
+    runtime.updateRelay({
+      enabled: true,
+      url,
+      token: relayToken,
+      fallbackToDirect: true,
+      transport: 'http',
+    }),
+  )
 
   console.log(`Relay enabled at ${url}`)
-  console.log(`Config saved to ${getAccountStoragePath()}.`)
+  console.log('Relay settings saved to the native account store.')
 }
 
 let promptInterface: ReturnType<typeof createInterface> | null = null
@@ -285,75 +306,87 @@ function closePromptInterface() {
 }
 
 /**
- * Dependencies the `login` command talks to the outside world through. All
- * default to the real implementations (the readline-backed prompt, and the
- * core authorize/exchange helpers) so the production `login` path is
- * unchanged; tests inject deterministic stubs to exercise the full login flow
- * in-process without a subprocess, real network, or stdin.
+ * Tests can supply prompts and OAuth responses without opening a browser.
+ * Login stores exchanged tokens in the shared account pool after validating
+ * the account identity. It never writes OpenCode's auth.json or old sidecars.
  */
 export interface LoginDeps {
   prompt?: (message: string) => Promise<string>
   authorize?: typeof authorize
   exchange?: typeof exchange
+  /** Receives each credential this command handles, for redacting failure detail. */
+  secrets?: string[]
 }
 
 export async function login(labelArg?: string, deps: LoginDeps = {}) {
+  if (process.env.OPENCODE_AUTH_CONTENT !== undefined) {
+    throw new Error(
+      'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set',
+    )
+  }
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
-  if (getClaustrumMode(await loadAccounts()) === 'claustrum') {
-    throw new Error('Exit Claustrum mode first: /claude-account local')
-  }
-  const label =
-    labelArg?.trim() || (await ask('Fallback account label (optional): '))
-  const authorization = await authorizeImpl('max')
-
-  console.log('\nOpen this URL in your browser and complete Claude sign-in:\n')
-  console.log(`${authorization.url}\n`)
-  const code = await ask(
-    'Paste the full callback URL or authorization code here: ',
-  )
-  const result = await exchangeImpl(
-    code,
-    authorization.verifier,
-    authorization.redirectUri,
-    authorization.state,
-  )
-
-  if (result.type === 'failed') {
-    throw new Error('Authentication failed')
-  }
-
-  const now = Date.now()
-  const account = {
-    id: label || crypto.randomUUID(),
-    label: label || undefined,
-    type: 'oauth',
-    authLineageId: crypto.randomUUID(),
-    access: result.access,
-    refresh: result.refresh,
-    expires: result.expires,
-    enabled: true,
-    addedAt: now,
-    lastUsed: now,
-    lastRefreshedAt: now,
-  } as const
-  await addAccountPersistent(account)
-
-  console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
+  await requireLocalCustody()
+  await withNativeAccounts(async (runtime) => {
+    const snapshot = await runtime.read()
+    const label =
+      labelArg?.trim() || (await ask('Fallback account label (optional): '))
+    const authorization = await authorizeImpl('max')
+    console.log(
+      '\nOpen this URL in your browser and complete Claude sign-in:\n',
+    )
+    console.log(`${authorization.url}\n`)
+    const code = await ask(
+      'Paste the full callback URL or authorization code here: ',
+    )
+    deps.secrets?.push(code)
+    const result = await exchangeImpl(
+      code,
+      authorization.verifier,
+      authorization.redirectUri,
+      authorization.state,
+    )
+    if (result.type === 'failed') throw new Error('Authentication failed')
+    deps.secrets?.push(result.access, result.refresh)
+    if (process.env.OPENCODE_AUTH_CONTENT !== undefined)
+      throw new Error(
+        'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set',
+      )
+    // Sign-in can take minutes; refuse if setup enrolled the host meanwhile.
+    await requireLocalCustody()
+    const routeId = label && label !== 'main' ? label : crypto.randomUUID()
+    const replace = snapshot.accounts.some(
+      (account) => account.id === routeId && account.source === 'local',
+    )
+    await runtime.loginOAuth({
+      routeId,
+      replace,
+      label: label || undefined,
+      credential: {
+        access: result.access,
+        refresh: result.refresh,
+        expires: result.expires,
+      },
+    })
+    console.log(`\nSaved native fallback account${label ? ` "${label}"` : ''}.`)
+  })
 }
 
 /**
- * Dependencies the `api add` command talks to the outside world through. The
- * prompt defaults to the real readline-backed prompt so the production
- * `api add` path is unchanged; tests inject canned answers to exercise the
- * full route-add flow in-process without a subprocess or stdin.
+ * Tests can supply prompts to check API keys and proxy route settings.
+ * New keys go to the shared account pool after migration has committed;
+ * OpenCode's auth.json and the old sidecar files remain unchanged.
  */
 export interface ApiAddDeps {
   prompt?: (message: string) => Promise<string>
+  /** Receives each credential this command handles, for redacting failure detail. */
+  secrets?: string[]
 }
 
 export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
+  await requireLocalCustody()
+  await withNativeAccounts((runtime) => runtime.read())
   const ask = deps.prompt ?? prompt
   const label =
     labelArg?.trim() || (await ask('API fallback label (optional): '))
@@ -372,6 +405,7 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     process.env.OPENCODE_ANTHROPIC_AUTH_API_KEY?.trim() ||
     (await ask('API key: '))
   if (!apiKey.trim()) throw new Error('API key is required')
+  deps.secrets?.push(apiKey.trim())
   const authHeaderInput = (
     process.env.OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER?.trim() ||
     (await ask(
@@ -382,18 +416,23 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     .toLowerCase()
   const authHeader =
     authHeaderInput === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
-  const now = Date.now()
 
-  await addAccountPersistent({
-    id: label || crypto.randomUUID(),
-    label: label || undefined,
-    type: 'api',
-    apiKey: apiKey.trim(),
-    baseURL,
-    authHeader,
-    enabled: true,
-    addedAt: now,
-    lastUsed: now,
+  await withNativeAccounts(async (runtime) => {
+    // The prompts above can take minutes; refuse if setup enrolled the host.
+    await requireLocalCustody()
+    const snapshot = await runtime.read()
+    const routeId = label && label !== 'main' ? label : crypto.randomUUID()
+    const existing = snapshot.accounts.find((account) => account.id === routeId)
+    if (existing?.source === 'vault')
+      throw new Error('Vault routes cannot be replaced with a local API key')
+    await runtime.addApi({
+      routeId,
+      replace: Boolean(existing),
+      label: label || undefined,
+      apiKey: apiKey.trim(),
+      baseURL,
+      authHeader,
+    })
   })
 
   console.log(
@@ -402,36 +441,52 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
 }
 
 async function listAccounts() {
-  const storage = await loadAccounts()
-  if (!storage?.accounts.length) {
-    console.log(`No fallback accounts found at ${getAccountStoragePath()}.`)
-    return
-  }
-
-  for (const [index, account] of storage.accounts.entries()) {
-    const label = account.label || account.id
-    const status = account.enabled === false ? 'disabled' : 'enabled'
-    if (!isOAuthAccount(account)) {
-      console.log(
-        `${index + 1}. ${label} (${status}) — API route ${account.baseURL}`,
-      )
-      continue
+  await withNativeAccounts(async (runtime) => {
+    const accounts = (await runtime.read()).accounts.filter(
+      (account) => account.id !== 'main',
+    )
+    if (!accounts.length) {
+      console.log('No native fallback accounts found.')
+      return
     }
-    const fiveHour = account.quota?.five_hour?.remainingPercent
-    const sevenDay = account.quota?.seven_day?.remainingPercent
-    const quota =
-      fiveHour === undefined && sevenDay === undefined
-        ? 'quota unknown'
-        : `5h ${fiveHour ?? '?'}%, 1w ${sevenDay ?? '?'}% remaining`
-    console.log(`${index + 1}. ${label} (${status}) — ${quota}`)
-  }
+    for (const [index, account] of accounts.entries()) {
+      const label = account.label || account.id
+      const status = account.enabled ? 'enabled' : 'disabled'
+      if (account.type === 'api') {
+        console.log(
+          `${index + 1}. ${label} (${status}) — API route ${account.baseURL}`,
+        )
+        continue
+      }
+      const fiveHour = account.quota?.five_hour?.remainingPercent
+      const sevenDay = account.quota?.seven_day?.remainingPercent
+      const quota =
+        fiveHour === undefined && sevenDay === undefined
+          ? 'quota unknown'
+          : `5h ${fiveHour ?? '?'}%, 1w ${sevenDay ?? '?'}% remaining`
+      console.log(
+        `${index + 1}. ${label} (${status}) — ${quota}${account.state ? ` — ${formatNativeAccountState(account)}` : ''}`,
+      )
+    }
+  })
 }
 
 import { runSetupCommand } from './setup/command.ts'
 
 export { runSetupCommand }
 
-async function main() {
+/**
+ * What the top-level failure handler needs from the running command: `stage`
+ * names the command being run (it starts as the generic 'cli-command'), and
+ * `secrets` collects the credentials that command handled so a failure detail
+ * can be scrubbed of their exact values. Lives only for one CLI invocation.
+ */
+interface CliFailureContext {
+  stage: CliFailureStage
+  secrets: string[]
+}
+
+async function main(failure: CliFailureContext) {
   const [command, subcommandOrLabel, maybeLabel] = process.argv.slice(2)
   if (
     !command ||
@@ -444,28 +499,33 @@ async function main() {
   }
 
   if (command === 'setup') {
+    failure.stage = 'cli-setup'
     const code = await runSetupCommand(process.argv.slice(3))
     if (code !== 0) process.exitCode = code
     return
   }
 
   if (command === 'login') {
-    await login(subcommandOrLabel)
+    failure.stage = 'cli-login'
+    await login(subcommandOrLabel, { secrets: failure.secrets })
     return
   }
 
   if (command === 'api' && subcommandOrLabel === 'add') {
-    await addApiRoute(maybeLabel)
+    failure.stage = 'cli-api-add'
+    await addApiRoute(maybeLabel, { secrets: failure.secrets })
     return
   }
 
   if (command === 'list') {
+    failure.stage = 'cli-list'
     await listAccounts()
     return
   }
 
   if (command === 'relay' && subcommandOrLabel === 'setup') {
-    await relaySetup()
+    failure.stage = 'cli-relay-setup'
+    await relaySetup({ secrets: failure.secrets })
     return
   }
 
@@ -476,10 +536,20 @@ async function main() {
 // Only run the CLI when executed directly (e.g. `bun src/cli.ts ...`), not when
 // imported by tests that exercise individual commands (relaySetup) in-process.
 if (import.meta.main) {
+  const failure: CliFailureContext = { stage: 'cli-command', secrets: [] }
   try {
-    await main()
+    await main(failure)
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error))
+    // Known fixed remedies print as before; any other failure prints only a
+    // fixed code and the path of a private file holding the scrubbed detail.
+    console.error(
+      await reportThrownFailure(
+        failure.stage,
+        error,
+        process.env,
+        failure.secrets,
+      ),
+    )
     process.exitCode = 1
   } finally {
     closePromptInterface()

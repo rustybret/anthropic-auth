@@ -8,6 +8,17 @@ import { E2EHarness } from '../src/harness.ts'
 
 let harness: E2EHarness | null = null
 
+// The host chooses its title model independently of the conversation model.
+// Match its title prompt, not a model ID; zero-token requests are cache warms.
+function isConversationGeneration(request: { body: Record<string, unknown> }) {
+  return (
+    request.body.max_tokens !== 0 &&
+    !JSON.stringify(request.body).includes(
+      'Generate a title for this conversation',
+    )
+  )
+}
+
 afterEach(async () => {
   const finished = harness
   harness = null
@@ -15,6 +26,32 @@ afterEach(async () => {
 })
 
 describe('OpenCode Anthropic auth e2e', () => {
+  it('excludes title requests by role without excluding Haiku conversation turns', () => {
+    const request = (model: string, text: string, maxTokens = 1) => ({
+      body: {
+        model,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: text }],
+      },
+    })
+    const title = 'Generate a title for this conversation:\n'
+    const captured = [
+      request('claude-haiku-4-5-20251001', title),
+      request('claude-haiku-5-5', title),
+      request('claude-fable-5', 'conversation turn'),
+      request('claude-haiku-4-5-20251001', 'conversation turn'),
+      request('claude-haiku-5-5', 'conversation turn'),
+      request('claude-fable-5', 'cache warm', 0),
+    ]
+    expect(
+      captured.filter(isConversationGeneration).map((item) => item.body.model),
+    ).toEqual([
+      'claude-fable-5',
+      'claude-haiku-4-5-20251001',
+      'claude-haiku-5-5',
+    ])
+  })
+
   it('keeps sidebar state inside the isolated run directory', async () => {
     const fakeTmpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-global-'))
     const globalStateDir = join(fakeTmpDir, 'opencode-anthropic-auth')
@@ -111,23 +148,19 @@ describe('OpenCode Anthropic auth e2e', () => {
       'high',
     )
 
-    const generationRequests = harness.anthropic
-      .requests()
-      .filter((request) => {
-        const serializedBody = JSON.stringify(request.body)
-        return (
-          request.body.model === 'claude-fable-5-1' &&
-          !serializedBody.includes('Generate a title for this conversation')
-        )
-      })
+    const generationRequests = harness.anthropic.requests().filter((request) => {
+      const serializedBody = JSON.stringify(request.body)
+      return (
+        request.body.model === 'claude-fable-5-1' &&
+        !serializedBody.includes('Generate a title for this conversation')
+      )
+    })
     expect(generationRequests).toHaveLength(3)
     for (const request of generationRequests) {
       expect(request.body.output_config).toMatchObject({ effort: 'low' })
     }
     const switchedMessages = generationRequests[2]?.body.messages
-    expect(
-      Array.isArray(switchedMessages) ? switchedMessages : [],
-    ).toContainEqual({
+    expect(Array.isArray(switchedMessages) ? switchedMessages : []).toContainEqual({
       role: 'system',
       content: [],
       output_config: { effort: 'high' },
@@ -176,20 +209,18 @@ describe('OpenCode Anthropic auth e2e', () => {
     expect(JSON.stringify(restoredResult)).toContain('source restored')
     await harness.waitForSessionText(sessionId, 'Returning to Fable 5')
 
-    const generationRequests = harness.anthropic
-      .requests()
-      .filter((request) => {
-        const serializedBody = JSON.stringify(request.body)
-        return (
-          request.body.max_tokens !== 0 &&
-          !serializedBody.includes('Generate a title for this conversation')
-        )
-      })
+    const generationRequests = harness.anthropic.requests().filter((request) => {
+      const serializedBody = JSON.stringify(request.body)
+      return (
+        request.body.max_tokens !== 0 &&
+        !serializedBody.includes('Generate a title for this conversation')
+      )
+    })
     expect(generationRequests).toHaveLength(2)
     expect(generationRequests[0]?.body.fallbacks).toBe('default')
-    expect(
-      generationRequests[0]?.headers['anthropic-beta']?.split(','),
-    ).toContain('server-side-fallback-2026-07-01')
+    expect(generationRequests[0]?.headers['anthropic-beta']?.split(',')).toContain(
+      'server-side-fallback-2026-07-01',
+    )
     expect(generationRequests[1]?.body.fallbacks).toBe('default')
 
     const replayMessages = Array.isArray(generationRequests[1]?.body.messages)
@@ -210,41 +241,20 @@ describe('OpenCode Anthropic auth e2e', () => {
       )
     }) as { content: Array<Record<string, unknown>> } | undefined
     expect(replayAssistant).toBeDefined()
-    const fallbackBlock = replayAssistant?.content.find(
-      (block) => block.type === 'fallback',
-    )
-    expect(fallbackBlock).toEqual({
+    const replayTypes = replayAssistant?.content.map((block) => block.type)
+    expect(replayTypes).toEqual(['text', 'fallback', 'thinking', 'text'])
+    expect(replayAssistant?.content[0]?.text).toBe('source prefix')
+    expect(replayAssistant?.content[1]).toEqual({
       type: 'fallback',
       from: { model: 'claude-fable-5' },
       to: { model: 'claude-opus-5' },
     })
-    const thinkingBlock = replayAssistant?.content.find(
-      (block) => block.type === 'thinking',
-    )
-    expect(thinkingBlock).toMatchObject({
+    expect(replayAssistant?.content[2]).toMatchObject({
       type: 'thinking',
       thinking: 'target reasoning',
       signature: 'mock-target-thinking-signature',
     })
-    const prefixBlock = replayAssistant?.content.find(
-      (block) =>
-        typeof block.text === 'string' && block.text.includes('source prefix'),
-    )
-    expect(prefixBlock).toBeDefined()
-    const suffixBlock = replayAssistant?.content.find(
-      (block) =>
-        typeof block.text === 'string' &&
-        block.text.includes('fallback suffix'),
-    )
-    expect(suffixBlock).toBeDefined()
-
-    const prefixIndex = replayAssistant?.content.indexOf(prefixBlock!) ?? -1
-    const fallbackIndex = replayAssistant?.content.indexOf(fallbackBlock!) ?? -1
-    const thinkingIndex = replayAssistant?.content.indexOf(thinkingBlock!) ?? -1
-    const suffixIndex = replayAssistant?.content.indexOf(suffixBlock!) ?? -1
-    expect(prefixIndex).toBeLessThan(fallbackIndex)
-    expect(fallbackIndex).toBeLessThan(thinkingIndex)
-    expect(thinkingIndex).toBeLessThan(suffixIndex)
+    expect(replayAssistant?.content[3]?.text).toBe('fallback suffix')
     expect(JSON.stringify(generationRequests[1]?.body)).not.toContain(
       'cortexkit-server-fallback-v1',
     )
@@ -268,20 +278,35 @@ describe('OpenCode Anthropic auth e2e', () => {
     const serialized = JSON.stringify(result)
     expect(serialized).not.toContain('unavailable tool')
     expect(serialized).not.toContain('mcp_Read')
-    await harness.waitFor(() => harness!.anthropic.requests().length >= 2, {
-      label: 'tool call and follow-up request captured',
-    })
+    await harness.waitFor(
+      () => harness!.anthropic.requests().length >= 2,
+      { label: 'tool call and follow-up request captured' },
+    )
     expect(
-      harness.anthropic
-        .requests()
-        .some((request) =>
-          JSON.stringify(request.body).includes('hello from sample file'),
-        ),
+      harness.anthropic.requests().some((request) =>
+        JSON.stringify(request.body).includes('hello from sample file'),
+      ),
     ).toBe(true)
   }, 90_000)
 
   it('continues a completed fallback tool call on Opus without replaying the side effect', async () => {
-    harness = await E2EHarness.create({ hybridCache: true })
+    harness = await E2EHarness.create({
+      hybridCache: true,
+      // Use Haiku 5.5 for titles: a filter that excludes only Haiku 4.5 must fail.
+      beforeSpawn: async (env) => {
+        const path = join(env.configDir, 'opencode.json')
+        const config: Record<string, unknown> = JSON.parse(
+          await Bun.file(path).text(),
+        )
+        await Bun.write(
+          path,
+          JSON.stringify({
+            ...config,
+            small_model: 'anthropic/claude-haiku-5-5',
+          }),
+        )
+      },
+    })
 
     const sideEffectPath = join(
       harness.opencode.env.tempDir,
@@ -334,13 +359,20 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
 
     expect(await Bun.file(sideEffectPath).text()).toBe('x')
+    expect(
+      harness.anthropic
+        .requests()
+        .some(
+          (request) =>
+            request.body.model === 'claude-haiku-5-5' &&
+            JSON.stringify(request.body).includes(
+              'Generate a title for this conversation',
+            ),
+        ),
+    ).toBe(true)
     const generationRequests = harness.anthropic
       .requests()
-      .filter(
-        (request) =>
-          request.body.model !== 'claude-haiku-4-5-20251001' &&
-          request.body.max_tokens !== 0,
-      )
+      .filter(isConversationGeneration)
     expect(generationRequests.map((request) => request.body.model)).toEqual([
       'claude-fable-5',
       'claude-fable-5',
@@ -475,19 +507,15 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
     expect(JSON.stringify(recovered)).toContain('second Opus recovery')
 
-    const generationRequests = harness.anthropic
-      .requests()
-      .filter((request) => {
-        const serializedBody = JSON.stringify(request.body)
-        return (
-          request.body.max_tokens !== 0 &&
-          !serializedBody.includes('Generate a title for this conversation')
-        )
-      })
+    const generationRequests = harness.anthropic.requests().filter((request) => {
+      const serializedBody = JSON.stringify(request.body)
+      return (
+        request.body.max_tokens !== 0 &&
+        !serializedBody.includes('Generate a title for this conversation')
+      )
+    })
     expect(generationRequests).toHaveLength(24)
-    expect(
-      generationRequests.slice(0, 11).map((request) => request.body.model),
-    ).toEqual([
+    expect(generationRequests.slice(0, 11).map((request) => request.body.model)).toEqual([
       'claude-fable-5',
       ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
     ])
@@ -504,9 +532,7 @@ describe('OpenCode Anthropic auth e2e', () => {
       const messages = Array.isArray(body.messages) ? body.messages : []
       return messages.flatMap((message, index) => {
         if (!message || typeof message !== 'object') return []
-        const content = Array.isArray(
-          (message as { content?: unknown }).content,
-        )
+        const content = Array.isArray((message as { content?: unknown }).content)
           ? ((message as { content: unknown[] }).content ?? [])
           : []
         return content.some(
@@ -529,11 +555,7 @@ describe('OpenCode Anthropic auth e2e', () => {
         const message = messages[index]
         if (!message || typeof message !== 'object') continue
         const content = (message as { content?: unknown }).content
-        blocks += Array.isArray(content)
-          ? content.length
-          : content == null
-            ? 0
-            : 1
+        blocks += Array.isArray(content) ? content.length : content == null ? 0 : 1
       }
       return blocks - 1
     }
@@ -606,84 +628,50 @@ describe('OpenCode Anthropic auth e2e', () => {
 
     const serialized = JSON.stringify(result)
     expect(serialized).not.toContain('websocket closed')
-    await harness.waitFor(
-      () => (harness!.relay?.acceptedRequests() ?? 0) >= 1,
-      {
-        label: 'websocket relay accepted request',
-      },
-    )
+    await harness.waitFor(() => (harness!.relay?.acceptedRequests() ?? 0) >= 1, {
+      label: 'websocket relay accepted request',
+    })
     await harness.waitFor(() => harness!.anthropic.requests().length >= 1, {
       label: 'upstream request captured',
     })
   }, 90_000)
 })
 
+
 describe('Fable 5.1 effort correlation through real OpenCode lowering', () => {
   it('keeps the current effort anchor across a tool-result continuation', async () => {
     harness = await E2EHarness.create()
     harness.script([
       { type: 'text', text: 'initial low response' },
-      {
-        type: 'tool_use',
-        name: 'mcp_Read',
-        input: { filePath: harness.sampleFilePath() },
-      },
+      { type: 'tool_use', name: 'mcp_Read', input: { filePath: harness.sampleFilePath() } },
       { type: 'text', text: 'high effort tool continuation completed' },
     ])
     const sessionId = await harness.createSession()
-    await harness.sendPrompt(
-      sessionId,
-      'first low request',
-      60_000,
-      'claude-fable-5-1',
-      'low',
-    )
-    const result = await harness.sendPrompt(
-      sessionId,
-      'switch to high and read the sample file',
-      60_000,
-      'claude-fable-5-1',
-      'high',
-    )
-    expect(JSON.stringify(result)).toContain(
-      'high effort tool continuation completed',
-    )
+    await harness.sendPrompt(sessionId, 'first low request', 60_000, 'claude-fable-5-1', 'low')
+    const result = await harness.sendPrompt(sessionId, 'switch to high and read the sample file', 60_000, 'claude-fable-5-1', 'high')
+    expect(JSON.stringify(result)).toContain('high effort tool continuation completed')
 
-    const requests = harness.anthropic
-      .requests()
-      .filter(
-        (request) =>
-          request.body.model === 'claude-fable-5-1' &&
-          !JSON.stringify(request.body).includes(
-            'Generate a title for this conversation',
-          ),
-      )
+    const requests = harness.anthropic.requests().filter((request) =>
+      request.body.model === 'claude-fable-5-1' &&
+      !JSON.stringify(request.body).includes('Generate a title for this conversation'),
+    )
     expect(requests).toHaveLength(3)
     const continuation = requests[2]?.body
     expect(JSON.stringify(continuation?.messages)).toContain('tool_result')
     expect(continuation?.output_config).toEqual({ effort: 'low' })
     expect(continuation?.messages).toContainEqual({
-      role: 'system',
-      content: [],
-      output_config: { effort: 'high' },
+      role: 'system', content: [], output_config: { effort: 'high' },
     })
-    for (const request of requests)
-      expect(JSON.stringify(request.body)).not.toContain(
-        'cortexkit-internal-effort',
-      )
+    for (const request of requests) expect(JSON.stringify(request.body)).not.toContain('cortexkit-internal-effort')
   }, 90_000)
 
   it('applies the last planned effort when OpenCode merges two host user records', async () => {
     harness = await E2EHarness.create({
       beforeSpawn: async (env) => {
         const configPath = join(env.configDir, 'opencode.json')
-        const config = JSON.parse(await readFile(configPath, 'utf8')) as {
-          plugin: string[]
-        }
+        const config = JSON.parse(await readFile(configPath, 'utf8')) as { plugin: string[] }
         const injector = join(env.configDir, 'inject-consecutive-users.mjs')
-        await writeFile(
-          injector,
-          `export default async function () {
+        await writeFile(injector, `export default async function () {
   return {
     'experimental.chat.messages.transform': async (_input, output) => {
       const messages = output.messages
@@ -698,8 +686,7 @@ describe('Fable 5.1 effort correlation through real OpenCode lowering', () => {
       })
     },
   }
-}\n`,
-        )
+}\n`)
         config.plugin.unshift(`file://${injector}`)
         await writeFile(configPath, JSON.stringify(config))
       },
@@ -709,49 +696,25 @@ describe('Fable 5.1 effort correlation through real OpenCode lowering', () => {
       { type: 'text', text: 'max response after merged boundary' },
     ])
     const sessionId = await harness.createSession()
-    await harness.sendPrompt(
-      sessionId,
-      'start at low',
-      60_000,
-      'claude-fable-5-1',
-      'low',
-    )
-    const result = await harness.sendPrompt(
-      sessionId,
-      'raise to max',
-      60_000,
-      'claude-fable-5-1',
-      'max',
-    )
-    expect(JSON.stringify(result)).toContain(
-      'max response after merged boundary',
-    )
+    await harness.sendPrompt(sessionId, 'start at low', 60_000, 'claude-fable-5-1', 'low')
+    const result = await harness.sendPrompt(sessionId, 'raise to max', 60_000, 'claude-fable-5-1', 'max')
+    expect(JSON.stringify(result)).toContain('max response after merged boundary')
 
-    const requests = harness.anthropic
-      .requests()
-      .filter(
-        (request) =>
-          request.body.model === 'claude-fable-5-1' &&
-          !JSON.stringify(request.body).includes(
-            'Generate a title for this conversation',
-          ),
-      )
+    const requests = harness.anthropic.requests().filter((request) =>
+      request.body.model === 'claude-fable-5-1' &&
+      !JSON.stringify(request.body).includes('Generate a title for this conversation'),
+    )
     expect(requests).toHaveLength(2)
     const body = requests[1]?.body
-    const merged = (Array.isArray(body?.messages) ? body.messages : []).filter(
-      (message) =>
-        message.role === 'user' &&
-        JSON.stringify(message.content).includes(
-          'injected high effort boundary',
-        ) &&
-        JSON.stringify(message.content).includes('raise to max'),
+    const merged = (Array.isArray(body?.messages) ? body.messages : []).filter((message) =>
+      message.role === 'user' &&
+      JSON.stringify(message.content).includes('injected high effort boundary') &&
+      JSON.stringify(message.content).includes('raise to max'),
     )
     expect(merged).toHaveLength(1)
     expect(body?.output_config).toEqual({ effort: 'low' })
     expect(body?.messages).toContainEqual({
-      role: 'system',
-      content: [],
-      output_config: { effort: 'max' },
+      role: 'system', content: [], output_config: { effort: 'max' },
     })
     expect(JSON.stringify(body)).not.toContain('cortexkit-internal-effort')
   }, 90_000)

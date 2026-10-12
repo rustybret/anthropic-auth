@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from 'bun:test'
+import { describe, expect } from 'bun:test'
+import { createTestLifetimeSuite } from '../../core/src/tests/test-lifetime.ts'
 import type { ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
@@ -25,17 +26,11 @@ import {
   terminateChildProcess,
 } from '../src/opencode-runner.ts'
 
-const roots: string[] = []
-
-afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-  )
-})
+const { test: it, deferCleanup, trackDetached } = createTestLifetimeSuite()
 
 async function createRoot() {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-hygiene-test-'))
-  roots.push(root)
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
   return root
 }
 
@@ -62,7 +57,11 @@ describe('e2e temporary directory hygiene', () => {
     const staleTime = new Date('2026-07-15T00:00:00.000Z')
     const now = new Date('2026-07-17T00:00:00.000Z')
 
-    await Promise.all([mkdir(oldDir), mkdir(newDir), mkdir(symlinkTarget)])
+    await Promise.all([
+      mkdir(oldDir),
+      mkdir(newDir),
+      mkdir(symlinkTarget),
+    ])
     await symlink(symlinkTarget, join(root, 'anthropic-auth-e2e-link'))
     await utimes(oldDir, staleTime, staleTime)
     await utimes(newDir, now, now)
@@ -128,7 +127,9 @@ describe('e2e temporary directory hygiene', () => {
     await Promise.all([mkdir(removedDir), mkdir(keptDir)])
 
     expect(await removeE2ETempDir(removedDir, { root })).toBe(true)
-    expect(await removeE2ETempDir(keptDir, { root, keep: true })).toBe(false)
+    expect(
+      await removeE2ETempDir(keptDir, { root, keep: true }),
+    ).toBe(false)
     expect((await readdir(root)).sort()).toEqual(['anthropic-auth-e2e-keep'])
   })
 
@@ -157,11 +158,12 @@ describe('e2e temporary directory hygiene', () => {
     }
     let resolved = false
 
-    const termination = terminateChildProcess(
-      child as unknown as ChildProcess,
-    ).then(() => {
-      resolved = true
-    })
+    const termination = terminateChildProcess(child as unknown as ChildProcess).then(
+      () => {
+        resolved = true
+      },
+    )
+    trackDetached(termination)
     await Bun.sleep(0)
 
     expect(child.killSignals).toEqual(['SIGTERM'])
@@ -188,15 +190,13 @@ describe('e2e temporary directory hygiene', () => {
     }
     let resolved = false
 
-    const termination = terminateChildProcess(
-      child as unknown as ChildProcess,
-      {
-        termTimeoutMs: 5,
-        killExitTimeoutMs: 100,
-      },
-    ).then(() => {
+    const termination = terminateChildProcess(child as unknown as ChildProcess, {
+      termTimeoutMs: 5,
+      killExitTimeoutMs: 100,
+    }).then(() => {
       resolved = true
     })
+    trackDetached(termination)
     await Bun.sleep(20)
 
     expect(child.killSignals).toEqual(['SIGTERM', 'SIGKILL'])
@@ -217,13 +217,10 @@ describe('e2e temporary directory hygiene', () => {
     child.signalCode = null
     child.kill = () => true
 
-    const exited = await terminateChildProcess(
-      child as unknown as ChildProcess,
-      {
-        termTimeoutMs: 5,
-        killExitTimeoutMs: 5,
-      },
-    )
+    const exited = await terminateChildProcess(child as unknown as ChildProcess, {
+      termTimeoutMs: 5,
+      killExitTimeoutMs: 5,
+    })
 
     expect(exited).toBe(false)
   })
@@ -347,7 +344,7 @@ describe('e2e temporary directory hygiene', () => {
     const root = await createRoot()
     const env = createIsolatedEnv(root)
     const externalDir = await mkdtemp(join(tmpdir(), 'e2e-pid-target-'))
-    roots.push(externalDir)
+    deferCleanup(() => rm(externalDir, { recursive: true, force: true }))
     const externalRunPid = join(externalDir, 'run.pid')
     await writeFile(externalRunPid, 'do not overwrite')
     await rm(env.tempDir, { recursive: true, force: true })
@@ -396,22 +393,20 @@ describe('e2e temporary directory hygiene', () => {
   })
 
   it('surfaces spawn errors and removes the temp directory', async () => {
-    const originalPath = process.env.PATH
+    const root = await createRoot()
+    const executable = join(root, 'missing-opencode')
     let tempDir = ''
-    process.env.PATH = ''
+    expect(await Bun.file(executable).exists()).toBe(false)
 
-    try {
-      await expect(
-        spawnOpencode({
-          anthropicBaseURL: 'http://127.0.0.1:1',
-          beforeSpawn: (env) => {
-            tempDir = env.tempDir
-          },
-        }),
-      ).rejects.toThrow(/Executable not found|ENOENT|spawn opencode/)
-    } finally {
-      process.env.PATH = originalPath
-    }
+    const spawning = spawnOpencode({
+      executable,
+      anthropicBaseURL: 'http://127.0.0.1:1',
+      beforeSpawn: (env) => {
+        tempDir = env.tempDir
+      },
+    })
+    await expect(spawning).rejects.toThrow(/Executable not found|ENOENT/)
+    await expect(spawning).rejects.toThrow(executable)
 
     expect(tempDir).not.toBe('')
     expect(await Bun.file(tempDir).exists()).toBe(false)

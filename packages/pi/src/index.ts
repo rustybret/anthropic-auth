@@ -1,118 +1,78 @@
 import {
-  authorize,
   CLAUDE_FABLE_MYTHOS_5_1_PRICING,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_FABLE_MYTHOS_5_PRICING,
+  CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
+  CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING,
+  CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+  CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_HAIKU_5_5_MODEL_ID,
+  CLAUDE_HAIKU_5_5_PRICING,
   CLAUDE_SONNET_5_5_CONTEXT_WINDOW,
   CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_SONNET_5_5_MODEL_ID,
   CLAUDE_SONNET_5_5_PRICING,
-  type ClaustrumScopedClient,
-  exchange,
-  getClaustrumMode,
   isClaudeFableOrMythos51Model,
-  loadAccounts,
   type MidConversationEffortTransition,
-  refreshClaudeOAuthToken,
+  type NativeAccountSnapshot,
+  type NativeCustodyClient,
 } from '@cortexkit/anthropic-auth-core'
-import type {
-  OAuthCredentials,
-  OAuthLoginCallbacks,
-  Provider,
-  SimpleStreamOptions,
-} from '@earendil-works/pi-ai'
+import type { Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
 import type {
   ExtensionAPI,
   ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
-import { createPiCustodyCommands, requirePiEnrollment } from './custody.ts'
 import {
   collectPiEffortHistory,
   deriveContextEntries,
 } from './effort-history.ts'
-import { getPiAccountStoragePath } from './paths.ts'
 import {
-  closePiScopedRuntime,
-  getPiScopedRuntime,
-  streamCortexKitAnthropic,
-} from './stream.ts'
-
-async function assertLocalAuthentication(): Promise<void> {
-  if (
-    getClaustrumMode(await loadAccounts(getPiAccountStoragePath())) ===
-    'claustrum'
-  ) {
-    throw new Error(
-      'Local Anthropic login and refresh are disabled while Claustrum custody is active',
-    )
-  }
-}
-
-async function loginAnthropic(
-  callbacks: OAuthLoginCallbacks,
-): Promise<OAuthCredentials> {
-  await assertLocalAuthentication()
-  const auth = await authorize('max')
-  callbacks.onAuth({ url: auth.url })
-  const callback = await callbacks.onPrompt({
-    message: 'Paste the Claude OAuth callback URL or code:',
-  })
-  const result = await exchange(
-    callback,
-    auth.verifier,
-    auth.redirectUri,
-    auth.state,
-  )
-  if (result.type !== 'success') {
-    throw new Error('Anthropic OAuth exchange failed')
-  }
-  await assertLocalAuthentication()
-  return {
-    refresh: result.refresh,
-    access: result.access,
-    expires: result.expires,
-  }
-}
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  isNativeMigrationRequired,
+} from './native.ts'
+import { createPiNativeCommands } from './native-commands.ts'
+import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
+import { streamCortexKitAnthropic } from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
   return ['text', 'image']
 }
 
-async function refreshAnthropicToken(
-  credentials: OAuthCredentials,
-): Promise<OAuthCredentials> {
-  await assertLocalAuthentication()
-  const refreshed = await refreshClaudeOAuthToken({
-    refreshToken: credentials.refresh,
+/**
+ * Refuses every Anthropic prompt with Core's migration message. Registered
+ * only when startup found an install that offline setup has never migrated.
+ * Pi checks a prompt's credentials after its input handlers run. Handling the
+ * input here stops it before that check, which would otherwise answer with
+ * Pi's generic missing-key text for a 1.x install whose Pi login is still
+ * stored. Extension commands such as /claude run before input handlers, so
+ * they stay reachable.
+ */
+function refuseUnmigratedPrompts(pi: ExtensionAPI, refusal: string) {
+  pi.on('input', (_event, ctx) => {
+    // Prompts for other providers do not use this install's accounts.
+    if (ctx.model?.provider !== 'anthropic') return { action: 'continue' }
+    if (ctx.hasUI) ctx.ui.notify(refusal, 'error')
+    else process.stderr.write(`${refusal}\n`)
+    return { action: 'handled' }
   })
-
-  return {
-    refresh: refreshed.refresh,
-    access: refreshed.access,
-    expires: refreshed.expires,
-  }
 }
 
 export default async function cortexKitPiAnthropicAuth(
   pi: ExtensionAPI,
   options: {
-    connectScoped?: () => Promise<ClaustrumScopedClient>
-    pollIntervalMs?: number
+    connectScoped?: () => Promise<NativeCustodyClient>
   } = {},
 ) {
   const storagePath = getPiAccountStoragePath()
-  registerCommands(
-    pi,
-    createPiCustodyCommands({
-      storagePath,
-      reconfigure: configureProvider,
-      connect: options.connectScoped,
-    }),
-  )
+  getPiNativeRuntime(storagePath, {
+    ...(options.connectScoped && { connect: options.connectScoped }),
+  })
+  registerCommands(pi, createPiNativeCommands(storagePath))
   const effortHistoryBySession = new Map<
     string,
     MidConversationEffortTransition[]
@@ -148,7 +108,7 @@ export default async function cortexKitPiAnthropicAuth(
   pi.on('session_shutdown', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) effortHistoryBySession.delete(sessionId)
-    closePiScopedRuntime(storagePath)
+    closePiNativeRuntime(storagePath)
   })
 
   const configuration: ProviderConfig = {
@@ -230,6 +190,35 @@ export default async function cortexKitPiAnthropicAuth(
         maxTokens: 128_000,
       },
       {
+        id: CLAUDE_HAIKU_5_5_MODEL_ID,
+        name: 'Claude Haiku 5.5',
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        input: textImageInput(),
+        cost: {
+          input: CLAUDE_HAIKU_5_5_PRICING.input,
+          output: CLAUDE_HAIKU_5_5_PRICING.output,
+          cacheRead: CLAUDE_HAIKU_5_5_PRICING.cacheRead,
+          cacheWrite: CLAUDE_HAIKU_5_5_PRICING.cacheWrite5m,
+          tiers: [
+            {
+              inputTokensAbove: CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+              input: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.input,
+              output: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.output,
+              cacheRead: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.cacheRead,
+              cacheWrite: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.cacheWrite5m,
+            },
+          ],
+        },
+        contextWindow: CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
+        maxTokens: CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS,
+      },
+      {
         id: CLAUDE_SONNET_5_5_MODEL_ID,
         name: 'Claude Sonnet 5.5',
         reasoning: true,
@@ -250,12 +239,6 @@ export default async function cortexKitPiAnthropicAuth(
         maxTokens: CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
       },
     ],
-    oauth: {
-      name: 'Anthropic Claude Pro/Max (CortexKit)',
-      login: loginAnthropic,
-      refreshToken: refreshAnthropicToken,
-      getApiKey: (credentials) => credentials.access,
-    },
     streamSimple: (model, context, options) =>
       streamCortexKitAnthropic(
         model,
@@ -268,37 +251,64 @@ export default async function cortexKitPiAnthropicAuth(
   }
 
   async function configureProvider() {
-    if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum') {
-      closePiScopedRuntime(storagePath)
-      pi.registerProvider('anthropic', configuration)
-      return
-    }
     const streamSimple = configuration.streamSimple
     if (!streamSimple)
       throw new Error('Anthropic stream implementation is unavailable')
+    // Read the account list installed by offline migration before registering
+    // the provider, so a vault account list is loaded before Pi first checks
+    // whether this provider is configured. Token authorization happens
+    // separately for each request.
+    try {
+      await getPiNativeRuntime(storagePath).view()
+    } catch (error) {
+      // An install that offline setup has never migrated, such as a 1.x
+      // install upgraded in place, must still load: a failed load drops the
+      // /claude menu and Pi exits at startup. Its prompts are refused instead.
+      // Any other failure stops the load as before.
+      const refusal = await getPiNativeRuntime(storagePath).migrationRefusal()
+      if (!refusal) throw error
+      refuseUnmigratedPrompts(pi, refusal.message)
+    }
     const configured = async () => {
-      if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum')
-        return false
-      await requirePiEnrollment()
-      return true
+      await requirePiNativeHostAuth()
+      let snapshot: NativeAccountSnapshot
+      try {
+        snapshot = await (
+          await getPiNativeRuntime(storagePath).service()
+        ).read()
+      } catch (error) {
+        // An unmigrated install still reports the provider as configured, so
+        // Pi keeps its Anthropic models selectable and its prompts reach the
+        // refusal above (or, from any other caller, the stream, which refuses
+        // with the same Core message). If this check threw instead, Pi would
+        // record the refusal as a startup availability error.
+        if (isNativeMigrationRequired(error)) return true
+        throw error
+      }
+      return snapshot.accounts.some(
+        (account) =>
+          account.type === 'oauth' &&
+          account.enabled &&
+          (account.source !== 'vault' || account.state === 'active'),
+      )
     }
     const provider: Provider = {
       id: 'anthropic',
-      name: 'Anthropic (Claustrum)',
+      name: 'Anthropic (CortexKit Native)',
       baseUrl: 'https://api.anthropic.com',
       auth: {
         // Native ambient auth avoids fake keys and local OAuth refresh. Pi refuses
         // a leftover stored OAuth credential because this provider has no OAuth
         // handler; setup must obtain consent before removing that local entry.
         apiKey: {
-          name: 'Claustrum',
+          name: 'CortexKit Native',
           check: async () =>
             (await configured())
-              ? { type: 'api_key', source: 'Claustrum' }
+              ? { type: 'api_key', source: 'CortexKit Native' }
               : undefined,
           resolve: async () =>
             (await configured())
-              ? { auth: {}, source: 'Claustrum' }
+              ? { auth: {}, source: 'CortexKit Native' }
               : undefined,
         },
       },
@@ -315,12 +325,6 @@ export default async function cortexKitPiAnthropicAuth(
       streamSimple,
     }
     pi.registerProvider(provider)
-    getPiScopedRuntime(storagePath, {
-      ...(options.connectScoped && { connect: options.connectScoped }),
-      ...(options.pollIntervalMs !== undefined && {
-        pollIntervalMs: options.pollIntervalMs,
-      }),
-    }).start()
   }
   await configureProvider()
 }
