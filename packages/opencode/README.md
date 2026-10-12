@@ -1,17 +1,7 @@
-# Anthropic Auth for OpenCode (Fleet Fork)
+# CortexKit Anthropic Auth for OpenCode and Pi
 
-## Todo: update all references to "bunx @cortexkit/" with local dev and or arcus specific package scripts, and ensure clean separation in those scripts with arcus published packages vs upstream ones. 
+Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), maintained by CortexKit.
 
-Claude Pro/Max OAuth support for [OpenCode](https://opencode.ai), maintained as a private fleet fork distributed via [Arcus](https://github.com/rustybret/arcus).
-
-This package is part of the `rustybret/anthropic-auth` downstream fork of upstream `cortexkit/anthropic-auth`. It provides Anthropic OAuth interception, multi-account fallback, prompt caching, quota tracking, TUI sidebar integration, and request signing for OpenCode, packaged as an Arcus v3 plugin bundle.
-
-## Fork Identity & Ecosystem Differentiation
-
-- **Distribution**: This fork is packaged exclusively as an **Arcus v3 release envelope** registered in `arcus-blessed-plugins.json`. It is never published to the public npm registry.
-- **Packaging Pipeline**: Uses Arcus Consumer Template (`packages/arcus/bootstrap.sh` + symlinked pipeline scripts in `scripts/`), driven locally with `scripts/pack-arcus.sh` and canonicalized in CI via Cloudhome BuildKit (`arcus-release-upload`). Submodules of the Arcus repo are strictly prohibited.
-- **Fork Synchronization**: Synchronized with upstream `cortexkit/anthropic-auth` via `scripts/fork-sync.sh` with automated dependency hydration and lockfile merge handling.
-- **Local Loading**: Loaded directly by OpenCode through Arcus or via `file://` references to `packages/opencode/dist/index.js`.
 This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi extension that replaces the implementation of Pi's built-in Anthropic provider while keeping its `anthropic` provider ID and model IDs. Both integrations share the same Anthropic OAuth, account-pool, quota, prompt-cache, relay, dump, and request-signing logic through `@cortexkit/anthropic-auth-core`.
 
 > [!IMPORTANT]
@@ -19,13 +9,11 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 
 ## Packages
 
-### TODO: add arcus pacakge info here
-
 | Package | Agent | Purpose |
 | --- | --- | --- |
-| `opencode-anthropic-auth` | OpenCode | OpenCode plugin and CLI for Claude OAuth, request rewriting, fallback accounts, quotas, cache controls, dumps, and relay setup. |
-| `pi-anthropic-auth` | Pi | Pi extension that replaces the implementation of Pi's built-in Anthropic provider, keeping the `anthropic` provider ID and model IDs. |
-| `anthropic-auth-core` | Shared | Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic used by both integrations. |
+| `@cortexkit/opencode-anthropic-auth` | OpenCode | OpenCode plugin and CLI for Claude OAuth, request rewriting, fallback accounts, quotas, cache controls, dumps, and relay setup. |
+| `@cortexkit/pi-anthropic-auth` | Pi | Pi extension that replaces the implementation of Pi's built-in Anthropic provider, keeping the `anthropic` provider ID and model IDs. |
+| `@cortexkit/anthropic-auth-core` | Shared | Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic used by both integrations. |
 
 ## Support matrix
 
@@ -41,7 +29,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Quota sidebar widget | OpenCode TUI plugin via `tui.json` | Not available |
 | Fallback accounts, quota routing, relay, dumps, fast mode | Supported | Supported through the same shared core |
 
-## What We add over the original plugin
+## What CortexKit adds over the original plugin
 
 - **Fallback Claude accounts**: keep a main Claude account and route to ordered fallback OAuth accounts or API-key routes on auth/quota/rate-limit failures.
 - **Routing modes**: choose **Routing mode** → `sticky-balanced` in the `/claude` menu to spread new sessions across OAuth accounts by current quota headroom while keeping each session on one account, or choose `main-first` / `fallback-first` ordering.
@@ -55,7 +43,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Claude Haiku 5.5**: `claude-haiku-5-5` supports a 1M context, 128K output and native `low` through `max` adaptive effort. Forced tool choice remains supported. Configured `error` or `drop_block` behavior handles replayed thinking after earlier conversation content changes. Explicit disabled thinking is preserved, with incompatible `xhigh`/`max` effort capped to `high`; manual budgets and sampling parameters are removed. Standard input/output rates are $0.10/$0.50 per million tokens, with fivefold request-wide rates above 100K total input including cache. OAuth model costs are zeroed by default. Opt-in quota-window priming uses Haiku 4.5 to start a new quota window.
 - **Fable/Opus 5 and 5.5 safety fallback (OpenCode)**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
 - **Live quota visibility**: the `/claude` menu's Quota group shows main and fallback quota state, reset times, and refresh errors.
-- **Host-local quota feed (OpenCode)**: optionally publish sanitized response-header quota observations so another local sk fleet process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
+- **Host-local quota feed (OpenCode)**: optionally publish sanitized response-header quota observations so another local CortexKit process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
 - **Quota sidebar widget**: register the OpenCode TUI plugin in `tui.json` to render a live sidebar with per-account quota, routing, cache, and health state.
 - **Killswitch (OpenCode menu)**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
@@ -79,14 +67,13 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 In this guide, a *host* is OpenCode or Pi. Setup is an *offline* step: every OpenCode, LiteCode, and Pi process must be closed while it runs. Offline does not mean without network; setup still uses the network, for example to install packages and to sign in to Claude. Quit those processes, then run:
 
 ```bash
-opencode-anthropic-auth setup
+bunx @cortexkit/opencode-anthropic-auth setup
 ```
 
 What setup does:
 
 - detects OpenCode, Pi, `ck`, and a running Claustrum daemon (Claustrum is a local credential-vault service; `ck` is its command-line tool), and lets you select which hosts to configure;
 - adds `@cortexkit/opencode-anthropic-auth` to `opencode.jsonc` (or `opencode.json`) and `tui.jsonc` (or `tui.json`), and installs `@cortexkit/pi-anthropic-auth` with `pi install`;
-## TODO: we don't want doctor to auto add this to the config files for our rustybret fork
 - migrates each selected host to its local account pool, unless you choose Claustrum vault custody;
 - enrolls each selected host in the vault when you choose vault custody (it asks, and defaults to no).
 
@@ -105,41 +92,16 @@ Setup refuses to change anything while an OpenCode, LiteCode, or Pi process is r
 
 ## Install
 
-### OpenCode (Arcus & Fleet Deployment)
+### OpenCode
 
-In the OpenCode fleet, this plugin is distributed through **Arcus v2** and loaded via the blessed plugin composition:
+Add the OpenCode plugin to your OpenCode configuration:
 
-1. **Arcus Distribution (Recommended for Fleet)**:
-   The plugin is declared in `arcus-blessed-plugins.json` and installed into the OpenCode environment via the Arcus toolchain.
+```json
+{
+  "plugin": ["@cortexkit/opencode-anthropic-auth"]
+}
+```
 
-2. **Local Development Build (`file://`)**:
-   Point your `~/.config/opencode/opencode.json` and `tui.json` directly to the local built bundle:
-
-   ```json
-   {
-     "plugin": ["file://<dir_path>/anthropic-auth/packages/opencode/dist/index.js"]
-   }
-   ```
-
-   And for the TUI widget in `~/.config/opencode/tui.json`:
-
-   ```json
-   {
-     "plugin": ["file://<dir_path>/anthropic-auth/packages/opencode"]
-   }
-   ```
-
-   Run `bun run build` to update the bundled output in `dist/` or `bun run dev` for continuous watch compilation.
-
-3. **Upstream npm Reference**:
-   If using the upstream CortexKit release outside of the Arcus fleet:
-
-   ```json
-   {
-     "plugin": ["@cortexkit/opencode-anthropic-auth@2.0.0"]
-   }
-   ```
-   
 Pinning is strongly recommended for any OpenCode plugin. Replace `VERSION` with the release you install:
 
 ```json
@@ -155,19 +117,9 @@ OpenCode 1 and OpenCode 2 load the same package. After changing plugin config, r
 
 ### Pi
 
-For local development or fleet testing:
+Install the Pi package with Pi's package manager:
 
 ```bash
-pi -e file://<dir_path>/anthropic-auth/packages/pi
-```
-
-Or when running the upstream npm release:
-
-```bash
-pi install npm:@cortexkit/pi-anthropic-auth@2.0.0
-```
-
-The Pi package registers a CortexKit Anthropic provider extension under Pi's built-in `anthropic` provider ID. After installation, start or restart Pi and authenticate with Pi's normal login command:
 pi install npm:@cortexkit/pi-anthropic-auth
 ```
 
@@ -783,7 +735,7 @@ The dump setting is saved with the host's other plugin settings. Dumps may conta
 | `PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE` | Override the persistent Pi sticky-balanced session assignment file. |
 | `PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Override the temporary Pi CacheKeep session lease directory. |
 | `PI_CODING_AGENT_DIR`, `PI_AGENT_DIR` | Override Pi's agent directory when deriving default paths. |
-| `XDG_STATE_HOME` | Base directory for the default enrollment files (`rustybret/anthropic-auth/<host>-enrollment.json`). Defaults to `~/.local/state`. |
+| `XDG_STATE_HOME` | Base directory for the default enrollment files (`cortexkit/anthropic-auth/<host>-enrollment.json`). Defaults to `~/.local/state`. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID used by relay setup. |
 
@@ -841,7 +793,7 @@ bun run build      # Deploy: bun build → bundled dist/ with all deps inlined (
 bun run build:dev  # Dev: tsc → individual dist/*.js files (requires workspace node_modules)
 ```
 
-The default `build` uses `bun build` to bundle `anthropic-auth-core` and all transitive dependencies into self-contained output files. No `node_modules/` needed at runtime — the plugin works via `file://` path in OpenCode config:
+The default `build` uses `bun build` to bundle `@cortexkit/anthropic-auth-core` and all transitive dependencies into self-contained output files. No `node_modules/` needed at runtime — the plugin works via `file://` path in OpenCode config:
 
 ```json
 {
@@ -873,32 +825,35 @@ Clean the local dev symlink with:
 bun run dev:clean
 ```
 
-## Arcus Distribution & Packaging
+## Release
 
-This repository is distributed to the OpenCode fleet via **Arcus v2**. Packaging and publishing scripts are driven through the Arcus pipeline:
+This repo uses CortexKit's tag-driven release workflow.
+
+Preview a release:
 
 ```bash
-# Verify pipeline scripts and self-tests across all scripts
-bun run test:arcus
-# or
-bun run pipeline:arcus self-test
-
-# Package 5-canonical-target release envelope locally (darwin-arm64, darwin-x64, linux-arm64, linux-x64, windows-x64)
-bun run pack:arcus
-
-# Canonical release:
-# 1. Push commits and tag to origin: git push origin main && git push origin v1.22.0
-# 2. Cloudhome BuildKit CI (arcus-release-upload) builds, signs, and commits the descriptor to rustybret/arcus
-# 3. uc-studio independently validates and promotes the release in arcus-blessed-plugins.json
+./scripts/release.sh 1.9.0 --dry
 ```
 
-See [scripts/AGENTS.md](../../scripts/AGENTS.md) for full script inventory and architecture details.
+Create and push the release tag:
+
+```bash
+./scripts/release.sh 1.9.0
+```
+
+Wait for GitHub Actions:
+
+```bash
+./scripts/wait-release.sh v1.9.0
+```
+
+The release workflow runs checks, publishes the core, OpenCode, and Pi packages to npm with provenance, and creates the GitHub release.
 
 ## Troubleshooting
 
 - Clear OpenCode's plugin cache after plugin config changes: `rm -rf ~/.cache/opencode`.
 - Start OpenCode or Pi again only after setup finishes; setup requires every host process to be stopped.
-- If an OpenCode fallback account shows `invalid_grant`, run `login <label>` again for that account. For the main account, sign in again from the host (see [Signing in](#signing-in)) or stop the hosts and run `setup --login --no-claustrum`.
+- If an OpenCode fallback account shows `invalid_grant`, run `bunx @cortexkit/opencode-anthropic-auth login <label>` again for that account. For the main account, sign in again from the host (see [Signing in](#signing-in)) or stop the hosts and run `setup --login --no-claustrum`.
 - If requests refuse because the enrollment record cannot be read, repair the enrollment files or use **Disconnect from the vault** in `/claude`, which removes them and returns the host to local accounts.
 - If requests refuse because OpenCode holds a separate Anthropic login while enrolled in the vault, remove that login, then choose **Claude via credential vault** (OpenCode 1) or **Claude vault accounts** (OpenCode 2); or disconnect from the vault.
 - Tail relay diagnostics when debugging relay setup: `tail -f "$(node -p 'require("node:os").tmpdir()')/opencode-anthropic-auth.log"`.

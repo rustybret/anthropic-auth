@@ -77,20 +77,20 @@ bun run setup
 
 ## 2. Packaging & Dist Directory Standard
 
-Packaging produces self-contained, validated release envelopes and archives organized by version and sequence:
+Packaging produces self-contained, validated release envelopes and archives organized by **sequence** first. Sequence is the release timeline and only ever increases (it never resets on an upstream version bump); version is a display-only label. For a multi-component suite, every component takes `max(all component sequences) + 1`:
 
 ```bash
 # Verify pipeline self-tests and packaging assertions
 bun run test:arcus
 
-# Package into tidy dist/<version>/<sequence>/opencode-anthropic-auth/
+# Package into tidy dist/<sequence>/opencode-anthropic-auth/<version>/
 bun run pack:arcus
 ```
 
 ### Packaging Driver (`scripts/pack-arcus.sh`)
 `scripts/pack-arcus.sh` acts as the target-assembly driver for `@cortexkit/opencode-anthropic-auth`:
-- **Standard Dist Hierarchy**: Automatically defaults output to `dist/<version>/<sequence>/<package_id>/`.
-- **Sequence Auto-Allocation**: When `--sequence` is omitted, it invokes `arcus manifest allocate-sequence` against the local Arcus catalog to assign the next monotonic sequence number.
+- **Standard Dist Hierarchy**: Automatically defaults output to `dist/<sequence>/<package_id>/<version>/`, which is itself a complete submission bundle.
+- **Sequence Auto-Allocation**: When `--sequence` is omitted, it asks the live gateway (`arcus manifest allocate-sequence --gateway …`) for the next monotonic sequence, falling back to the local Arcus catalog checkout (or forced with `--offline`).
 - **Dynamic Binary Discovery**: Resolves the `arcus` CLI binary from `$PATH`, candidate local build trees, or `ARCUS_BIN`.
 - **Argv Key Guard**: Prevents leaking private keys in command-line arguments (rejects raw key values passed via `--key`, `--signing-key`, or `--private-key`; accepts `--key-env`, `--key-file`, or stdin).
 - **Hermetic Self-Test**: Supports `--self-test` to validate argument parsing, exit codes, and sequence logic safely.

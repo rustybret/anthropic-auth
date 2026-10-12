@@ -49,4 +49,4 @@ verification-inputs/
 *.flow.log
 captures/*.txt
 # omo/ralph-loop local agent state (never project work)
-/.omo/
+.omo/

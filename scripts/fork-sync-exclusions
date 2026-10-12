@@ -2,6 +2,8 @@
 # Format: <action>: <glob>
 #
 # keep-deleted: files removed in this fork that upstream might re-introduce
+# keep-ours:   fork-owned files — our version always wins, on conflict AND after a
+#              textually clean merge (a rewritten file can merge into a hybrid)
 # take-theirs: pure checkout — upstream's version is always preferred as-is
 # regenerate:  checkout upstream's version, run the rebuild command for THAT
 #              FILE'S ecosystem, then stage the result INTO the merge commit
@@ -22,6 +24,11 @@ keep-deleted: scripts/wait-release.sh
 keep-deleted: scripts/version-sync.mjs
 keep-deleted: .github/workflows/release.yaml
 keep-deleted: .github/workflows/release.yml
+
+# Fork-owned documentation: README.md documents ONLY what differs from upstream and
+# links to upstream's README rather than vendoring it, so upstream README edits
+# must never reach this file.
+keep-ours: README.md
 
 # Lockfile
 regenerate: bun.lock

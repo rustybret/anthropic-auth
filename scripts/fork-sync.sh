@@ -7,6 +7,7 @@
 #   1b. fast-forward to origin if origin is ahead
 #   2. merge upstream/<branch> into current branch (default: main)
 #   3. auto-resolve standing conflict classes from scripts/fork-sync-exclusions
+#      (keep-deleted, keep-ours, take-theirs, regenerate)
 #   4. reconcile regenerated artifacts (lockfiles) into the merge commit
 #   5. verify build passes
 #   6. push to origin (unless FORK_SYNC_NO_PUSH=1)
@@ -43,6 +44,7 @@ fi
 KEEP_DELETED=()
 TAKE_THEIRS=()
 REGENERATE=()
+KEEP_OURS=()
 
 # trim <string> — strip surrounding whitespace. Manifest values are used both as
 # match patterns AND as literal git pathspecs, so they must be normalized here
@@ -62,6 +64,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   case "$line" in
     keep-deleted:*) KEEP_DELETED+=("$(trim "${line#keep-deleted:}")") ;;
     take-theirs:*)  TAKE_THEIRS+=("$(trim "${line#take-theirs:}")") ;;
+    keep-ours:*)    KEEP_OURS+=("$(trim "${line#keep-ours:}")") ;;
     regenerate:*)   REGENERATE+=("$(trim "${line#regenerate:}")") ;;
     *) echo "warning: unrecognized manifest line: $line" >&2 ;;
   esac
@@ -207,6 +210,12 @@ else
       continue
     fi
 
+    if matches_any "$conflict_file" ${KEEP_OURS[@]+"${KEEP_OURS[@]}"}; then
+      git -C "$ROOT" checkout --ours -- "$conflict_file"
+      git -C "$ROOT" add -- "$conflict_file"
+      continue
+    fi
+
     if matches_any "$conflict_file" ${TAKE_THEIRS[@]+"${TAKE_THEIRS[@]}"}; then
       git -C "$ROOT" checkout --theirs -- "$conflict_file"
       git -C "$ROOT" add -- "$conflict_file"
@@ -247,6 +256,33 @@ else
   fi
 
   git -C "$ROOT" commit --no-edit
+fi
+
+# --- 2b. enforce keep-ours -------------------------------------------------------
+# A fork-owned file (e.g. a README rewritten to describe only fork differences)
+# can still merge "cleanly" into a hybrid when upstream's hunks happen not to
+# overlap ours. Restore our pre-merge version after EVERY real merge, folded
+# into the merge commit. Skipped for fast-forwards: amending would rewrite an
+# upstream commit.
+if [[ "${#KEEP_OURS[@]}" -gt 0 ]]; then
+  POST_PARENTS="$(git -C "$ROOT" rev-list --parents -n 1 HEAD | awk '{print NF-1}')"
+  if [[ "$POST_PARENTS" -ge 2 && "$(git -C "$ROOT" rev-parse HEAD)" != "$PRE_MERGE_HEAD" ]]; then
+    OURS_RESTORED=()
+    while IFS= read -r changed_file; do
+      [[ -z "$changed_file" ]] && continue
+      if matches_any "$changed_file" "${KEEP_OURS[@]}"; then
+        git -C "$ROOT" cat-file -e "$PRE_MERGE_HEAD:$changed_file" 2>/dev/null || continue
+        git -C "$ROOT" checkout "$PRE_MERGE_HEAD" -- "$changed_file"
+        OURS_RESTORED+=("$changed_file")
+      fi
+    done < <(git -C "$ROOT" diff --name-only "$PRE_MERGE_HEAD" HEAD)
+
+    if [[ "${#OURS_RESTORED[@]}" -gt 0 ]]; then
+      echo "Restoring fork-owned files from this fork (keep-ours): ${OURS_RESTORED[*]}"
+      git -C "$ROOT" add -- "${OURS_RESTORED[@]}"
+      git -C "$ROOT" commit --amend --no-edit
+    fi
+  fi
 fi
 
 # --- 3. verify build -----------------------------------------------------------

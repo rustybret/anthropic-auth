@@ -30,7 +30,7 @@ const defaultExclusions =
   '# fixture\nkeep-deleted: dist-arcus/*\nkeep-deleted: captures/*\nregenerate: bun.lock\n'
 
 describe('fork-sync exclusion manifest', () => {
-  it('parses to the three supported action verbs only', () => {
+  it('parses to the four supported action verbs only', () => {
     const verbs = manifest
       .split('\n')
       .map((line) => line.replace(/#.*$/, '').trim())
@@ -39,7 +39,12 @@ describe('fork-sync exclusion manifest', () => {
 
     expect(verbs.length).toBeGreaterThan(0)
     for (const verb of verbs) {
-      expect(['keep-deleted', 'take-theirs', 'regenerate']).toContain(verb)
+      expect([
+        'keep-deleted',
+        'keep-ours',
+        'take-theirs',
+        'regenerate',
+      ]).toContain(verb)
     }
   })
 
@@ -77,13 +82,23 @@ describe('fork-sync.sh structure and behavior', () => {
   })
 
   it('handles every verb the manifest is allowed to use', () => {
-    for (const verb of ['keep-deleted', 'take-theirs', 'regenerate']) {
+    for (const verb of [
+      'keep-deleted',
+      'keep-ours',
+      'take-theirs',
+      'regenerate',
+    ]) {
       expect(script).toContain(`${verb}:*)`)
     }
   })
 
   it('normalizes manifest values before using them as git pathspecs', () => {
-    for (const verb of ['keep-deleted', 'take-theirs', 'regenerate']) {
+    for (const verb of [
+      'keep-deleted',
+      'keep-ours',
+      'take-theirs',
+      'regenerate',
+    ]) {
       const pattern = new RegExp(
         `${verb}:\\*\\)\\s*\\w+\\+=\\("\\$\\(trim "\\$\\{line#${verb}:\\}"\\)"\\)`,
       )
@@ -345,6 +360,88 @@ describe('fork-sync integration', () => {
       rmSync(fixture.root, { recursive: true, force: true })
     }
   }, 20000)
+
+  it('keeps the fork README on a conflicting upstream README edit', () => {
+    const fixture = makeFixture('keep-ours: README.md\n')
+    try {
+      forkCommit(fixture, 'README.md', '# fork-only readme\n')
+      upstreamCommit(fixture, 'README.md', '# upstream readme\n')
+      const result = runSync(fixture)
+      expect(result.status).toBe(0)
+      expect(readFileSync(join(fixture.fork, 'README.md'), 'utf8')).toBe(
+        '# fork-only readme\n',
+      )
+      expect(existsSync(join(fixture.fork, '.git', 'MERGE_HEAD'))).toBe(false)
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true })
+    }
+  }, 20000)
+
+  it('restores the fork README when git merges both edits cleanly into a hybrid', () => {
+    const fixture = makeFixture('keep-ours: README.md\n')
+    try {
+      const body = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`)
+      upstreamCommit(fixture, 'README.md', `${body.join('\n')}\n`)
+      expect(runSync(fixture).status).toBe(0)
+
+      const forkBody = [...body]
+      forkBody[0] = 'FORK TOP'
+      const upstreamBody = [...body]
+      upstreamBody[29] = 'UPSTREAM BOTTOM'
+      forkCommit(fixture, 'README.md', `${forkBody.join('\n')}\n`)
+      writeFileSync(
+        join(fixture.upstreamWork, 'README.md'),
+        `${upstreamBody.join('\n')}\n`,
+      )
+      writeFileSync(join(fixture.upstreamWork, 'other.txt'), 'upstream other\n')
+      commit(fixture.upstreamWork, 'upstream readme tail + other')
+      git(fixture.upstreamWork, ['push', 'origin', 'main'])
+
+      // Control: a plain git merge produces the hybrid we must prevent.
+      const control = mkdtempSync(join(tmpdir(), 'fork-sync-control-'))
+      try {
+        git(control, ['clone', '-q', fixture.fork, 'c'])
+        const c = join(control, 'c')
+        configure(c)
+        git(c, [
+          'remote',
+          'add',
+          'upstream',
+          join(fixture.root, 'upstream.git'),
+        ])
+        git(c, ['fetch', '-q', 'upstream', 'main'])
+        git(c, ['merge', '-q', '--no-edit', 'upstream/main'])
+        const hybrid = readFileSync(join(c, 'README.md'), 'utf8')
+        expect(hybrid).toContain('FORK TOP')
+        expect(hybrid).toContain('UPSTREAM BOTTOM')
+      } finally {
+        rmSync(control, { recursive: true, force: true })
+      }
+
+      const result = runSync(fixture)
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('keep-ours')
+      const readme = readFileSync(join(fixture.fork, 'README.md'), 'utf8')
+      expect(readme).toBe(`${forkBody.join('\n')}\n`)
+      expect(readme).not.toContain('UPSTREAM BOTTOM')
+      // Everything else from upstream still lands, in one merge commit.
+      expect(readFileSync(join(fixture.fork, 'other.txt'), 'utf8')).toBe(
+        'upstream other\n',
+      )
+      const parents = git(fixture.fork, [
+        'rev-list',
+        '--parents',
+        '-n',
+        '1',
+        'HEAD',
+      ])
+        .trim()
+        .split(' ')
+      expect(parents.length - 1).toBe(2)
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true })
+    }
+  }, 30000)
 
   it('fast-forwards local branch to origin when origin is ahead before merging upstream', () => {
     const fixture = makeFixture()
