@@ -1,4 +1,4 @@
-import { expect, test as registerTest } from 'bun:test'
+import { expect, test as registerTest, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -32,7 +32,11 @@ import {
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
-import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
+import {
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  PiNativeRuntime,
+} from '../native.ts'
 import {
   __prewarmPiCacheKeepForTest,
   streamCortexKitAnthropic,
@@ -102,6 +106,7 @@ async function fixture(
     'PI_AGENT_DIR',
     'PI_ANTHROPIC_AUTH_FILE',
     'PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+    'PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
     'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
   ]
   const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
@@ -194,7 +199,13 @@ async function fixture(
     },
     close: () => {},
   }
-  const native = getPiNativeRuntime(path, { connect: async () => client })
+  const connect = async () => client
+  // Tests publish roster changes explicitly; a background poll would make
+  // discovery timing nondeterministic. One test below enables it on purpose.
+  const native = getPiNativeRuntime(path, {
+    connect,
+    vaultPoll: { intervalMs: 0 },
+  })
   const service = await native.service()
   const roster = await service.vault.refresh()
   await service.updateSettings((settings) => ({
@@ -214,8 +225,125 @@ async function fixture(
   )
   if (!primary?.accountIdentity)
     throw new Error('Fixture vault primary identity is missing')
-  return { rows, gets, reports, client, path, localFiles, beforeLocal, native }
+  return {
+    rows,
+    gets,
+    reports,
+    client,
+    connect,
+    path,
+    localFiles,
+    beforeLocal,
+    native,
+  }
 }
+
+test('Pi background vault poll adopts a main re-login while a fallback serves, with no request-time discovery', async () => {
+  const f = await fixture('main-first')
+  f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+  f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  const service = await f.native.service()
+  await service.vault.refresh()
+  // Two Pi runtimes for the same storage share one vault connection. The
+  // fixture's runtime was created with polling off; this second one turns the
+  // shared background poll on at a short interval for this test.
+  const polled = new PiNativeRuntime(f.path, {
+    connect: f.connect,
+    vaultPoll: { intervalMs: 20 },
+  })
+  deferCleanup(() => polled.close())
+  const requestRefresh = spyOn(service.vault, 'refresh')
+  deferCleanup(() => requestRefresh.mockRestore())
+  const mainState = async () =>
+    (await polled.requestView()).accounts.find(
+      (account) => account.credentialId === 'oauth:anthropic',
+    )?.state
+  // The 'work' account is active, so a request can be served without asking
+  // the vault for changes. The main account stays needs_reauth here until the
+  // background poll notices the re-login below.
+  expect(await mainState()).toBe('needs_reauth')
+  f.rows[0] = { ...f.rows[0]!, state: 'active' }
+  let state = await mainState()
+  while (state !== 'active') {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    state = await mainState()
+  }
+  expect(state).toBe('active')
+  expect(requestRefresh).toHaveBeenCalledTimes(0)
+})
+
+test('Pi same-key replacement drains its predecessor without closing the shared consumer', async () => {
+  const f = await fixture()
+  const closes = spyOn(f.client, 'close')
+  deferCleanup(() => closes.mockRestore())
+  const get = f.client.getScoped.bind(f.client)
+  const stableVersion = spyOn(f.client, 'getScoped').mockImplementation(
+    async (input) => ({
+      ...(await get(input)),
+      recordVersion: 1,
+    }),
+  )
+  deferCleanup(() => stableVersion.mockRestore())
+  const runtime = await f.native.service()
+  const first = await f.native.authorize('main')
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  let wrote = false
+  f.native.usagePublications.publish(async () => {
+    entered.open()
+    await release.wait
+    if (first.source !== 'vault') throw new Error('Expected a vault receipt')
+    wrote = await runtime.vault.publish(first.receipt, { lastUsed: Date.now() })
+  })
+  await entered.wait
+  let disposed = false
+  const disposing = closePiNativeRuntime(f.path).then(() => {
+    disposed = true
+  })
+  lifetimes.trackDetached(disposing)
+  const successor = new PiNativeRuntime(f.path, { connect: f.connect })
+  deferCleanup(() => successor.close())
+  expect(disposed).toBe(false)
+  const second = await successor.authorize('main')
+  expect(second.source).toBe('vault')
+  if (first.source !== 'vault' || second.source !== 'vault')
+    throw new Error('Expected vault attempts')
+  expect(second.receipt).not.toBe(first.receipt)
+  expect(second.receipt.accessToken).not.toBe(first.receipt.accessToken)
+  release.open()
+  await disposing
+  expect(wrote).toBe(true)
+  expect(closes).toHaveBeenCalledTimes(0)
+  await successor.authorize('main')
+  await successor.close()
+  expect(closes).toHaveBeenCalledTimes(1)
+})
+
+test('Pi runtime cache isolates connection and enrollment paths for the same storage file', async () => {
+  const f = await fixture()
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+    dirname(f.path),
+    'connection-a.json',
+  )
+  const a = getPiNativeRuntime(f.path, { connect: f.connect })
+  expect(getPiNativeRuntime(f.path)).toBe(a)
+  const differentConnector = getPiNativeRuntime(f.path, {
+    connect: async () => f.client,
+  })
+  expect(differentConnector).not.toBe(a)
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+    dirname(f.path),
+    'connection-b.json',
+  )
+  const b = getPiNativeRuntime(f.path, { connect: f.connect })
+  expect(b).not.toBe(a)
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    dirname(f.path),
+    'other-enrollment.json',
+  )
+  const c = getPiNativeRuntime(f.path, { connect: f.connect })
+  expect(c).not.toBe(b)
+})
 
 test('Pi sends using scoped credentials without host auth, and never bootstraps with a cached token', async () => {
   const f = await fixture()
@@ -293,7 +421,7 @@ test('a revoked scoped credential never falls back to local auth or a paid API r
   expect(sends).toBe(1)
 })
 
-test('fallback-first discovers a new account on the next turn and honors a live disable', async () => {
+test('fallback-first adopts a newly published account on the next turn and honors a live disable', async () => {
   const f = await fixture('fallback-first')
   globalThis.fetch = Object.assign(async () => success(), {
     preconnect: originalFetch.preconnect,
@@ -302,6 +430,7 @@ test('fallback-first discovers a new account on the next turn and honors a live 
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
   f.rows.push(row('oauth:anthropic:new', fixtureAccountIdentity('new')))
+  await (await f.native.service()).vault.refresh()
   expect(
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
@@ -323,6 +452,76 @@ test('fallback-first discovers a new account on the next turn and honors a live 
     code: 'ENOENT',
   })
 })
+
+for (const mode of [
+  'main-first',
+  'fallback-first',
+  'sticky-balanced',
+] as const) {
+  test(`Pi vault reauth recovers on the next request in ${mode}`, async () => {
+    const f = await fixture(mode)
+    f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+    f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+    await (await f.native.service()).vault.refresh()
+    await (await f.native.service()).updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: false },
+    }))
+    const served: string[] = []
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(input).includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 0 },
+          })
+        const index =
+          Number(
+            /vault-test-access-(\d+)$/.exec(
+              new Headers(init?.headers).get('authorization') ?? '',
+            )?.[1],
+          ) - 1
+        served.push(f.gets[index]?.credentialId ?? 'missing receipt')
+        return success()
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const options = { sessionId: `reauth-${mode}` }
+    expect(
+      (await streamCortexKitAnthropic(model, context, options).result())
+        .stopReason,
+    ).toBe('stop')
+    expect(served).toEqual(['oauth:anthropic:work'])
+    f.rows[0] = { ...f.rows[0]!, state: 'active' }
+    f.rows[1] = { ...f.rows[1]!, state: 'needs_reauth' }
+    await (await f.native.service()).vault.refresh()
+    expect(
+      (await streamCortexKitAnthropic(model, context, options).result())
+        .stopReason,
+    ).toBe('stop')
+    expect(served.at(-1)).toBe('oauth:anthropic')
+    f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+    await (await f.native.service()).vault.refresh()
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await streamCortexKitAnthropic(
+        model,
+        context,
+        options,
+      ).result()
+      expect(result.stopReason).toBe('error')
+      expect(result.errorMessage).toBe(
+        'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+      )
+    }
+    expect(served).toHaveLength(2)
+    f.rows[0] = { ...f.rows[0]!, state: 'active' }
+    expect(
+      (await streamCortexKitAnthropic(model, context, options).result())
+        .stopReason,
+    ).toBe('stop')
+    expect(served.at(-1)).toBe('oauth:anthropic')
+  })
+}
 
 registerTest.each([500, 401])(
   'relay status %i falls back direct with a fresh version-fenced credential',
@@ -383,6 +582,7 @@ registerTest.each([500, 401])(
 test('scoped model switches reuse the existing sticky allocator and its Opus reserve preference', async () => {
   const f = await fixture('sticky-balanced')
   f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  await (await f.native.service()).vault.refresh()
   const served: string[] = []
   globalThis.fetch = Object.assign(
     async (
@@ -460,8 +660,13 @@ test('an incomplete scoped quota pool cannot spend a paid fallback or issue a mo
   expect(f.gets).toHaveLength(1)
 })
 
-const hostCredentials: Array<{ name: string; credential?: Credential }> = [
+const hostCredentials: Array<{
+  name: string
+  credential?: Credential
+  initiallyInactive?: boolean
+}> = [
   { name: 'empty credential store' },
+  { name: 'inactive vault at provider registration', initiallyInactive: true },
   {
     name: 'stored local API key',
     credential: { type: 'api_key', key: 'must-not-use-local-api-key' },
@@ -479,8 +684,12 @@ const hostCredentials: Array<{ name: string; credential?: Credential }> = [
 
 registerTest.each(hostCredentials)(
   'real Pi model runtime honors custody with $name',
-  wrapBody(async ({ credential }) => {
+  wrapBody(async ({ credential, initiallyInactive }) => {
     const f = await fixture()
+    if (initiallyInactive) {
+      f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+      await (await f.native.service()).vault.refresh()
+    }
     let writes = 0,
       sends = 0
     const credentials: CredentialStore = {
@@ -568,6 +777,15 @@ registerTest.each(hostCredentials)(
         const registered = host.getModel('anthropic', model.id)
         if (!registered)
           throw new Error('Native Anthropic model was not registered')
+        if (initiallyInactive) {
+          const refused = await host.completeSimple(registered, context)
+          expect(refused.stopReason).toBe('error')
+          expect(refused.errorMessage).toBe(
+            'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+          )
+          expect(sends).toBe(0)
+          f.rows[0] = { ...f.rows[0]!, state: 'active' }
+        }
         expect(
           (await host.completeSimple(registered, context)).stopReason,
         ).toBe('stop')
@@ -1185,6 +1403,7 @@ registerTest.each([
 test('Pi vault default UUID replacement re-places the old session without inheriting quota or changing an unrelated fallback pin', async () => {
   const f = await fixture('sticky-balanced')
   f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  await (await f.native.service()).vault.refresh()
   const served: string[] = []
   globalThis.fetch = Object.assign(
     async (

@@ -31,6 +31,7 @@ export type {
   NativeRelayUpdate,
 } from './native-account-runtime.ts'
 export {
+  acquireNativeAccountRuntime,
   createNativeAccountRuntime,
   nativeAccountPolicy,
 } from './native-account-runtime.ts'
@@ -44,7 +45,6 @@ export * from './native-credential-validation.ts'
 export type {
   NativeCustody,
   NativeCustodyClient,
-  NativeCustodyError,
   NativeCustodyErrorCode,
   NativeCustodyIdentity,
   NativeCustodyInventory,
@@ -54,7 +54,7 @@ export type {
   NativeCustodyReporterSource,
   NativeCustodyRetry,
 } from './native-custody.ts'
-export { createNativeCustody } from './native-custody.ts'
+export { createNativeCustody, NativeCustodyError } from './native-custody.ts'
 export type {
   NativeCustodyActivationErrorCode,
   NativeCustodyActivationHooks,
@@ -149,6 +149,7 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
+export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
 export {
   isNativeTransientAccountError,
   NativeTransientAccountError,
@@ -176,6 +177,11 @@ export {
   runPiCommandMenu,
 } from './native-ui.ts'
 export * from './native-usage-publication.ts'
+export {
+  NATIVE_VAULT_NO_ACCOUNT_MESSAGE,
+  NativeVaultNoAccountError,
+  readNativeAccountsForRequest,
+} from './native-vault-admission.ts'
 export type {
   NativePiAuthSlot,
   NativePiAuthSlotErrorCode,
@@ -193,6 +199,8 @@ export {
 export type {
   NativeVaultRuntime,
   NativeVaultRuntimeOptions,
+  NativeVaultWatch,
+  NativeVaultWatchOptions,
 } from './native-vault-runtime.ts'
 export {
   acquireNativeVaultRuntime,

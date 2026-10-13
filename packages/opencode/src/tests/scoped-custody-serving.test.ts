@@ -1,4 +1,4 @@
-import { afterEach, describe, expect } from 'bun:test'
+import { afterEach, describe, expect, spyOn } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -168,6 +168,23 @@ async function readNativeAccounts(fixture: NativeOpencodeFixture) {
   }
 }
 
+/** Publish the inventory change independently of the next model request, as the background vault watch does. */
+async function publishScopedRoster(
+  fixture: NativeOpencodeFixture,
+  client: NativeCustodyClient,
+) {
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => client },
+  })
+  try {
+    await runtime.vault.refresh()
+  } finally {
+    runtime.close()
+  }
+}
+
 /** The OpenCode auth entry exactly as the migration left it in host auth. */
 function migratedActivation(fixture: NativeOpencodeFixture) {
   return async () =>
@@ -261,6 +278,455 @@ function scopedLegacyConfig(extra: Record<string, unknown> = {}) {
 }
 
 describe('OpenCode scoped custody serving', () => {
+  test('project leases share one real vault poller and survive a disposing predecessor', async () => {
+    const { root, plugins } = await startBody('opencode-shared-consumer-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'aa'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
+    const counts = { connects: 0, lists: 0, gets: 0, closes: 0 }
+    const nextList = () => {
+      const arrived = lifetimes.gate()
+      arrivals.push(arrived.open)
+      return arrived.wait
+    }
+    const arrivals: Array<() => void> = []
+    const client: NativeCustodyClient = {
+      async listScoped() {
+        counts.lists++
+        arrivals.shift()?.()
+        return { view: 'shared-consumer', rows: [mainRow] }
+      },
+      async getScoped(input) {
+        counts.gets++
+        return {
+          credentialId: input.credentialId,
+          accountId: mainRow.accountId,
+          material: `fresh-scoped-${counts.gets}`,
+          recordVersion: mainRow.recordVersion,
+          expiresAtMs: Date.now() + 3_600_000,
+        }
+      },
+      async reportAuthFailureScoped() {},
+      close() {
+        counts.closes++
+      },
+    }
+    const authorizations: string[] = []
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('/v1/messages')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        return Response.json({
+          id: 'shared-message',
+          type: 'message',
+          content: [],
+        })
+      }
+      return Response.json({})
+    }) as typeof fetch
+    const intervals = new Set<ReturnType<typeof setInterval>>()
+    const polls = new Set<ReturnType<typeof setInterval>>()
+    const pollMs = 1000
+    const overrides = {
+      claustrumScopedConnect: async () => {
+        counts.connects++
+        return client
+      },
+      scopedRosterPollIntervalMs: pollMs,
+      cacheKeepAggregateRefreshIntervalMs: 0,
+      setInterval: ((fn: () => void, ms: number) => {
+        const timer = setInterval(fn, ms)
+        intervals.add(timer)
+        if (ms === pollMs) polls.add(timer)
+        return timer
+      }) as typeof setInterval,
+      clearInterval: ((timer: ReturnType<typeof setInterval>) => {
+        intervals.delete(timer)
+        polls.delete(timer)
+        clearInterval(timer)
+      }) as typeof clearInterval,
+    }
+    // The injection wraps real timers; teardown also owns them if an assertion fails.
+    lifetimes.deferCleanup(() => {
+      for (const timer of intervals) clearInterval(timer)
+      intervals.clear()
+      polls.clear()
+    })
+    const instances: PluginHooks[] = []
+    for (let index = 0; index < 3; index++) {
+      const plugin = await createPlugin(
+        plugins,
+        { root: join(root, `project-${index}`) },
+        overrides,
+      )
+      await (plugin as any).__fallbackRefreshReady
+      instances.push(plugin)
+    }
+    expect(counts.connects).toBe(1)
+    expect(counts.lists).toBe(1)
+    expect(polls.size).toBe(1)
+    for (let tick = 0; tick < 2; tick++) {
+      const before = counts.lists
+      await nextList()
+      expect(counts.lists).toBe(before + 1)
+    }
+    for (const plugin of instances.slice(0, 2)) {
+      await plugin.dispose?.()
+      plugins.delete(plugin)
+    }
+    expect(counts.closes).toBe(0)
+    expect(polls.size).toBe(1)
+    await nextList()
+    const predecessor = instances[2]!
+    const transport = await (predecessor as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
+    )
+    const sent = await transport.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(sent.status).toBe(200)
+    await sent.text()
+    const entered = lifetimes.gate()
+    const release = lifetimes.gate()
+    const vault = (predecessor as any).__scopedRuntime
+    const originalPublish = vault.publish.bind(vault)
+    const publication = spyOn(vault, 'publish').mockImplementation(
+      async (...args: Parameters<typeof vault.publish>) => {
+        entered.open()
+        await release.wait
+        return originalPublish(...args)
+      },
+    )
+    lifetimes.deferCleanup(() => publication.mockRestore())
+    // A second served request owns a detached usage write that blocks only its disposer.
+    const second = await transport.fetch(MESSAGES_URL, EMPTY_POST)
+    await second.text()
+    await entered.wait
+    let disposed = false
+    const disposing = Promise.resolve(predecessor.dispose?.()).then(() => {
+      disposed = true
+    })
+    lifetimes.trackDetached(disposing)
+    const successor = await createPlugin(
+      plugins,
+      { root: join(root, 'project-2') },
+      overrides,
+    )
+    await (successor as any).__fallbackRefreshReady
+    expect(disposed).toBe(false)
+    release.open()
+    await disposing
+    plugins.delete(predecessor)
+    expect(counts.closes).toBe(0)
+    expect(polls.size).toBe(1)
+    publication.mockRestore()
+    const newTransport = await (successor as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
+    )
+    const third = await newTransport.fetch(MESSAGES_URL, EMPTY_POST)
+    await third.text()
+    expect(third.status).toBe(200)
+    expect(new Set(authorizations).size).toBe(3)
+    expect(
+      authorizations.every((value) => /^Bearer fresh-scoped-\d+$/.test(value)),
+    ).toBe(true)
+    await nextList()
+    await successor.dispose?.()
+    plugins.delete(successor)
+    expect(counts.closes).toBe(1)
+    expect(polls.size).toBe(0)
+    expect(intervals.size).toBe(0)
+  }, 15_000)
+
+  test('native vault quota identity rejects an unbound receipt without a legacy roster flag', async () => {
+    const { root, plugins } = await startBody('opencode-vault-identity-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'fd'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
+    expect(
+      (await readNativeAccounts(fixture)).policyStorage.claustrum?.scopedRoster,
+    ).toBeUndefined()
+    const client: NativeCustodyClient = {
+      listScoped: async () => ({ view: 'identity', rows: [mainRow] }),
+      getScoped: async () => {
+        throw new Error('no credential read expected')
+      },
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => client,
+      scopedRosterPollIntervalMs: 0,
+    })
+    const resolveIdentity = Reflect.get(
+      plugin,
+      '__resolveMainQuotaIdentityForTest',
+    )
+    if (typeof resolveIdentity !== 'function')
+      throw new Error('missing identity test hook')
+    expect(await resolveIdentity('unbound-access')).toMatchObject({
+      stale: true,
+      state: 'on-identity-mismatch',
+    })
+  })
+
+  test('vault loader does not freeze a repairable host slot or enrollment refusal', async () => {
+    const { root, plugins } = await startBody('opencode-vault-live-admission-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'fb'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
+    const client: NativeCustodyClient = {
+      listScoped: async () => ({ view: 'live', rows: [mainRow] }),
+      getScoped: async ({ credentialId }) => ({
+        credentialId,
+        accountId: mainRow.accountId!,
+        material: 'live-access',
+        recordVersion: 10,
+        expiresAtMs: Date.now() + 3_600_000,
+      }),
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }
+    globalThis.fetch = (async (_input: unknown, _init?: RequestInit) =>
+      Response.json({ content: [] })) as typeof fetch
+    const hostBytes = await readFile(fixture.hostAuthPath, 'utf8')
+    const enrollmentBytes = await readFile(fixture.enrollmentPath, 'utf8')
+    await writeFile(
+      fixture.hostAuthPath,
+      JSON.stringify({
+        anthropic: { type: 'oauth', access: 'separate-login' },
+      }),
+    )
+    await writeFile(fixture.enrollmentPath, '{broken')
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => client,
+      scopedRosterPollIntervalMs: 0,
+    })
+    if (!plugin.auth?.loader) throw new Error('missing auth loader')
+    const loader = await plugin.auth.loader(migratedActivation(fixture), {
+      id: 'anthropic',
+      name: 'Anthropic',
+      source: 'custom',
+      env: [],
+      options: {},
+      models: {},
+    })
+    if (!loader.fetch) throw new Error('missing fetch')
+    await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow()
+    await writeFile(fixture.enrollmentPath, enrollmentBytes)
+    await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
+      'OpenCode holds a separate Anthropic login',
+    )
+    await writeFile(fixture.hostAuthPath, hostBytes)
+    expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+  })
+
+  for (const recoverBeforeDeadline of [true, false]) {
+    test(`vault request waits for a missing roster and ${recoverBeforeDeadline ? 'serves' : 'refuses within two seconds then recovers'}`, async () => {
+      const { root, plugins } = await startBody('opencode-vault-roster-wait-')
+      const fixture = await migrateScopedSeat(root, {
+        rows: () => [mainRow],
+        token: 'fc'.repeat(32),
+        expectedCredentials: [mainRow.id],
+        legacyConfig: scopedLegacyConfig(),
+      })
+      await rm(nativeVaultPaths(fixture.paths).roster)
+      const discovery = lifetimes.gate()
+      const entered = lifetimes.gate()
+      const client: NativeCustodyClient = {
+        listScoped: async () => {
+          entered.open()
+          await discovery.wait
+          return { view: 'ready', rows: [mainRow] }
+        },
+        getScoped: async ({ credentialId }) => ({
+          credentialId,
+          accountId: mainRow.accountId!,
+          material: 'ready-access',
+          recordVersion: 10,
+          expiresAtMs: Date.now() + 3_600_000,
+        }),
+        reportAuthFailureScoped: async () => {},
+        close: () => {},
+      }
+      let sends = 0
+      globalThis.fetch = (async (_input: unknown, _init?: RequestInit) => {
+        sends++
+        return Response.json({ content: [] })
+      }) as typeof fetch
+      const plugin = await createPlugin(plugins, fixture, {
+        claustrumScopedConnect: async () => client,
+        scopedRosterPollIntervalMs: 0,
+      })
+      if (!plugin.auth?.loader) throw new Error('missing auth loader')
+      const loader = await plugin.auth.loader(migratedActivation(fixture), {
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'custom',
+        env: [],
+        options: {},
+        models: {},
+      })
+      if (!loader.fetch) throw new Error('missing fetch')
+      await entered.wait
+      const requestWaiting = lifetimes.gate()
+      const vault = Reflect.get(plugin, '__scopedRuntime')
+      const refresh = Reflect.get(vault, 'refresh')
+      if (typeof refresh !== 'function')
+        throw new Error('missing vault refresh')
+      Reflect.set(vault, 'refresh', (...args: unknown[]) => {
+        requestWaiting.open()
+        return Reflect.apply(refresh, vault, args)
+      })
+      lifetimes.deferCleanup(() => {
+        Reflect.set(vault, 'refresh', refresh)
+      })
+      const started = performance.now()
+      const request = loader.fetch(MESSAGES_URL, EMPTY_POST)
+      lifetimes.trackDetached(
+        request.then(
+          () => {},
+          () => {},
+        ),
+      )
+      try {
+        if (recoverBeforeDeadline) {
+          await requestWaiting.wait
+          discovery.open()
+          expect((await request).status).toBe(200)
+        } else {
+          await expect(request).rejects.toMatchObject({
+            message:
+              'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+          })
+          expect(performance.now() - started).toBeGreaterThanOrEqual(1900)
+          expect(performance.now() - started).toBeLessThan(3000)
+          expect(sends).toBe(0)
+          discovery.open()
+          await Reflect.get(plugin, '__fallbackRefreshReady')
+          expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(
+            200,
+          )
+        }
+      } finally {
+        discovery.open()
+      }
+    })
+  }
+
+  for (const mode of [
+    'main-first',
+    'fallback-first',
+    'sticky-balanced',
+  ] as const) {
+    test(`vault admission recovers per request with an inactive main in ${mode}`, async () => {
+      const { root, plugins } = await startBody('opencode-vault-admission-')
+      let rows: ScopedInventoryRow[] = [
+        { ...mainRow, state: 'needs_reauth' },
+        workRow,
+      ]
+      const fixture = await migrateScopedSeat(root, {
+        rows: () => rows,
+        token: 'fa'.repeat(32),
+        expectedCredentials: [mainRow.id, workRow.id],
+        legacyConfig: scopedLegacyConfig({
+          routing: { mode },
+          accounts: [
+            {
+              id: 'work',
+              label: 'work',
+              type: 'oauth',
+              enabled: true,
+              refresh: '',
+              claustrumScopedCredentialId: workRow.id,
+              anthropicAccountUuid: workRow.accountId,
+              claustrumScopedState: 'active',
+            },
+          ],
+        }),
+      })
+      const client: NativeCustodyClient = {
+        listScoped: async () => ({ view: 'admission', rows }),
+        getScoped: async ({ credentialId }) => {
+          const row = rows.find((row) => row.id === credentialId)
+          if (row?.state !== 'active') throw new Error('not-active')
+          return {
+            credentialId,
+            accountId: row.accountId!,
+            material: `admission-${credentialId}`,
+            recordVersion: row.recordVersion,
+            expiresAtMs: Date.now() + 3_600_000,
+          }
+        },
+        reportAuthFailureScoped: async () => {},
+        close: () => {},
+      }
+      const served: string[] = []
+      globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+        if (String(input).includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 0 },
+          })
+        served.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Response.json({ content: [] })
+      }) as typeof fetch
+      const plugin = await createPlugin(plugins, fixture, {
+        claustrumScopedConnect: async () => client,
+        scopedRosterPollIntervalMs: 0,
+      })
+      if (!plugin.auth?.loader) throw new Error('missing auth loader')
+      const loader = await plugin.auth.loader(migratedActivation(fixture), {
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'custom',
+        env: [],
+        options: {},
+        models: {},
+      })
+      if (!loader.fetch) throw new Error('missing provider fetch')
+      expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+      expect(served).toEqual([`Bearer admission-${workRow.id}`])
+
+      // Re-login changes vault inventory, while the same Anthropic request
+      // handler and OpenCode auth.json activation entry remain installed.
+      rows = [
+        { ...mainRow, recordVersion: 11 },
+        { ...workRow, state: 'needs_reauth' },
+      ]
+      await publishScopedRoster(fixture, client)
+      expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+      expect(served.at(-1)).toBe(`Bearer admission-${mainRow.id}`)
+
+      rows = rows.map((row) => ({ ...row, state: 'needs_reauth' }))
+      await publishScopedRoster(fixture, client)
+      for (let attempt = 0; attempt < 2; attempt++)
+        await expect(
+          loader.fetch(MESSAGES_URL, EMPTY_POST),
+        ).rejects.toMatchObject({
+          message:
+            'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+        })
+      expect(served).toHaveLength(2)
+      rows = [
+        { ...mainRow, recordVersion: 12 },
+        { ...workRow, state: 'needs_reauth' },
+      ]
+      expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+      expect(served.at(-1)).toBe(`Bearer admission-${mainRow.id}`)
+    })
+  }
+
   test('serves requests using scoped receipts and dynamically adopts newly logged-in accounts without restart', async () => {
     const { root, plugins } = await startBody('opencode-scoped-serving-')
     const rows = [mainRow, workRow]
