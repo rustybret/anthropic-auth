@@ -427,22 +427,45 @@ if command -v jq >/dev/null 2>&1; then
 
   CREATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   PUB_KEY_ID=$(sed -n 's/.*"key_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ENVELOPE" | head -n 1)
-  OBSERVED_SEQ=$((SEQUENCE - 1))
-  cat <<SUBMISSION_EOF > "${OUTPUT_DIR}/submission.json"
-{
-  "schema_version": 1,
-  "package_id": "${PACKAGE_ID}",
-  "release_id": "${RELEASE_ID}",
-  "version": "${VERSION}",
-  "sequence": ${SEQUENCE},
-  "channel": "${CHANNEL}",
-  "created_at": "${CREATED_AT}",
-  "toolchain_version": "${TOOLCHAIN_VER}",
-  "publisher_key_id": "${PUB_KEY_ID}",
-  "sequence_source": "gateway",
-  "observed_max_sequence": ${OBSERVED_SEQ}
-}
-SUBMISSION_EOF
+  REL_TAG="v${VERSION}_seq${SEQUENCE}"
+  REPO_LOCATOR="${GITHUB_REPO:-rustybret/anthropic-auth}"
+  COMMIT_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "0000000000000000000000000000000000000000")
+
+  SOURCES_JSON=$(jq -R -s --arg repo "$REPO_LOCATOR" --arg tag "$REL_TAG" '
+    split("\n") | map(select(length > 0) | split("  ") | {
+      type: "github_release",
+      repository: $repo,
+      tag: $tag,
+      asset: .[1]
+    })
+  ' "${OUTPUT_DIR}/assets.sha256" 2>/dev/null || echo "[]")
+
+  jq -n \
+    --arg package_id "$PACKAGE_ID" \
+    --arg release_id "$RELEASE_ID" \
+    --arg version "$VERSION" \
+    --argjson sequence "$SEQUENCE" \
+    --arg created_at "$CREATED_AT" \
+    --arg toolchain_version "${TOOLCHAIN_VER}" \
+    --arg publisher_key_id "$PUB_KEY_ID" \
+    --argjson sources "$SOURCES_JSON" \
+    --arg repo "$REPO_LOCATOR" \
+    --arg commit "$COMMIT_SHA" \
+    '{
+      schema_version: 2,
+      package_id: $package_id,
+      release_id: $release_id,
+      version: $version,
+      sequence: $sequence,
+      created_at: $created_at,
+      toolchain_version: $toolchain_version,
+      publisher_key_id: $publisher_key_id,
+      sources: $sources,
+      provenance: {
+        repository: $repo,
+        commit_sha: $commit
+      }
+    }' > "${OUTPUT_DIR}/submission.json" 2>/dev/null || true
 fi
 
 # Verification of digest distinctness
