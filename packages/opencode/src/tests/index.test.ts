@@ -47,7 +47,6 @@ import {
   isNativeLocalCredentialValidation,
   isOAuthAccount,
   type LogTestRecord,
-  loadAccounts,
   type NativeCustodyClient,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -58,8 +57,6 @@ import {
   resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
   resetFastModeState,
-  saveAccountState,
-  saveAccounts,
   setLogLevel,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   tokenFingerprint,
@@ -841,36 +838,24 @@ function syntheticMainHostAuth() {
 }
 
 /**
- * Serialize old-installation data with saveAccounts and saveAccountState.
- * Return the config and credential-state text for offline migration.
+ * Serialize raw old-installation input without interpreting or merging it.
+ * Migration, not this fixture writer, owns its meaning.
  */
 async function legacyAccountFiles(storage: AccountStorage) {
   const scratch = await mkdtemp(join(tmpdir(), 'anthropic-plugin-legacy-'))
   const configPath = join(scratch, 'anthropic-auth.json')
   const statePath = join(scratch, 'anthropic-auth-state.json')
-  const savedStatePath = process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
-  process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = statePath
   try {
-    await saveAccounts(storage, configPath)
-    if (
-      storage.main?.profile ||
-      storage.prime?.mainAuthLineageId ||
-      storage.prime?.main
-    )
-      await saveAccountState(storage, configPath, {
-        mainProfile: Boolean(storage.main?.profile),
-        mainPrime: Boolean(
-          storage.prime?.mainAuthLineageId || storage.prime?.main,
-        ),
-      })
+    await writeLegacyAccountFiles(configPath, storage, statePath, {
+      version: 1,
+      main: {},
+      accounts: {},
+    })
     return {
       config: await readFile(configPath, 'utf8'),
       state: await readFile(statePath, 'utf8').catch(() => undefined),
     }
   } finally {
-    if (savedStatePath === undefined)
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
-    else process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = savedStatePath
     await rm(scratch, { recursive: true, force: true })
   }
 }
@@ -1545,7 +1530,10 @@ async function useUnmigratedAccountFile(storage: AccountStorage) {
     'quota-header-feed',
   )
   process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(root, 'rpc')
-  await saveAccounts(storage)
+  await writeLegacyAccountFiles(
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+    storage,
+  )
 }
 
 // The fetch installed by the test preload (setup.ts), which only allows
@@ -1825,7 +1813,10 @@ async function waitForSidebarState(
  */
 async function readAccountStorage(): Promise<AccountStorage | null> {
   const pool = migratedPool
-  if (!pool) return loadAccounts()
+  if (!pool)
+    return readLegacyJson<AccountStorage>(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+    )
   const runtime = createNativeAccountRuntime({
     paths: pool.paths,
     host: 'opencode',
@@ -1838,7 +1829,7 @@ async function readAccountStorage(): Promise<AccountStorage | null> {
 }
 
 async function waitForAccountStorage(
-  predicate: (storage: Awaited<ReturnType<typeof loadAccounts>>) => boolean,
+  predicate: (storage: AccountStorage | null) => boolean,
 ) {
   for (let attempt = 0; attempt < 100; attempt++) {
     const storage = await readAccountStorage()
@@ -3498,6 +3489,7 @@ describe('quota header feed integration', () => {
             ...createFallbackStorage().quota,
             mainQuota: {
               source: 'headers',
+              checkedAt: requestCheckedAt,
               five_hour: {
                 usedPercent: 4,
                 remainingPercent: 96,
@@ -5310,9 +5302,6 @@ describe('quota header feed extended integration', () => {
       },
     })
     await useTempAccountFile(storage)
-    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
-      mainQuota: true,
-    })
     const messageRequests: string[] = []
     globalThis.fetch = mock(
       withNativeAdmission((input: any) => {
@@ -7561,6 +7550,8 @@ describe('auth.loader', () => {
   })
 
   test('/claude-quota preserves fresher routing from another session', async () => {
+    const releaseStartupQuota = bodyLifetime().gate()
+    const startupSidebarMerged = bodyLifetime().gate()
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
@@ -7584,14 +7575,15 @@ describe('auth.loader', () => {
     )
     globalThis.fetch = mock((input: string | URL | Request) => {
       if (extractUrl(input).includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: { utilization: 0.25 },
-              seven_day: { utilization: 0.3 },
-            }),
-            { status: 200 },
-          ),
+        return releaseStartupQuota.wait.then(
+          () =>
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0.25 },
+                seven_day: { utilization: 0.3 },
+              }),
+              { status: 200 },
+            ),
         )
       }
       return Promise.resolve(new Response('{}', { status: 200 }))
@@ -7609,6 +7601,17 @@ describe('auth.loader', () => {
       { models: {} },
     )
     await seedSidebarRouting('fallback-b', 'fallback-first', Date.now())
+
+    // The startup fallback-quota sweep publishes routing independently of menu
+    // opening. Let its display-only merge learn the sibling's fresh route before
+    // aging the file; draining alone cannot join a write not yet enqueued.
+    __setSidebarStateWriteTestHooks({
+      afterMergeRead: () => startupSidebarMerged.open(),
+    })
+    releaseStartupQuota.open()
+    await startupSidebarMerged.wait
+    await drainSidebarWrites()
+    __setSidebarStateWriteTestHooks(null)
 
     await expectHandledCommandResponse(
       plugin['command.execute.before']({
@@ -11035,6 +11038,19 @@ describe('auth.loader', () => {
     const firstProfileStarted = lifetimeSignal()
     const secondLookupArrived = lifetimeSignal()
     const secondLookupReleased = lifetimeSignal()
+    const profilesPublished = lifetimeSignal()
+    // Profile responses and their persisted sidebar publications settle separately.
+    // Observe the committed labels instead of racing metadata writes with a polling budget.
+    __setSidebarStateWriteTestHooks({
+      afterRename: async () => {
+        const state = await getSidebarState()
+        if (
+          state.main.tierLabel === 'Max 20x' &&
+          state.fallbacks[0]?.tierLabel === 'Team · Max 5x'
+        )
+          profilesPublished.raise()
+      },
+    })
     const lookupAccounts: string[] = []
     const firstFetchCalls: string[] = []
     const answer = withNativeAdmission(
@@ -11112,11 +11128,10 @@ describe('auth.loader', () => {
     })
     globalThis.fetch = nextTestFetch as unknown as typeof fetch
     secondLookupReleased.raise()
-    await waitForSidebarState(
-      (state) =>
-        state.main.tierLabel === 'Max 20x' &&
-        state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
-    )
+    await profilesPublished.raised
+    const state = await getSidebarState()
+    expect(state.main.tierLabel).toBe('Max 20x')
+    expect(state.fallbacks[0]?.tierLabel).toBe('Team · Max 5x')
 
     expect(firstFetchCalls.toSorted()).toEqual([
       'Bearer sk-ant-oat01-fallback-access',
@@ -13733,10 +13748,10 @@ describe('auth.loader', () => {
     const routed = await result.fetch(MESSAGES_URL, request)
     expect(routed.status).toBe(200)
 
-    await saveAccounts({
-      ...storage,
+    await updatePoolSettings((settings) => ({
+      ...settings,
       quota: { ...storage.quota, failClosedOnUnknownQuota: true },
-    })
+    }))
     const blocked = await result.fetch(MESSAGES_URL, {
       ...request,
       headers: { 'x-session-affinity': 'unknown-quota-blocked' },
@@ -14860,7 +14875,7 @@ describe('auth.loader', () => {
   })
 
   test('fetch wrapper retries with fallback when main streaming body reports rate limit', async () => {
-    await useTempAccountFile(createFallbackStorage())
+    await useTempAccountFile(bindPoolAccounts(createFallbackStorage()))
     const authorizations: string[] = []
 
     globalThis.fetch = mock(
@@ -18984,23 +18999,46 @@ describe('auth.loader', () => {
 
     test('header push persists source headers and refreshes sidebar checkedAt without a usage poll', async () => {
       await useTempAccountFile(harvestStorage())
-      let usageCalls = 0
-      globalThis.fetch = mock(
-        withNativeAdmission((input: string | URL | Request) => {
-          if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
-          return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
-        }),
-      ) as unknown as typeof fetch
-      const result = await loadFetch()
-
-      await result.fetch(MESSAGES_URL, EMPTY_POST)
-      const state = await waitForSidebarState(
-        (value) => value.main.quota?.five_hour?.usedPercent === 78,
+      const published = bodyLifetime().gate()
+      const sidebarPath = getSidebarStateFile()
+      // Returning the model response does not join quota persistence or its
+      // sidebar refresh. Wait for the atomic sidebar publication containing
+      // these headers, rather than assuming it fits a polling deadline.
+      __setSidebarStateWriteTestHooks(
+        {
+          afterRename: async () => {
+            const state = await getSidebarState(sidebarPath)
+            if (state.main.quota?.five_hour?.usedPercent === 78)
+              published.open()
+          },
+        },
+        sidebarPath,
       )
+      try {
+        let usageCalls = 0
+        globalThis.fetch = mock(
+          withNativeAdmission((input: string | URL | Request) => {
+            if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
+            return Promise.resolve(
+              new Response('ok', { headers: quotaHeaders }),
+            )
+          }),
+        ) as unknown as typeof fetch
+        const result = await loadFetch()
 
-      expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
-      expect(state.lastUpdated).toBeGreaterThan(0)
-      expect(usageCalls).toBe(0)
+        await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await published.wait
+        const state = await getSidebarState(sidebarPath)
+        const storage = await readAccountStorage()
+
+        expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
+        expect(state.lastUpdated).toBeGreaterThan(0)
+        expect(storage?.quota?.mainQuota?.source).toBe('headers')
+        expect(storage?.quota?.mainQuotaCheckedAt).toBeGreaterThan(0)
+        expect(usageCalls).toBe(0)
+      } finally {
+        __setSidebarStateWriteTestHooks(null, sidebarPath)
+      }
     })
 
     test('successful harvest emits one quota debug record without raw headers', async () => {
@@ -22690,3 +22728,8 @@ describe('claude-prime — warn dedup (R3)', () => {
     ).toHaveLength(0)
   })
 })
+
+import {
+  readLegacyJson,
+  writeLegacyAccountFiles,
+} from '../../../core/src/tests/legacy-account-fixture.ts'

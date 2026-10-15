@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { applyEdits, modify, parse } from 'jsonc-parser'
 
 const WORKSPACES = [
@@ -107,4 +108,19 @@ export function syncVersionLock(root, version, { dryRun = false } = {}) {
   }
   if (changes.length && !dryRun) writeFileSync(path, text, 'utf8')
   return changes
+}
+
+if (
+  process.argv[1] &&
+  (import.meta.url === `file://${process.argv[1]}` ||
+    process.argv[1].endsWith('workspace-lock.mjs'))
+) {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const issues = workspaceLockErrors(root)
+  if (issues.length) {
+    console.error(`Workspace lockfile is stale:\n${issues.join('\n')}`)
+    process.exit(1)
+  } else {
+    console.log('Workspace lockfile matches package manifests.')
+  }
 }

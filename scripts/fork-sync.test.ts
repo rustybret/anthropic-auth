@@ -492,4 +492,63 @@ describe('fork-sync integration', () => {
       rmSync(scriptHome, { recursive: true, force: true })
     }
   }, 20000)
+
+  it('removes keep-deleted files even when upstream adds or modifies them in a clean merge', () => {
+    const fixture = makeFixture()
+    try {
+      mkdirSync(join(fixture.upstreamWork, 'dist-arcus'), { recursive: true })
+      upstreamCommit(
+        fixture,
+        'dist-arcus/stale.txt',
+        'stale release artifact\n',
+      )
+      upstreamCommit(fixture, 'upstream-note.txt', 'upstream note\n')
+
+      const result = runSync(fixture)
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('keep-deleted')
+      expect(existsSync(join(fixture.fork, 'dist-arcus', 'stale.txt'))).toBe(
+        false,
+      )
+      expect(existsSync(join(fixture.fork, 'upstream-note.txt'))).toBe(true)
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true })
+    }
+  }, 25000)
+
+  it('halts with diagnostic guidance and leaves local merge unpushed when verification fails', () => {
+    const fixture = makeFixture()
+    try {
+      const pkgPath = join(fixture.fork, 'package.json')
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+      pkg.scripts = { ...pkg.scripts, build: 'exit 1' }
+      writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`)
+      commit(fixture.fork, 'add failing build script')
+      git(fixture.fork, ['push', 'origin', 'main'])
+
+      upstreamCommit(fixture, 'upstream-feature.txt', 'feature\n')
+
+      const originHeadBefore = git(fixture.fork, [
+        'rev-parse',
+        'origin/main',
+      ]).trim()
+
+      const result = runSync(fixture, {
+        env: { FORK_SYNC_SKIP_BUILD: '0' },
+      })
+      expect(result.status).not.toBe(0)
+      expect(result.stderr).toContain(
+        'error: verification failed during fork-sync',
+      )
+      expect(result.stderr).toContain('was NOT pushed to origin')
+
+      const originHeadAfter = git(fixture.fork, [
+        'rev-parse',
+        'origin/main',
+      ]).trim()
+      expect(originHeadAfter).toBe(originHeadBefore)
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true })
+    }
+  }, 30000)
 })

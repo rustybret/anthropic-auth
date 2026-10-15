@@ -25,6 +25,12 @@ keep-deleted: scripts/version-sync.mjs
 keep-deleted: .github/workflows/release.yaml
 keep-deleted: .github/workflows/release.yml
 
+# Legacy Arcus submodule and obsolete migration scaffolding forbidden in Arcus V3
+keep-deleted: submodules/arcus
+keep-deleted: .gitmodules
+keep-deleted: scripts/migrate-arcus.sh
+keep-deleted: scripts/setup-arcus.sh
+
 # Fork-owned documentation: README.md documents ONLY what differs from upstream and
 # links to upstream's README rather than vendoring it, so upstream README edits
 # must never reach this file.

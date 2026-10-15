@@ -8,5 +8,6 @@
   "plugin": {
     "package_name": "@cortexkit/opencode-anthropic-auth",
     "strip_components": 1
-  }
+  },
+  "gateway": "https://arcus-auth.rustybret.com"
 }

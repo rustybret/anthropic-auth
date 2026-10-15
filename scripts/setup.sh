@@ -65,7 +65,6 @@ ARCUS_SCRIPTS=(
   "sign-arcus.sh"
   "validate-arcus.sh"
   "publish-arcus.sh"
-  "migrate-arcus.sh"
   "arcus-toolchain.json"
 )
 for script_name in "${ARCUS_SCRIPTS[@]}"; do

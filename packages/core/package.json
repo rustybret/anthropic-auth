@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/anthropic-auth-core",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "repository": {
     "type": "git",
@@ -29,10 +29,11 @@
     "types": "tsc"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "0.14.2"
+    "@cortexkit/common-auth": "0.15.0"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "0.6.2",
+    "@cortexkit/claustrum-client": "0.9.0",
+    "@cortexkit/private-files": "0.2.1",
     "jsonc-parser": "^3.3.1",
     "xxhash-wasm": "^1.1.0"
   }

@@ -53,7 +53,6 @@ anthropic-auth/
 │   ├── sign-arcus.sh           # -> ../packages/arcus/toolchain/scripts/sign-arcus.sh
 │   ├── validate-arcus.sh       # -> ../packages/arcus/toolchain/scripts/validate-arcus.sh
 │   ├── publish-arcus.sh        # -> ../packages/arcus/toolchain/scripts/publish-arcus.sh
-│   ├── migrate-arcus.sh        # -> ../packages/arcus/toolchain/scripts/migrate-arcus.sh
 │   └── arcus-toolchain.json    # -> ../packages/arcus/toolchain/scripts/arcus-toolchain.json
 ```
 
@@ -127,41 +126,58 @@ Global Flags:
 
 ### Step-by-Step Publishing Flow:
 
-1. **Emit Submission Bundle**:
-   Publishing scripts (`scripts/publish-arcus.sh` or `arcus-pipeline.sh publish`) generate a self-contained submission bundle:
+1. **Pack & Sign Submission Bundle**:
+   Run the packaging pipeline (allocates sequence, verifies distinct digest triples, enforces mode 0755 on entrypoints, and signs release envelope):
+   ```bash
+   # In automated or subagent environments, use headless secrets:
+   export ARCUS_SECRET_BACKEND=file
+   export ARCUS_CONFIG_DIR="$HOME/.config/arcus"
+
+   bun run pack:arcus
    ```
-   dist/arcus/opencode-anthropic-auth-<release_id>/
+   The self-contained submission bundle is written to:
+   ```text
+   dist/<sequence>/opencode-anthropic-auth/<version>/
    ├── release.json               # Signed RFC 8785 Schema V3 envelope
-   ├── release.index-policy.json  # Optional channel routing policy
+   ├── release.index-policy.json  # Channel routing policy (stable)
    ├── assets.sha256              # Signed cryptographic artifact ledger
-   ├── toolchain.json             # Publisher toolchain provenance
+   ├── toolchain.json             # Publisher toolchain provenance record
    ├── submission.json            # Intake manifest (submission.schema.json)
    └── <artifact_archives>        # .tar.zst, .pwr, -content.zip per target
    ```
 
-2. **Submit to Gateway**:
+2. **GitHub Release Mirroring (Gate C)**:
+   Upload all target archives, Wharf signatures, and checksum manifest to GitHub Releases using Tier B git tag convention (`v<version>_seq<sequence>`):
+   ```bash
+   BUNDLE="dist/<sequence>/opencode-anthropic-auth/<version>"
+   TAG="v<version>_seq<sequence>"
+
+   git tag -a "$TAG" -m "Release $TAG"
+   git push origin "$TAG"
+
+   gh release create "$TAG" \
+     "$BUNDLE"/*.tar.zst \
+     "$BUNDLE"/*.zip \
+     "$BUNDLE"/*.pwr \
+     "$BUNDLE"/assets.sha256 \
+     --title "opencode-anthropic-auth $TAG" \
+     --generate-notes
+   ```
+   Verify assets return HTTP 200 before proceeding to gateway submission.
+
+3. **Submit to Gateway**:
    Submit the immutable release bundle to the Arcus gateway over authenticated HTTPS:
    ```bash
-   arcus publish submit \
-     --bundle dist/arcus/opencode-anthropic-auth-<release_id>/ \
+   arcus publish submit "$BUNDLE" \
      --gateway https://arcus-auth.rustybret.com \
      --wait
    ```
 
-3. **Check Submission Status**:
+4. **Check Submission Status**:
    Inspect verification status, gate results, and hydration diagnostics:
    ```bash
    arcus publish status <submission_id> --gateway https://arcus-auth.rustybret.com
    ```
-
-4. **Gateway Ingestion & Hydration**:
-   The gateway catalog authority evaluates the 8-point acceptance gate:
-   - Toolchain version floor (`>= 0.4.0`)
-   - Ed25519 signature verification against publisher public key
-   - Monotonic sequence check against live index
-   - Distinct digest triple verification
-   - POSIX executable bit verification on action targets
-   - Hydrates artifacts to storage and re-signs `manifests/v3/index.json`.
 
 ---
 
@@ -172,9 +188,9 @@ Global Flags:
 | **1. Upstream Sync** | Merge upstream `cortexkit/anthropic-auth` | `bun run fork-sync` |
 | **2. Code Quality** | Verify compilation and unit tests | `bun run typecheck && bun run test` |
 | **3. Pipeline Test** | Verify Arcus pipeline scripts & test gates | `bun run test:arcus` |
-| **4. Build & Pack** | Pack into `dist/<version>/<seq>/<package>` | `bun run pack:arcus` |
-| **5. Validate** | Validate signed envelope | `arcus manifest validate --with-envelope dist/<ver>/<seq>/opencode-anthropic-auth/releases/<id>.json` |
-| **6. Upload Assets** | Upload GitHub release assets | `gh release upload v<version> dist/<ver>/<seq>/opencode-anthropic-auth/*` |
-| **7. Gateway Submit** | Submit release bundle to gateway | `arcus publish submit --bundle dist/arcus/opencode-anthropic-auth-<id>/` |
+| **4. Build & Pack** | Pack into `dist/<seq>/opencode-anthropic-auth/<version>` | `bun run pack:arcus` |
+| **5. Validate** | Validate signed envelope | `arcus manifest validate --with-envelope dist/<seq>/opencode-anthropic-auth/<version>/release.json` |
+| **6. GitHub Release** | Create release and upload assets | `gh release create v<ver>_seq<seq> dist/<seq>/opencode-anthropic-auth/<ver>/*` |
+| **7. Gateway Submit** | Submit release bundle to gateway | `arcus publish submit dist/<seq>/opencode-anthropic-auth/<ver>/ --wait` |
 | **8. Verify Status** | Confirm gateway hydration | `arcus publish status <submission_id>` |
 | **9. Local Plugin Sync**| Refresh local OpenCode plugin | `cp -R packages/opencode/dist/* ~/.config/opencode/plugins/opencode-anthropic-auth/dist/` |

@@ -142,12 +142,17 @@ dist/<sequence>/<package_id>/<version>/    # one self-contained submission bundl
 ```
 
 ```bash
-bun run pack:arcus       # allocate sequence, build, pack 5 targets, sign, validate
+# In automated or headless environments, export file secret backend:
+export ARCUS_SECRET_BACKEND=file
+export ARCUS_CONFIG_DIR="$HOME/.config/arcus"
+
+bun run pack:arcus       # allocate sequence from gateway, build, pack 5 targets, sign, validate
+gh release create "v<version>_seq<sequence>" dist/<sequence>/opencode-anthropic-auth/<version>/* \
+  --title "opencode-anthropic-auth v<version>_seq<sequence>" --generate-notes
 arcus publish submit --bundle dist/<sequence>/opencode-anthropic-auth/<version>/ \
   --gateway https://arcus-auth.rustybret.com --wait
 arcus publish status <submission_id> --gateway https://arcus-auth.rustybret.com
 ```
-
 Packing allocates the sequence from the live gateway (`--offline` falls back to a
 local Arcus checkout) and asserts distinct archive/content/tree digests per
 target. Full process and agent checklist: [`docs/arcus-release-process.md`](docs/arcus-release-process.md);
@@ -161,8 +166,11 @@ bun run fork-sync
 
 Fetches `upstream` and `origin`, fast-forwards if `origin` is ahead, merges
 `upstream/main`, resolves standing conflict classes from
-`scripts/fork-sync-exclusions`, regenerates `bun.lock`, runs `bun install` and the
-workspace build, then pushes. The manifest verbs are:
+`scripts/fork-sync-exclusions`, regenerates `bun.lock`, runs frozen install,
+workspace lock consistency checks, typecheck, build, and test gates, then pushes.
+Both `keep-ours` and `keep-deleted` are enforced after every real merge to prevent
+hybrid merges or silent reintroduction of purged files. If any verification gate
+fails, the local merge commit is preserved unpushed for inspection. The manifest verbs are:
 
 | Verb | Meaning |
 | --- | --- |

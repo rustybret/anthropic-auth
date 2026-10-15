@@ -51,12 +51,28 @@ if [ -z "${INSTALL_ROOT}" ]; then
   esac
 fi
 
-PUBLISHER_DIR="${INSTALL_ROOT}/arcus-publisher"
-RECEIPT="${PUBLISHER_DIR}/.arcus/receipt.json"
-if [ -f "${RECEIPT}" ] && command -v jq >/dev/null 2>&1; then
-  MANAGED_PATH=$(jq -r ".managed_tree_path // empty" "${RECEIPT}")
-  if [ -n "${MANAGED_PATH}" ] && [ -d "${PUBLISHER_DIR}/${MANAGED_PATH}" ]; then
-    PUBLISHER_DIR="${PUBLISHER_DIR}/${MANAGED_PATH}"
+PUBLISHER_ROOT="${INSTALL_ROOT}/arcus-publisher"
+
+# Bind to the stable 'current' pointer, never to a tree_instance_id.
+#
+# managed_tree_path embeds a tree_instance_id that is regenerated on every
+# activation, so a link built from it keeps resolving the sequence that was
+# active at bootstrap time and silently survives later updates as a stale
+# toolchain. 'current' is rewritten by each activation, so the link tracks
+# whatever is active without re-running this script.
+PUBLISHER_DIR="${PUBLISHER_ROOT}/.arcus/current"
+if [ ! -d "${PUBLISHER_DIR}" ]; then
+  # Fallback for hosts that could not create the pointer (unprivileged Windows)
+  # or for installs activated before the pointer existed.
+  RECEIPT="${PUBLISHER_ROOT}/.arcus/receipt.json"
+  PUBLISHER_DIR="${PUBLISHER_ROOT}"
+  if [ -f "${RECEIPT}" ] && command -v jq >/dev/null 2>&1; then
+    MANAGED_PATH=$(jq -r ".managed_tree_path // empty" "${RECEIPT}")
+    if [ -n "${MANAGED_PATH}" ] && [ -d "${PUBLISHER_ROOT}/${MANAGED_PATH}" ]; then
+      PUBLISHER_DIR="${PUBLISHER_ROOT}/${MANAGED_PATH}"
+      echo "==> WARNING: no 'current' pointer; linking to ${MANAGED_PATH}."
+      echo "    Re-run this script after each 'arcus install arcus-publisher'."
+    fi
   fi
 fi
 
@@ -64,17 +80,45 @@ fi
 mkdir -p "${REPO_ROOT}/packages/arcus"
 ln -sfn "${PUBLISHER_DIR}" "${REPO_ROOT}/packages/arcus/toolchain"
 
-# 5. Create skill symlink under .opencode/skills
-mkdir -p "${REPO_ROOT}/.opencode/skills"
-ln -sfn "../../packages/arcus/toolchain/skill" "${REPO_ROOT}/.opencode/skills/arcus-publisher"
-
-echo "==> Symlinks created:"
+echo "==> Symlink created:"
 echo "    packages/arcus/toolchain -> ${PUBLISHER_DIR}"
-echo "    .opencode/skills/arcus-publisher -> ../../packages/arcus/toolchain/skill"
 
-# 6. Validate installed toolchain if available
+# 5. Validate installed toolchain if available
 if [ -d "${REPO_ROOT}/packages/arcus/toolchain/scripts" ]; then
   arcus manifest verify-toolchain --root "${REPO_ROOT}/packages/arcus/toolchain/scripts"
+fi
+
+# 6. Ensure arcus.json exists and declares the canonical gateway endpoint
+CONFIG_PATH=""
+if [ -f "${REPO_ROOT}/packages/arcus/arcus.json" ]; then
+  CONFIG_PATH="${REPO_ROOT}/packages/arcus/arcus.json"
+elif [ -f "${REPO_ROOT}/arcus.json" ]; then
+  CONFIG_PATH="${REPO_ROOT}/arcus.json"
+fi
+
+DEFAULT_GATEWAY="https://arcus-auth.rustybret.com"
+
+if [ -z "${CONFIG_PATH}" ]; then
+  CONFIG_PATH="${REPO_ROOT}/packages/arcus/arcus.json"
+  PKG_NAME="$(basename "${REPO_ROOT}")"
+  cat > "${CONFIG_PATH}" <<EOF
+{
+  "\$schema": "https://arcus.rustybret.com/schemas/arcus-project.schema.json",
+  "package_id": "${PKG_NAME}",
+  "software_type": "source_snapshot",
+  "channel": "stable",
+  "source_id": "arcus",
+  "gateway": "${DEFAULT_GATEWAY}"
+}
+EOF
+  echo "==> Scaffolded ${CONFIG_PATH} with gateway: ${DEFAULT_GATEWAY}"
+elif command -v jq >/dev/null 2>&1; then
+  GW_VAL=$(jq -r '.gateway // empty' "${CONFIG_PATH}" 2>/dev/null || true)
+  if [ -z "${GW_VAL}" ]; then
+    TMP_CFG=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
+    jq --arg gw "${DEFAULT_GATEWAY}" '. + {gateway: $gw}' "${CONFIG_PATH}" > "${TMP_CFG}" && mv "${TMP_CFG}" "${CONFIG_PATH}"
+    echo "==> Configured gateway in ${CONFIG_PATH}: ${DEFAULT_GATEWAY}"
+  fi
 fi
 
 echo "==> Arcus publisher bootstrap complete."

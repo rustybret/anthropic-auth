@@ -6,14 +6,25 @@ import { fileURLToPath } from 'node:url'
 export const OPENCODE_PACKAGE_NAME = '@cortexkit/opencode-anthropic-auth'
 export const PI_PACKAGE_NAME = '@cortexkit/pi-anthropic-auth'
 
+export function getHostHome(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return (
+    (platform === 'win32' ? env.USERPROFILE || env.HOME : env.HOME) || homedir()
+  )
+}
+
 export function getOpenCodeConfigDir(
   env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   const configured = env.OPENCODE_CONFIG_DIR?.trim()
   if (configured) return resolve(configured)
-  const xdg = env.XDG_CONFIG_HOME?.trim()
-  if (xdg) return join(resolve(xdg), 'opencode')
-  return join(homedir(), '.config', 'opencode')
+  return join(
+    env.XDG_CONFIG_HOME || join(getHostHome(env, platform), '.config'),
+    'opencode',
+  )
 }
 
 export function getOpenCodeDataDir(
@@ -30,10 +41,13 @@ export function getOpenCodeAuthPath(
   return join(getOpenCodeDataDir(env), 'auth.json')
 }
 
-export function getPiAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+export function getPiAgentDir(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const configured = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim()
   if (configured) return resolve(configured)
-  return join(homedir(), '.pi', 'agent')
+  return join(getHostHome(env, platform), '.pi', 'agent')
 }
 
 export function getPiAuthPath(env: NodeJS.ProcessEnv = process.env): string {

@@ -166,10 +166,26 @@ MERGE_BASE="$(git -C "$ROOT" merge-base HEAD "$REMOTE/$BRANCH")"
 UPSTREAM_HEAD="$(git -C "$ROOT" rev-parse "$REMOTE/$BRANCH")"
 
 PRE_MERGE_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
+FAILED_AFTER_MERGE=0
+
+cleanup_on_exit() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 && $FAILED_AFTER_MERGE -eq 1 ]]; then
+    echo "" >&2
+    echo "======================================================================" >&2
+    echo "error: verification failed during fork-sync (exit code: $exit_code)" >&2
+    echo "The merge commit is retained locally at HEAD ($(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)) and was NOT pushed to origin." >&2
+    echo "To inspect changes: git diff HEAD~1" >&2
+    echo "To undo the merge:  git reset --hard $PRE_MERGE_HEAD" >&2
+    echo "======================================================================" >&2
+  fi
+}
+trap cleanup_on_exit EXIT
 
 if [[ "$MERGE_BASE" == "$UPSTREAM_HEAD" ]]; then
   echo "Already up to date with $REMOTE/$BRANCH."
 elif git -C "$ROOT" merge "$REMOTE/$BRANCH" -m "chore(sync): merge upstream $BRANCH into $LOCAL_BRANCH" --no-edit; then
+  FAILED_AFTER_MERGE=1
   echo "Clean merge completed."
 
   # Clean-merge safety: git can merge a lockfile textually without conflict and
@@ -256,6 +272,7 @@ else
   fi
 
   git -C "$ROOT" commit --no-edit
+  FAILED_AFTER_MERGE=1
 fi
 
 # --- 2b. enforce keep-ours -------------------------------------------------------
@@ -285,16 +302,53 @@ if [[ "${#KEEP_OURS[@]}" -gt 0 ]]; then
   fi
 fi
 
-# --- 3. verify build -----------------------------------------------------------
-echo "== verifying workspace build =="
+# --- 2c. enforce keep-deleted ----------------------------------------------------
+# Purged upstream files (e.g. obsolete release scripts or unwanted tooling) must
+# remain deleted even when upstream modifies or restores them in a clean merge.
+if [[ "${#KEEP_DELETED[@]}" -gt 0 ]]; then
+  POST_PARENTS="$(git -C "$ROOT" rev-list --parents -n 1 HEAD | awk '{print NF-1}')"
+  if [[ "$POST_PARENTS" -ge 2 && "$(git -C "$ROOT" rev-parse HEAD)" != "$PRE_MERGE_HEAD" ]]; then
+    DELETED_RESTORED=()
+    while IFS= read -r changed_file; do
+      [[ -z "$changed_file" ]] && continue
+      if matches_any "$changed_file" "${KEEP_DELETED[@]}"; then
+        if [[ -e "$ROOT/$changed_file" || -L "$ROOT/$changed_file" ]]; then
+          git -C "$ROOT" rm -rf -- "$changed_file"
+          DELETED_RESTORED+=("$changed_file")
+        fi
+      fi
+    done < <(git -C "$ROOT" diff --name-only "$PRE_MERGE_HEAD" HEAD)
+
+    if [[ "${#DELETED_RESTORED[@]}" -gt 0 ]]; then
+      echo "Removing purged upstream files (keep-deleted): ${DELETED_RESTORED[*]}"
+      git -C "$ROOT" commit --amend --no-edit
+    fi
+  fi
+fi
+
+# --- 3. verify workspace gates ------------------------------------------------
+echo "== verifying workspace gates =="
 cd "$ROOT"
 if [[ "$SKIP_BUILD" == "1" ]]; then
   echo "FORK_SYNC_SKIP_BUILD=1; skipping workspace build."
 else
+  echo "== verifying workspace lock consistency =="
+  if [[ -f "$ROOT/scripts/workspace-lock.mjs" ]]; then
+    node "$ROOT/scripts/workspace-lock.mjs"
+  fi
+
   echo "== installing workspace dependencies =="
   rm -rf packages/*/node_modules
-  bun install
+  bun install --frozen-lockfile
+
+  echo "== verifying workspace typecheck =="
+  bun run typecheck
+
+  echo "== verifying workspace build =="
   bun run build
+
+  echo "== verifying workspace tests =="
+  bun test packages/core/src/tests scripts/fork-sync.test.ts
 fi
 
 # --- 4. push -------------------------------------------------------------------
@@ -305,4 +359,5 @@ else
   git -C "$ROOT" push origin "$LOCAL_BRANCH"
 fi
 
+trap - EXIT
 echo "Fork sync complete."
