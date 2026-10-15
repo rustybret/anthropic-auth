@@ -225,7 +225,7 @@ fi
 VERSION=${VERSION#v}
 
 if [ -z "$RELEASE_ID" ]; then
-  RELEASE_ID="$VERSION"
+  RELEASE_ID="${PACKAGE_ID}-${VERSION}"
 fi
 [ -n "$RELEASE_ID" ] || die "could not derive a release_id from ${PACKAGE_ID} ${VERSION}"
 
@@ -365,8 +365,8 @@ printf 'pack-arcus: packing %s %s (release %s, sequence %s, channel %s) across 5
   --sequence "$SEQUENCE" \
   --channel "$CHANNEL" \
   --format "$ARCHIVE_FORMAT" \
-  --strategy "$SOFTWARE_TYPE" \
-  --action-executable "dist/index.js" \
+  --install-only \
+  --submission-bundle "$OUTPUT_DIR" \
   $KEY_FLAGS > "$REPORT" ||
   die "arcus pack failed (report: ${REPORT})"
 
@@ -384,6 +384,9 @@ if [ "$RELEASE_ID" != "${PACKAGE_ID}-${VERSION}" ]; then
 fi
 if [ "$RELEASE_ID" != "${PACKAGE_ID}-${VERSION}-${SEQUENCE}" ]; then
   cp "$ENVELOPE" "${OUTPUT_DIR}/releases/${PACKAGE_ID}-${VERSION}-${SEQUENCE}.json" 2>/dev/null || true
+fi
+if [ "$RELEASE_ID" != "${VERSION}" ]; then
+  cp "$ENVELOPE" "${OUTPUT_DIR}/releases/${VERSION}.json" 2>/dev/null || true
 fi
 
 # Emit self-contained Arcus submission bundle metadata at the dist root

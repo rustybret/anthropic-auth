@@ -4,7 +4,7 @@
   "software_type": "opencode-plugin",
   "source_id": "arcus",
   "channel": "stable",
-  "format": "tar.gz",
+  "format": "tar.zst",
   "plugin": {
     "package_name": "@cortexkit/opencode-anthropic-auth",
     "strip_components": 1

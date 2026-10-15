@@ -4,7 +4,7 @@
   "software_type": "opencode-plugin",
   "source_id": "arcus",
   "channel": "stable",
-  "format": "tar.gz",
+  "format": "tar.zst",
   "gateway": "https://arcus-auth.rustybret.com",
   "plugin": {
     "package_name": "@cortexkit/opencode-anthropic-auth",
